@@ -21,19 +21,34 @@ Requires Rust + Cargo.
 
 ```sh
 # Find all uses of a symbol — like grep but structure-aware
-ctsq -q 'id#malloc' src/
+ctsq -q 'id#malloc' fixtures/
+fixtures/example.c:<match>:6: "malloc"
+fixtures/example.cpp:<match>:7: "malloc"
+fixtures/example.cpp:<match>:15: "malloc"
+fixtures/example.py:<match>:2: "malloc"
 
 # Find function definitions named "process"
-ctsq -q '*function#process' src/
+ctsq -q '*function#process' fixtures/
+fixtures/example.c:<match>:4: "void process(int ARRAY_SIZE) {"
+fixtures/example.js:<match>:5: "() => {"
 
-# Find calls to malloc inside any function named "init"
-ctsq -q '(*function#init @f).body((&function#malloc @call))' src/
+# Find calls to malloc inside a function named "process"
+ctsq -q '(*function#process @f).body((&function#malloc @call))' fixtures/
+fixtures/example.c:@f:4: "void process(int ARRAY_SIZE) {", @call:6: "malloc(ARRAY_SIZE)"
 
 # Structural outline of a file (classes, functions, variables)
-ctsq tree src/main.rs
+ctsq tree fixtures/example.go
+fixtures/example.go
+├── type Server  :5
+├── fn Start  :10
+├── fn NewServer  :14
+└── fn main  :18
 
-# Who calls "send_request" (traces up the call chain)
-ctsq callers send_request src/
+# Who calls "helper" (traces up the call chain)
+ctsq callers helper fixtures/
+helper()
+├── main()  [example.js:1]
+└── main()  [example.js:10]
 ```
 
 ## Commands
@@ -58,8 +73,12 @@ ctsq -l rust -q 'QUERY' src/   # force Rust
 Print a structural outline (classes → methods, top-level functions, variables).
 
 ```sh
-ctsq tree src/main.rs
-ctsq tree src/
+ctsq tree fixtures/example.go
+fixtures/example.go
+├── type Server  :5
+├── fn Start  :10
+├── fn NewServer  :14
+└── fn main  :18
 ```
 
 ### `callers NAME PATH` — call chain (up)
@@ -67,8 +86,14 @@ ctsq tree src/
 Show what calls a given function, walking up the call chain.
 
 ```sh
-ctsq callers ProcessMessages src/
-ctsq callers send_request src/ --depth 5   # default depth: 3
+ctsq callers helper fixtures/
+helper()
+├── main()  [example.js:1]
+└── main()  [example.js:10]
+
+ctsq callers Start fixtures/ --depth 5   # default depth: 3
+Start()
+└── main()  [example.go:18]
 ```
 
 ### `callees NAME PATH` — call chain (down)
@@ -76,7 +101,11 @@ ctsq callers send_request src/ --depth 5   # default depth: 3
 Show what a function calls, walking down the call chain.
 
 ```sh
-ctsq callees main src/
+ctsq callees main fixtures/example.go
+main()
+├── NewServer()  [example.go:14]
+└── Start()  [example.go:10]
+    └── Println()
 ```
 
 ### `callgraph PATH` — full call graph
@@ -84,8 +113,14 @@ ctsq callees main src/
 Build a call graph for all functions in a path.
 
 ```sh
-ctsq callgraph src/                   # DOT format (pipe to dot -Tpng)
-ctsq callgraph src/ --format edges    # plain "caller -> callee" pairs
+ctsq callgraph fixtures/                   # DOT format (pipe to dot -Tpng)
+ctsq callgraph fixtures/ --format edges    # plain "caller -> callee" pairs
+example.c:10 -> process
+example.c:4 -> malloc
+example.go:18 -> example.go:10
+example.go:18 -> example.go:14
+example.js:1 -> example.js:5
+…
 ```
 
 ### `def NAME PATH` — definition lookup
@@ -93,9 +128,11 @@ ctsq callgraph src/ --format edges    # plain "caller -> callee" pairs
 Resolve a name to its definition location(s).
 
 ```sh
-ctsq def helper src/
-ctsq def Foo::method src/             # qualified path
-ctsq def a::b::func src/
+ctsq def helper fixtures/
+fixtures/example.js:5: const helper = () => {
+
+ctsq def NewServer fixtures/
+fixtures/example.go:14: func NewServer(host string, port int) *Server {
 ```
 
 ## Query language
@@ -156,23 +193,33 @@ selector.params(var#SIZE @v)          match SIZE in the params field
 ### Examples
 
 ```sh
-# grep -n "Symbol" file.cpp
-ctsq -q 'id#Symbol' file.cpp
+# grep -n "ARRAY_SIZE" example.c
+ctsq -q 'id#ARRAY_SIZE' fixtures/example.c
+<match>:4: "ARRAY_SIZE"
+<match>:6: "ARRAY_SIZE"
 
-# grep -n "A\|B\|C" file.cpp
-ctsq -q 'id#/A|B|C/' file.cpp
+# grep -n "ARRAY_SIZE\|malloc" example.c
+ctsq -q 'id#/ARRAY_SIZE|malloc/' fixtures/example.c
+<match>:4: "ARRAY_SIZE"
+<match>:6: "malloc"
+<match>:6: "ARRAY_SIZE"
 
-# grep -rn "Symbol" src/ --include=*.cpp
-ctsq -l cpp -q 'id#Symbol' src/
+# grep -rn "malloc" src/ --include=*.cpp
+ctsq -l cpp -q 'id#malloc' fixtures/
+<match>:7: "malloc"
+<match>:15: "malloc"
 
-# all definitions of Foo
-ctsq -q '*function#Foo' file.cpp
+# all definitions of "process"
+ctsq -q '*function#process' fixtures/example.c
+<match>:4: "void process(int ARRAY_SIZE) {"
 
-# functions that reference a constant named CONST
-ctsq -q '(*function @f).body(id#CONST)' file.cpp
+# functions that reference ARRAY_SIZE
+ctsq -q '(*function @f).body(id#ARRAY_SIZE)' fixtures/example.c
+@f:4: "void process(int ARRAY_SIZE) {"
 
 # calls to malloc inside any function definition
-ctsq -q '(*function @f).body((&function#malloc @call))' file.cpp
+ctsq -q '(*function @f).body((&function#malloc @call))' fixtures/example.c
+@f:4: "void process(int ARRAY_SIZE) {", @call:6: "malloc(ARRAY_SIZE)"
 ```
 
 ## Supported languages
