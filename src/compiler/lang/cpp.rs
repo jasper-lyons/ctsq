@@ -28,6 +28,7 @@ impl Lang for CppLang {
                     name_path: &[],
                     params_needs_bridge: false,
                     always_constraint: None,
+                    parent_name_wrap: None, always_callee_eq: None,
                 },
                 TsVariant {
                     node: "struct_specifier",
@@ -40,6 +41,7 @@ impl Lang for CppLang {
                     name_path: &[],
                     params_needs_bridge: false,
                     always_constraint: None,
+                    parent_name_wrap: None, always_callee_eq: None,
                 },
             ]),
             "module" => Some(vec![TsVariant {
@@ -53,6 +55,7 @@ impl Lang for CppLang {
                 name_path: &[],
                 params_needs_bridge: false,
                 always_constraint: None,
+                parent_name_wrap: None, always_callee_eq: None,
             }]),
             "id" => Some(vec![identifier(), field_identifier()]),
             "var" => Some(vec![identifier(), field_identifier()]),
@@ -67,6 +70,7 @@ impl Lang for CppLang {
                 name_path: &[],
                 params_needs_bridge: false,
                 always_constraint: None,
+                parent_name_wrap: None, always_callee_eq: None,
             }]),
             "type" => Some(vec![simple("type_identifier")]),
             "import" => Some(vec![simple("preproc_include")]),
@@ -107,6 +111,7 @@ fn def_variants() -> Vec<TsVariant> {
             name_path: &[("function_declarator", "declarator")],
             params_needs_bridge: true,
             always_constraint: None,
+            parent_name_wrap: None, always_callee_eq: None,
         },
         // Scoped out-of-line definition: `Foo::bar()` — navigate to qualified_identifier.name
         TsVariant {
@@ -120,6 +125,7 @@ fn def_variants() -> Vec<TsVariant> {
             name_path: &[("function_declarator", "declarator"), ("qualified_identifier", "name")],
             params_needs_bridge: true,
             always_constraint: None,
+            parent_name_wrap: None, always_callee_eq: None,
         },
         // Method prototype inside a class body: `int Find(K key);`
         TsVariant {
@@ -133,6 +139,7 @@ fn def_variants() -> Vec<TsVariant> {
             name_path: &[("function_declarator", "declarator")],
             params_needs_bridge: false,
             always_constraint: Some(" declarator: (function_declarator)"),
+            parent_name_wrap: None, always_callee_eq: None,
         },
     ]
 }
@@ -151,6 +158,7 @@ fn call_variants() -> Vec<TsVariant> {
             name_path: &[],
             params_needs_bridge: false,
             always_constraint: None,
+            parent_name_wrap: None, always_callee_eq: None,
         },
         // method call: obj.method(...) or obj->method(...)
         TsVariant {
@@ -164,6 +172,7 @@ fn call_variants() -> Vec<TsVariant> {
             name_path: &[("field_expression", "field")],
             params_needs_bridge: false,
             always_constraint: None,
+            parent_name_wrap: None, always_callee_eq: None,
         },
     ]
 }
@@ -180,6 +189,7 @@ fn identifier() -> TsVariant {
         name_path: &[],
         params_needs_bridge: false,
         always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
     }
 }
 
@@ -195,6 +205,7 @@ fn field_identifier() -> TsVariant {
         name_path: &[],
         params_needs_bridge: false,
         always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
     }
 }
 
@@ -210,5 +221,6 @@ fn simple(node: &'static str) -> TsVariant {
         name_path: &[],
         params_needs_bridge: false,
         always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
     }
 }

@@ -1,0 +1,11 @@
+{
+  // paths map aliases to real dirs
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "~/*": ["src/*"],
+      "@/*": ["src/*"],
+      "@app/*": ["src/shared/*"],
+    },
+  },
+}

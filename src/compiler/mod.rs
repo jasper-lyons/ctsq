@@ -48,6 +48,8 @@ struct Fragment {
     /// Deferred name predicate for nodes where the node itself is the name.
     /// Resolved when a Group provides outer_capture, or at emit time.
     pending_name_match: Option<NameMatch>,
+    /// When set, wrap node_body in a parent pattern at emit time to filter by name via parent.
+    pending_parent_wrap: Option<(crate::compiler::lang::ParentNameWrap, NameMatch)>,
     // Field routing — set from whichever TsVariant produced this fragment
     params_field: Option<&'static str>,
     params_container: Option<&'static str>,
@@ -76,6 +78,22 @@ impl Fragment {
     fn emit(mut self) -> String {
         self.resolve();
         let node = format!("({})", self.node_body);
+
+        if let Some((wrap, nm)) = self.pending_parent_wrap {
+            // Emit: ((parent name_field: (name_node) @_n self_field: (inner) @_root) predicate)
+            let id = fresh_id();
+            let name_cap = format!("@_n{}", id);
+            let pred = name_predicate(&name_cap, &nm);
+            let cap = self.outer_capture.get_or_insert_with(|| format!("_root{}", fresh_id()));
+            let inner_name = format!("({}) {}", wrap.name_node, name_cap);
+            let wrapped = format!(
+                "({} {}: {} {}: {} @{})",
+                wrap.parent, wrap.name_field, inner_name,
+                wrap.self_field, node, cap,
+            );
+            return format!("({} {})", wrapped, pred);
+        }
+
         let cap = self.outer_capture.get_or_insert_with(|| format!("_root{}", fresh_id()));
         let with_cap = format!("{} @{}", node, cap);
         if self.predicates.is_empty() {
@@ -296,6 +314,7 @@ fn compile_wildcard(atom: &Atom) -> Fragment {
         predicates: vec![],
         outer_capture: None,
         pending_name_match: atom.name_match.clone(),
+        pending_parent_wrap: None,
         params_field: None,
         params_container: None,
         params_needs_bridge: false,
@@ -311,6 +330,7 @@ fn compile_passthrough(node_type: &str, atom: &Atom) -> Fragment {
         outer_capture: None,
         // Unknown / pass-through nodes: their text IS their name, same logic as self-name.
         pending_name_match: atom.name_match.clone(),
+        pending_parent_wrap: None,
         params_field: None,
         params_container: None,
         params_needs_bridge: false,
@@ -324,6 +344,7 @@ fn compile_variant(variant: &TsVariant, atom: &Atom) -> Fragment {
     let mut node_body = variant.node.to_string();
     let mut predicates = Vec::new();
     let mut pending_name_match = None;
+    let mut pending_parent_wrap = None;
 
     if let Some(nm) = &atom.name_match {
         match variant.name_field {
@@ -344,10 +365,19 @@ fn compile_variant(variant: &TsVariant, atom: &Atom) -> Fragment {
                 pending_name_match = Some(nm.clone());
             }
             None => {
-                // Node has no accessible name (e.g. arrow_function with name in parent).
-                // Skip the name predicate — the variant still matches, just unfiltered.
+                // Name lives in parent (e.g. arrow_function inside variable_declarator).
+                if let Some(wrap) = variant.parent_name_wrap {
+                    pending_parent_wrap = Some((wrap, nm.clone()));
+                }
+                // else: no way to filter by name — variant matches unfiltered.
             }
         }
+    } else if let Some(value) = variant.always_callee_eq {
+        // Force a callee-name predicate with no user name filter (e.g. require(...)).
+        let cap = format!("@_c{}", id);
+        node_body.push_str(&format!(" {}: ({}) {}",
+            variant.name_field.unwrap_or("function"), variant.name_node, cap));
+        predicates.push(format!("(#eq? {} \"{}\")", cap, value));
     } else if let Some(constraint) = variant.always_constraint {
         node_body.push_str(constraint);
     }
@@ -357,6 +387,7 @@ fn compile_variant(variant: &TsVariant, atom: &Atom) -> Fragment {
         predicates,
         outer_capture: None,
         pending_name_match,
+        pending_parent_wrap,
         params_field: variant.params_field,
         params_container: variant.params_container,
         params_needs_bridge: variant.params_needs_bridge,
@@ -372,6 +403,7 @@ fn apply_field_access(frags: Vec<Fragment>, fa: &FieldAccess, lang: &dyn Lang) -
             predicates: vec![],
             outer_capture: None,
             pending_name_match: None,
+            pending_parent_wrap: None,
             params_field: None,
             params_container: None,
             params_needs_bridge: false,

@@ -65,12 +65,13 @@ fn walk_top_level(node: Node, source: &[u8], lang_name: &str, out: &mut Vec<Item
 
 fn try_extract(node: Node, source: &[u8], lang_name: &str, top: bool) -> Option<Item> {
     match lang_name {
-        "cpp" | "c" => extract_c(node, source, lang_name, top),
-        "python"     => extract_python(node, source, top),
-        "javascript" => extract_js(node, source, top),
-        "rust"       => extract_rust(node, source, top),
-        "go"         => extract_go(node, source, top),
-        _            => None,
+        "cpp" | "c"            => extract_c(node, source, lang_name, top),
+        "python"               => extract_python(node, source, top),
+        "javascript"           => extract_js(node, source, top),
+        "typescript" | "tsx"   => extract_ts(node, source, top),
+        "rust"                 => extract_rust(node, source, top),
+        "go"                   => extract_go(node, source, top),
+        _                      => None,
     }
 }
 
@@ -267,6 +268,89 @@ fn extract_js(node: Node, source: &[u8], top: bool) -> Option<Item> {
                         // arrow functions / function expressions: show as fn
                         return Some(Item {
                             kind: "fn",
+                            name: node_text(n, source).to_string(),
+                            line: node.start_position().row + 1,
+                            children: vec![],
+                        });
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+// ── TypeScript / TSX ─────────────────────────────────────────────────────────
+
+fn extract_ts(node: Node, source: &[u8], top: bool) -> Option<Item> {
+    match node.kind() {
+        // unwrap export/declare wrappers and recurse into the inner declaration
+        "export_statement" | "ambient_declaration" => {
+            let mut cur = node.walk();
+            for child in node.children(&mut cur) {
+                if let Some(item) = extract_ts(child, source, top) {
+                    return Some(item);
+                }
+            }
+            None
+        }
+        "function_declaration" | "function_signature" => {
+            let name = node.child_by_field_name("name")
+                .map(|n| node_text(n, source).to_string())?;
+            Some(Item { kind: "fn", name, line: node.start_position().row + 1, children: vec![] })
+        }
+        "class_declaration" | "abstract_class_declaration" => {
+            let name = node.child_by_field_name("name")
+                .map(|n| node_text(n, source).to_string())
+                .unwrap_or_else(|| "(anonymous)".into());
+            let line = node.start_position().row + 1;
+            let mut children = Vec::new();
+            if let Some(body) = node.child_by_field_name("body") {
+                let mut cur = body.walk();
+                for child in body.children(&mut cur) {
+                    if matches!(child.kind(), "method_definition" | "abstract_method_signature") {
+                        if let Some(n) = child.child_by_field_name("name") {
+                            children.push(Item {
+                                kind: "fn",
+                                name: node_text(n, source).to_string(),
+                                line: child.start_position().row + 1,
+                                children: vec![],
+                            });
+                        }
+                    }
+                }
+            }
+            Some(Item { kind: "class", name, line, children })
+        }
+        "interface_declaration" => {
+            let name = node.child_by_field_name("name")
+                .map(|n| node_text(n, source).to_string())
+                .unwrap_or_else(|| "(anonymous)".into());
+            Some(Item { kind: "interface", name, line: node.start_position().row + 1, children: vec![] })
+        }
+        "enum_declaration" => {
+            let name = node.child_by_field_name("name")
+                .map(|n| node_text(n, source).to_string())
+                .unwrap_or_else(|| "(anonymous)".into());
+            Some(Item { kind: "enum", name, line: node.start_position().row + 1, children: vec![] })
+        }
+        "type_alias_declaration" => {
+            let name = node.child_by_field_name("name")
+                .map(|n| node_text(n, source).to_string())?;
+            Some(Item { kind: "type", name, line: node.start_position().row + 1, children: vec![] })
+        }
+        "lexical_declaration" | "variable_declaration" if top => {
+            let mut cur = node.walk();
+            for child in node.children(&mut cur) {
+                if child.kind() == "variable_declarator" {
+                    if let Some(n) = child.child_by_field_name("name") {
+                        let val_kind = child.child_by_field_name("value")
+                            .map(|v| v.kind())
+                            .unwrap_or("");
+                        let kind = if matches!(val_kind, "arrow_function" | "function") { "fn" } else { "var" };
+                        return Some(Item {
+                            kind,
                             name: node_text(n, source).to_string(),
                             line: node.start_position().row + 1,
                             children: vec![],

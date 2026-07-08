@@ -4,11 +4,14 @@ mod query;
 mod runner;
 mod tree;
 mod calltree;
+mod importgraph;
+mod types;
 mod resolve;
 
 use clap::{Parser, Subcommand};
 use compiler::lang;
 use std::collections::HashMap;
+use std::io::{BufRead, IsTerminal, Read};
 
 #[derive(Parser)]
 #[command(
@@ -48,6 +51,15 @@ EXAMPLES
   ctsq -q '*function#Foo' file.cpp                        grep -n \"void Foo\" file.cpp
   ctsq -q '(*function @f).body(id#CONST)' file.cpp        functions that reference CONST
 
+STDIN
+  Pipe file paths (language detected per file from extension):
+    find . -name '*.rs' | ctsq -q 'id#Symbol'
+    find . -name '*.py' | ctsq -l python -q '*function'
+
+  Pipe source content directly (requires --lang; use - as the path):
+    cat file.ts | ctsq -l typescript -q '*function' -
+    echo 'fn foo() {}' | ctsq -l rust -q '*function' -
+
 SUBCOMMANDS
   ctsq tree file.cpp                    structural outline of a file
   ctsq tree src/                        structural outline of all files in a directory
@@ -57,6 +69,12 @@ SUBCOMMANDS
   ctsq callgraph src/ --format edges    full call graph as plain caller -> callee pairs
   ctsq def helper src/                  where is this function defined (file:line)
   ctsq def Foo::method src/             resolve a qualified path or method to its definition
+  ctsq imports src/main.rs src/         what files this file imports (down the import tree)
+  ctsq importers src/files.rs src/      what files import this file (up the import tree)
+  ctsq importgraph src/                 full import graph in DOT format (pipe to dot -Tpng)
+  ctsq importgraph src/ --format edges  full import graph as plain source -> target pairs
+  ctsq types                            how abstract types map to tree-sitter nodes (all langs)
+  ctsq types rust                       the same mapping for a single language
 
 RESOLUTION
   Rust and Go call sites resolve through imports/aliases, qualified paths,
@@ -65,7 +83,15 @@ RESOLUTION
   a call through a Go interface or a Rust dyn Trait / T: Trait / impl Trait
   receiver gets one edge per implementing type. Ambiguous calls resolve to
   the best-ranked candidate (same file > same dir > imported) and are marked
-  with '?'. Other languages match by name only."
+  with '?'. Other languages match by name only.
+
+  Import edges (imports/importers/importgraph) resolve per language: C/C++
+  #include, JS/TS relative paths (with extension + index probing, plus
+  require/dynamic-import/re-export), Python dotted and relative imports, and
+  Rust use paths. Go imports resolve to a package (a directory node) with edges
+  annotated by the specific member file whose symbols are used. Externals and
+  unresolved specifiers show as leaf '(external)' nodes; ambiguous resolutions
+  are marked with '?'."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -79,7 +105,8 @@ struct Cli {
     #[arg(long, short)]
     query: Option<String>,
 
-    /// Source files or directories to search
+    /// Source files, directories, or '-' to read source from stdin (requires --lang).
+    /// Omit entirely to read file paths from stdin (e.g. find . | ctsq -q QUERY).
     #[arg(num_args(0..))]
     source_files: Vec<String>,
 
@@ -139,6 +166,47 @@ enum Commands {
         /// File or directory to search
         path: String,
     },
+    /// Find all usage sites of a name (complement of def)
+    Refs {
+        /// Identifier name to find references to
+        name: String,
+        /// File or directory to search
+        path: String,
+    },
+    /// Show what files/packages a file imports (forward dependency tree)
+    Imports {
+        /// File whose imports to trace
+        file: String,
+        /// File or directory that scopes resolution
+        path: String,
+        /// Maximum depth to traverse
+        #[arg(long, default_value = "3")]
+        depth: usize,
+    },
+    /// Show what files import a file (reverse dependents tree)
+    Importers {
+        /// File whose importers to trace
+        file: String,
+        /// File or directory that scopes resolution
+        path: String,
+        /// Maximum depth to traverse
+        #[arg(long, default_value = "3")]
+        depth: usize,
+    },
+    /// Build a full import graph for a path
+    Importgraph {
+        /// File or directory to analyze
+        path: String,
+        /// Output format: dot (default) or edges
+        #[arg(long, default_value = "dot")]
+        format: String,
+    },
+    /// Show how abstract node types map to tree-sitter nodes, per language
+    Types {
+        /// Languages to show (default: all). E.g. `ctsq types rust go`
+        #[arg(num_args(0..))]
+        langs: Vec<String>,
+    },
 }
 
 fn main() {
@@ -170,6 +238,26 @@ fn main() {
         }
         Some(Commands::Def { name_or_expr, path }) => {
             resolve::run_def(&name_or_expr, &path, cli.lang.as_deref(), cli.no_ignore);
+            return;
+        }
+        Some(Commands::Refs { name, path }) => {
+            run_refs(&name, &path, cli.lang.as_deref(), cli.no_ignore);
+            return;
+        }
+        Some(Commands::Imports { file, path, depth }) => {
+            importgraph::imports(&file, &path, cli.lang.as_deref(), depth, cli.no_ignore);
+            return;
+        }
+        Some(Commands::Importers { file, path, depth }) => {
+            importgraph::importers(&file, &path, cli.lang.as_deref(), depth, cli.no_ignore);
+            return;
+        }
+        Some(Commands::Importgraph { path, format }) => {
+            importgraph::importgraph(&path, cli.lang.as_deref(), cli.no_ignore, &format);
+            return;
+        }
+        Some(Commands::Types { langs }) => {
+            types::run(&langs, cli.lang.as_deref());
             return;
         }
         None => {}
@@ -218,16 +306,59 @@ fn main() {
         }
     }
 
-    if cli.source_files.is_empty() {
-        if cli.show_query && cli.lang.is_none() {
-            eprintln!("--show-query requires --lang when no source file is given");
-            std::process::exit(1);
+    let stdin_source_files: Vec<String>;
+    let files_from_stdin: bool;
+    let effective_files: &Vec<String> = if cli.source_files.is_empty() {
+        if !std::io::stdin().is_terminal() {
+            stdin_source_files = std::io::stdin()
+                .lock()
+                .lines()
+                .filter_map(|l| l.ok())
+                .filter(|l| !l.trim().is_empty())
+                .collect();
+            files_from_stdin = true;
+            &stdin_source_files
+        } else {
+            if cli.show_query && cli.lang.is_none() {
+                eprintln!("--show-query requires --lang when no source file is given");
+                std::process::exit(1);
+            }
+            return;
         }
-        return;
-    }
+    } else {
+        files_from_stdin = false;
+        &cli.source_files
+    };
+
+    let stdin_bytes: Option<Vec<u8>> = if effective_files.iter().any(|f| f == "-") {
+        let mut buf = Vec::new();
+        std::io::stdin().read_to_end(&mut buf)
+            .unwrap_or_else(|e| { eprintln!("Failed to read stdin: {}", e); std::process::exit(1) });
+        Some(buf)
+    } else {
+        None
+    };
 
     let mut jobs: Vec<(String, &'static str)> = Vec::new();
-    for path in &cli.source_files {
+    for path in effective_files {
+        if path == "-" {
+            let lang_name = match &cli.lang {
+                Some(ln) => match lang::lang_for_name_canonical(ln) {
+                    Some(n) => n,
+                    None => {
+                        eprintln!("Unknown language: {}. Supported: c, cpp, javascript, python, rust, go", ln);
+                        std::process::exit(1);
+                    }
+                },
+                None => {
+                    eprintln!("--lang is required when reading from stdin (-)");
+                    std::process::exit(1);
+                }
+            };
+            jobs.push(("-".to_string(), lang_name));
+            continue;
+        }
+
         let meta = match std::fs::metadata(path) {
             Ok(m) => m,
             Err(e) => {
@@ -235,7 +366,9 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        if meta.is_dir() {
+        if meta.is_dir() && files_from_stdin {
+            continue;
+        } else if meta.is_dir() {
             let exts = cli.lang.as_deref()
                 .map(lang::extensions_for_name)
                 .unwrap_or_else(lang::all_known_extensions);
@@ -309,13 +442,19 @@ fn main() {
             println!("\n=== Matches in {} ===", file);
         }
 
-        let source = match std::fs::read(file) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Failed to read {}: {}", file, e);
-                continue;
+        let source = if file == "-" {
+            stdin_bytes.as_ref().expect("stdin pre-read").clone()
+        } else {
+            match std::fs::read(file) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Failed to read {}: {}", file, e);
+                    continue;
+                }
             }
         };
+
+        let display = if file == "-" { "<stdin>" } else { file.as_str() };
 
         match runner::run(compiled, lang_box.as_ref(), &source, cli.body) {
             Ok(matches) if matches.is_empty() => {
@@ -326,7 +465,7 @@ fn main() {
             Ok(matches) => {
                 for m in &matches {
                     if multiple {
-                        println!("{}:{}", file, m);
+                        println!("{}:{}", display, m);
                     } else {
                         println!("{}", m);
                     }
@@ -335,6 +474,47 @@ fn main() {
             Err(e) => {
                 eprintln!("Runner error in {}: {}", file, e);
             }
+        }
+    }
+}
+
+fn run_refs(name: &str, path: &str, lang_override: Option<&str>, no_ignore: bool) {
+    let query_str = format!("id#{}", name);
+    let ast = match query::parse(&query_str) {
+        Ok(q) => q,
+        Err(e) => { eprintln!("Parse error: {}", e); std::process::exit(1); }
+    };
+
+    let jobs = files::resolve_jobs(path, lang_override, no_ignore);
+    if jobs.is_empty() {
+        return;
+    }
+    let multiple = jobs.len() > 1 || std::path::Path::new(path).is_dir();
+
+    let mut compiled_cache: HashMap<&'static str, (Box<dyn lang::Lang>, compiler::CompiledQuery)> =
+        HashMap::new();
+
+    for (file, lang_name) in &jobs {
+        let (lang_box, compiled) = compiled_cache.entry(lang_name).or_insert_with(|| {
+            let l = lang::for_name(lang_name).expect("lang_name always valid here");
+            let c = compiler::compile(&ast, l.as_ref());
+            (l, c)
+        });
+        let source = match std::fs::read(file) {
+            Ok(s) => s,
+            Err(e) => { eprintln!("Failed to read {}: {}", file, e); continue; }
+        };
+        match runner::run(compiled, lang_box.as_ref(), &source, false) {
+            Ok(matches) => {
+                for m in &matches {
+                    if multiple {
+                        println!("{}:{}", file, m);
+                    } else {
+                        println!("{}", m);
+                    }
+                }
+            }
+            Err(e) => eprintln!("Runner error in {}: {}", file, e),
         }
     }
 }

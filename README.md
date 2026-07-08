@@ -61,6 +61,21 @@ Search files or directories with an abstract query. Language is inferred from fi
 ctsq -q 'QUERY' file.rs
 ctsq -q 'QUERY' src/            # all supported files under src/
 ctsq -l rust -q 'QUERY' src/   # force Rust
+ctsq -q 'QUERY' a.rs b.rs      # explicit file list
+```
+
+**Stdin — file paths** (language detected per file from extension):
+
+```sh
+find . -name '*.rs' | ctsq -q 'id#Symbol'
+find . -name '*.py' | ctsq -l python -q '*function'
+```
+
+**Stdin — source content** (pass `-` as the path; `--lang` required):
+
+```sh
+cat file.ts | ctsq -l typescript -q '*function' -
+echo 'fn foo() {}' | ctsq -l rust -q '*function' -
 ```
 
 **Flags:**
@@ -134,6 +149,51 @@ fixtures/example.js:5: const helper = () => {
 ctsq def NewServer fixtures/
 fixtures/example.go:14: func NewServer(host string, port int) *Server {
 ```
+
+### `imports FILE PATH` — import chain (down)
+
+What files a file imports, traced down the dependency tree (the file-level
+analogue of `callees`). `PATH` scopes resolution.
+
+```sh
+ctsq imports src/main.rs src/
+src/main.rs
+├── clap  (external)
+├── mod.rs  [src/compiler/lang/mod.rs]
+└── std  (external)
+```
+
+### `importers FILE PATH` — import chain (up)
+
+What files import a file, traced up the dependents tree (the analogue of
+`callers`).
+
+```sh
+ctsq importers src/files.rs src/
+src/files.rs
+├── calltree.rs  [src/calltree.rs]
+└── importgraph.rs  [src/importgraph.rs]
+```
+
+### `importgraph PATH` — full import graph
+
+Build a file-level import graph for a path.
+
+```sh
+ctsq importgraph src/                   # DOT format (pipe to dot -Tpng)
+ctsq importgraph src/ --format edges    # plain "source -> target" pairs
+```
+
+Resolution is per language: C/C++ `#include`, JS/TS relative paths (with
+extension and `index` probing, plus `require`, dynamic `import()`, and
+`export … from`), Python dotted and relative imports, and Rust `use` paths.
+JS/TS path aliases (`~/…`, `@/…`, `@app/…`) resolve through the nearest
+`tsconfig.json` / `jsconfig.json` (`baseUrl` + `paths`, following `extends`);
+projects without one fall back to matching the specifier's path tail.
+A Go import names a package (a directory), so Go edges point at the specific
+member file whose symbols are used, tagged with the package. Externals and
+unresolved specifiers appear as `(external)` leaves; ambiguous resolutions are
+marked with `?`.
 
 ## Query language
 

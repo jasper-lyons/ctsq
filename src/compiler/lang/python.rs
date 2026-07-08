@@ -27,11 +27,15 @@ impl Lang for PyLang {
                 name_path: &[],
                 params_needs_bridge: false,
                 always_constraint: None,
+                parent_name_wrap: None, always_callee_eq: None,
             }]),
             "id" => Some(vec![identifier()]),
             "var" => Some(vec![identifier()]),
             "param" => Some(vec![identifier()]),
-            "import" => Some(vec![simple("import_statement")]),
+            "import" => Some(vec![
+                simple("import_statement"),
+                simple("import_from_statement"),
+            ]),
             "literal" => Some(vec![
                 simple("integer"),
                 simple("float"),
@@ -63,6 +67,7 @@ fn def_variant() -> TsVariant {
         name_path: &[],
         params_needs_bridge: false,
         always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
     }
 }
 
@@ -78,6 +83,7 @@ fn call_variant() -> TsVariant {
         name_path: &[],
         params_needs_bridge: false,
         always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
     }
 }
 
@@ -93,6 +99,7 @@ fn identifier() -> TsVariant {
         name_path: &[],
         params_needs_bridge: false,
         always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
     }
 }
 
@@ -108,5 +115,6 @@ fn simple(node: &'static str) -> TsVariant {
         name_path: &[],
         params_needs_bridge: false,
         always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
     }
 }

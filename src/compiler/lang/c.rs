@@ -29,6 +29,7 @@ impl Lang for CLang {
                 name_path: &[],
                 params_needs_bridge: false,
                 always_constraint: None,
+                parent_name_wrap: None, always_callee_eq: None,
             }]),
             "type" => Some(vec![simple("type_identifier")]),
             "import" => Some(vec![simple("preproc_include")]),
@@ -65,6 +66,7 @@ fn call_variant() -> TsVariant {
         name_path: &[],
         params_needs_bridge: false,
         always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
     }
 }
 
@@ -80,6 +82,7 @@ fn def_variant() -> TsVariant {
         name_path: &[("function_declarator", "declarator")],
         params_needs_bridge: true,
         always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
     }
 }
 
@@ -95,6 +98,7 @@ fn field_identifier() -> TsVariant {
         name_path: &[],
         params_needs_bridge: false,
         always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
     }
 }
 
@@ -110,6 +114,7 @@ fn identifier() -> TsVariant {
         name_path: &[],
         params_needs_bridge: false,
         always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
     }
 }
 
@@ -125,5 +130,6 @@ fn simple(node: &'static str) -> TsVariant {
         name_path: &[],
         params_needs_bridge: false,
         always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
     }
 }

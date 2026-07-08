@@ -28,6 +28,7 @@ impl Lang for RustLang {
                     name_path: &[],
                     params_needs_bridge: false,
                     always_constraint: None,
+                    parent_name_wrap: None, always_callee_eq: None,
                 },
                 TsVariant {
                     node: "enum_item",
@@ -40,6 +41,7 @@ impl Lang for RustLang {
                     name_path: &[],
                     params_needs_bridge: false,
                     always_constraint: None,
+                    parent_name_wrap: None, always_callee_eq: None,
                 },
                 TsVariant {
                     node: "trait_item",
@@ -52,6 +54,7 @@ impl Lang for RustLang {
                     name_path: &[],
                     params_needs_bridge: false,
                     always_constraint: None,
+                    parent_name_wrap: None, always_callee_eq: None,
                 },
             ]),
             "module" => Some(vec![TsVariant {
@@ -65,6 +68,7 @@ impl Lang for RustLang {
                 name_path: &[],
                 params_needs_bridge: false,
                 always_constraint: None,
+                parent_name_wrap: None, always_callee_eq: None,
             }]),
             "id" => Some(vec![identifier()]),
             "var" => Some(vec![TsVariant {
@@ -78,6 +82,7 @@ impl Lang for RustLang {
                 name_path: &[],
                 params_needs_bridge: false,
                 always_constraint: None,
+                parent_name_wrap: None, always_callee_eq: None,
             }]),
             "param" => Some(vec![TsVariant {
                 node: "parameter",
@@ -90,6 +95,7 @@ impl Lang for RustLang {
                 name_path: &[],
                 params_needs_bridge: false,
                 always_constraint: None,
+                parent_name_wrap: None, always_callee_eq: None,
             }]),
             "type" => Some(vec![simple("type_identifier")]),
             "import" => Some(vec![simple("use_declaration")]),
@@ -127,6 +133,7 @@ fn identifier() -> TsVariant {
         name_path: &[],
         params_needs_bridge: false,
         always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
     }
 }
 
@@ -142,6 +149,7 @@ fn fn_item() -> TsVariant {
         name_path: &[],
         params_needs_bridge: false,
         always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
     }
 }
 
@@ -157,6 +165,7 @@ fn call_variant() -> TsVariant {
         name_path: &[],
         params_needs_bridge: false,
         always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
     }
 }
 
@@ -172,5 +181,6 @@ fn simple(node: &'static str) -> TsVariant {
         name_path: &[],
         params_needs_bridge: false,
         always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
     }
 }

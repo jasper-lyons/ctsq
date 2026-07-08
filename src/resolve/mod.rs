@@ -15,7 +15,9 @@
 pub mod fallback;
 pub mod go;
 pub mod graph;
+pub mod imports;
 pub mod rust;
+pub mod tsconfig;
 
 use std::collections::HashMap;
 

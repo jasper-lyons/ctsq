@@ -28,6 +28,7 @@ impl Lang for GoLang {
                 name_path: &[],
                 params_needs_bridge: false,
                 always_constraint: None,
+                parent_name_wrap: None, always_callee_eq: None,
             }]),
             "id" => Some(vec![identifier(), field_identifier()]),
             "var" => Some(vec![TsVariant {
@@ -41,6 +42,7 @@ impl Lang for GoLang {
                 name_path: &[],
                 params_needs_bridge: false,
                 always_constraint: None,
+                parent_name_wrap: None, always_callee_eq: None,
             }]),
             "param" => Some(vec![TsVariant {
                 node: "parameter_declaration",
@@ -53,6 +55,7 @@ impl Lang for GoLang {
                 name_path: &[],
                 params_needs_bridge: false,
                 always_constraint: None,
+                parent_name_wrap: None, always_callee_eq: None,
             }]),
             "type" => Some(vec![simple("type_identifier")]),
             "import" => Some(vec![simple("import_declaration")]),
@@ -92,6 +95,7 @@ fn identifier() -> TsVariant {
         name_path: &[],
         params_needs_bridge: false,
         always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
     }
 }
 
@@ -107,6 +111,7 @@ fn field_identifier() -> TsVariant {
         name_path: &[],
         params_needs_bridge: false,
         always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
     }
 }
 
@@ -122,6 +127,7 @@ fn fn_decl() -> TsVariant {
         name_path: &[],
         params_needs_bridge: false,
         always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
     }
 }
 
@@ -137,6 +143,7 @@ fn method_decl() -> TsVariant {
         name_path: &[],
         params_needs_bridge: false,
         always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
     }
 }
 
@@ -153,6 +160,7 @@ fn call_ident() -> TsVariant {
         name_path: &[],
         params_needs_bridge: false,
         always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
     }
 }
 
@@ -169,6 +177,7 @@ fn call_selector() -> TsVariant {
         name_path: &[("selector_expression", "field")],
         params_needs_bridge: false,
         always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
     }
 }
 
@@ -184,5 +193,6 @@ fn simple(node: &'static str) -> TsVariant {
         name_path: &[],
         params_needs_bridge: false,
         always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
     }
 }

@@ -27,12 +27,13 @@ impl Lang for JsLang {
                 name_path: &[],
                 params_needs_bridge: false,
                 always_constraint: None,
+                parent_name_wrap: None, always_callee_eq: None,
             }]),
             "id" => Some(vec![identifier()]),
             "var" => Some(vec![identifier()]),
             "param" => Some(vec![identifier()]),
             "type" => Some(vec![simple("type_identifier")]),
-            "import" => Some(vec![simple("import_statement")]),
+            "import" => Some(import_variants()),
             "literal" => Some(vec![
                 simple("number"),
                 simple("string"),
@@ -67,6 +68,7 @@ fn def_variants() -> Vec<TsVariant> {
             name_path: &[],
             params_needs_bridge: false,
             always_constraint: None,
+            parent_name_wrap: None, always_callee_eq: None,
         },
         TsVariant {
             node: "function_expression",
@@ -79,8 +81,8 @@ fn def_variants() -> Vec<TsVariant> {
             name_path: &[],
             params_needs_bridge: false,
             always_constraint: None,
+            parent_name_wrap: None, always_callee_eq: None,
         },
-        // arrow_function: name lives in parent variable_declarator — emit without name predicate.
         TsVariant {
             node: "arrow_function",
             name_field: None,
@@ -92,6 +94,13 @@ fn def_variants() -> Vec<TsVariant> {
             name_path: &[],
             params_needs_bridge: false,
             always_constraint: None,
+            parent_name_wrap: Some(super::ParentNameWrap {
+                parent: "variable_declarator",
+                name_field: "name",
+                name_node: "identifier",
+                self_field: "value",
+            }),
+            always_callee_eq: None,
         },
         TsVariant {
             node: "method_definition",
@@ -104,6 +113,7 @@ fn def_variants() -> Vec<TsVariant> {
             name_path: &[],
             params_needs_bridge: false,
             always_constraint: None,
+            parent_name_wrap: None, always_callee_eq: None,
         },
     ]
 }
@@ -121,6 +131,7 @@ fn call_variants() -> Vec<TsVariant> {
             name_path: &[],
             params_needs_bridge: false,
             always_constraint: None,
+            parent_name_wrap: None, always_callee_eq: None,
         },
         TsVariant {
             node: "call_expression",
@@ -133,6 +144,33 @@ fn call_variants() -> Vec<TsVariant> {
             name_path: &[("member_expression", "property")],
             params_needs_bridge: false,
             always_constraint: None,
+            parent_name_wrap: None, always_callee_eq: None,
+        },
+        TsVariant {
+            node: "jsx_self_closing_element",
+            name_field: Some("name"),
+            name_node: "identifier",
+            params_field: None,
+            params_container: None,
+            body_field: None,
+            body_container: None,
+            name_path: &[],
+            params_needs_bridge: false,
+            always_constraint: None,
+            parent_name_wrap: None, always_callee_eq: None,
+        },
+        TsVariant {
+            node: "jsx_opening_element",
+            name_field: Some("name"),
+            name_node: "identifier",
+            params_field: None,
+            params_container: None,
+            body_field: None,
+            body_container: None,
+            name_path: &[],
+            params_needs_bridge: false,
+            always_constraint: None,
+            parent_name_wrap: None, always_callee_eq: None,
         },
     ]
 }
@@ -149,6 +187,7 @@ fn identifier() -> TsVariant {
         name_path: &[],
         params_needs_bridge: false,
         always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
     }
 }
 
@@ -164,5 +203,27 @@ fn simple(node: &'static str) -> TsVariant {
         name_path: &[],
         params_needs_bridge: false,
         always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
     }
+}
+
+/// All constructs that create a module dependency, so `-q 'import'` matches the
+/// same things the import graph does: static `import`, `export … from`
+/// re-exports, dynamic `import()`, and CommonJS `require()`. Shared with TS.
+pub(super) fn import_variants() -> Vec<TsVariant> {
+    vec![
+        simple("import_statement"),
+        // re-export with a source (`export { x } from "./m"`) — the source field
+        // excludes plain `export` declarations.
+        TsVariant { always_constraint: Some(" source: (string)"), ..simple("export_statement") },
+        // dynamic import: `import("./m")` — the callee is the `import` keyword node.
+        TsVariant { always_constraint: Some(" function: (import)"), ..simple("call_expression") },
+        // CommonJS: `require("./m")` — force a callee-name predicate.
+        TsVariant {
+            name_field: Some("function"),
+            name_node: "identifier",
+            always_callee_eq: Some("require"),
+            ..simple("call_expression")
+        },
+    ]
 }
