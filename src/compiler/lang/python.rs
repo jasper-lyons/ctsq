@@ -10,11 +10,11 @@ impl Lang for PyLang {
                 Some(Sigil::Def) | None => {
                     let mut v = vec![def_variant()];
                     if sigil.is_none() {
-                        v.push(call_variant());
+                        v.extend(call_variants());
                     }
                     v
                 }
-                Some(Sigil::Ref) => vec![call_variant()],
+                Some(Sigil::Ref) => call_variants(),
             }),
             "class" => Some(vec![TsVariant {
                 node: "class_definition",
@@ -45,7 +45,8 @@ impl Lang for PyLang {
             "if" => Some(vec![simple("if_statement")]),
             "for" => Some(vec![simple("for_statement")]),
             "while" => Some(vec![simple("while_statement")]),
-            "call" | "module" | "switch" | "type" | "op" => Some(vec![]),
+            "call" => Some(vec![simple("call")]),
+            "module" | "switch" | "type" | "op" => Some(vec![]),
             _ => None,
         }
     }
@@ -71,20 +72,37 @@ fn def_variant() -> TsVariant {
     }
 }
 
-fn call_variant() -> TsVariant {
-    TsVariant {
-        node: "call",
-        name_field: Some("function"),
-        name_node: "identifier",
-        params_field: Some("arguments"),
-        params_container: Some("argument_list"),
-        body_field: None,
-        body_container: None,
-        name_path: &[],
-        params_needs_bridge: false,
-        always_constraint: None,
-        parent_name_wrap: None, always_callee_eq: None,
-    }
+fn call_variants() -> Vec<TsVariant> {
+    vec![
+        TsVariant {
+            node: "call",
+            name_field: Some("function"),
+            name_node: "identifier",
+            params_field: Some("arguments"),
+            params_container: Some("argument_list"),
+            body_field: None,
+            body_container: None,
+            name_path: &[],
+            params_needs_bridge: false,
+            always_constraint: None,
+            parent_name_wrap: None, always_callee_eq: None,
+        },
+        // Method call: u.send_email() — callee is an `attribute` node whose
+        // `attribute` field holds the method-name identifier.
+        TsVariant {
+            node: "call",
+            name_field: Some("function"),
+            name_node: "identifier",
+            params_field: Some("arguments"),
+            params_container: Some("argument_list"),
+            body_field: None,
+            body_container: None,
+            name_path: &[("attribute", "attribute")],
+            params_needs_bridge: false,
+            always_constraint: None,
+            parent_name_wrap: None, always_callee_eq: None,
+        },
+    ]
 }
 
 fn identifier() -> TsVariant {
