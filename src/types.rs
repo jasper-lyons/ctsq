@@ -7,7 +7,8 @@ use crate::query::ast::Sigil;
 use std::collections::HashSet;
 
 /// The fixed abstract-type vocabulary, in a sensible reading order.
-const ABSTRACT_TYPES: &[&str] = &[
+/// Also the classification priority order for `example` (query-by-example).
+pub const ABSTRACT_TYPES: &[&str] = &[
     "id", "function", "call", "class", "module", "type", "var", "param",
     "import", "literal", "block", "if", "for", "while", "switch", "op",
 ];

@@ -1,4 +1,5 @@
 mod compiler;
+mod example;
 mod files;
 mod query;
 mod runner;
@@ -60,6 +61,14 @@ STDIN
     cat file.ts | ctsq -l typescript -q '*function' -
     echo 'fn foo() {}' | ctsq -l rust -q '*function' -
 
+QUERY BY EXAMPLE
+  Paste the code you're looking for; ctsq derives the queries that match it:
+    ctsq example 'u.sendEmail(msg)' -l js
+  Candidates run most-literal (exact structural match) to most-general, each
+  one verified against the snippet — every printed line works with -q.
+  $UPPERCASE marks a wildcard; unmarked parts stay literal:
+    ctsq example '$X.sendEmail(msg)' -l js   any receiver; method + arg pinned
+
 SUBCOMMANDS
   ctsq tree file.cpp                    structural outline of a file
   ctsq tree src/                        structural outline of all files in a directory
@@ -75,6 +84,8 @@ SUBCOMMANDS
   ctsq importgraph src/ --format edges  full import graph as plain source -> target pairs
   ctsq types                            how abstract types map to tree-sitter nodes (all langs)
   ctsq types rust                       the same mapping for a single language
+  ctsq example 'u.sendEmail()' -l js    suggest queries that match this code snippet
+  ctsq example '$X.send(msg)' -l js     $UPPERCASE = wildcard; unmarked parts stay literal
 
 RESOLUTION
   Rust and Go call sites resolve through imports/aliases, qualified paths,
@@ -201,6 +212,27 @@ enum Commands {
         #[arg(long, default_value = "dot")]
         format: String,
     },
+    /// Derive candidate queries from an example code snippet (query-by-example)
+    #[command(after_help = "Prints candidate queries from most literal (an exact structural match) to most
+general, each self-verified against the snippet — every line works with -q.
+
+  ctsq example 'u.sendEmail(msg)' -l js
+
+Mark the parts you don't care about with $UPPERCASE placeholders; unmarked
+parts stay literal. Placeholders inside string literals are left alone.
+
+  ctsq example '$X.sendEmail(msg)' -l js    any receiver; method + arg pinned
+  ctsq example 'function $F() {}' -l js     any function definition
+
+Bare expressions are auto-wrapped in a scratch function for C, C++, and Go.
+Constructs with no abstract mapping fall back to raw tree-sitter node kinds.")]
+    Example {
+        /// Code snippet, or '-' to read it from stdin (requires --lang)
+        snippet: String,
+        /// Also show rejected candidates and focus-node diagnostics
+        #[arg(long)]
+        debug: bool,
+    },
     /// Show how abstract node types map to tree-sitter nodes, per language
     Types {
         /// Languages to show (default: all). E.g. `ctsq types rust go`
@@ -255,6 +287,9 @@ fn main() {
         Some(Commands::Importgraph { path, format }) => {
             importgraph::importgraph(&path, cli.lang.as_deref(), cli.no_ignore, &format);
             return;
+        }
+        Some(Commands::Example { snippet, debug }) => {
+            std::process::exit(example::run(&snippet, cli.lang.as_deref(), debug));
         }
         Some(Commands::Types { langs }) => {
             types::run(&langs, cli.lang.as_deref());

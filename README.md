@@ -195,6 +195,49 @@ member file whose symbols are used, tagged with the package. Externals and
 unresolved specifiers appear as `(external)` leaves; ambiguous resolutions are
 marked with `?`.
 
+### `example SNIPPET` — query-by-example
+
+Don't know the query? Paste the code you're looking for and ctsq derives it,
+by inverting the same abstract-type mappings the compiler uses. Candidates are
+printed from most specific to most general, and each one is self-verified
+against the snippet before it's shown — every line is a query that provably
+matches your example.
+
+```sh
+$ ctsq example 'u.sendEmail()' -l js
+&function#sendEmail  # calls to sendEmail
+function#sendEmail   # definitions of, or calls to, sendEmail
+&function            # any function call
+
+$ ctsq example 'def greet(name): pass' -l python
+*function#greet  # definitions of greet
+function#greet   # definitions of, or calls to, greet
+*function        # any function definition
+```
+
+The first candidate is a **structural query**: raw node kinds with field
+accesses that pin every named part of the snippet literally. Mark the parts
+you *don't* care about with `$UPPERCASE` placeholders and they become
+unconstrained, while everything unmarked stays literal:
+
+```sh
+$ ctsq example '$X.sendEmail(msg)' -l js
+call_expression.function(member_expression.property(property_identifier#sendEmail)).arguments(arguments > (identifier#msg))  # this code shape, for any $X
+&function#sendEmail                                                                                                          # calls to sendEmail
+…
+```
+
+Here any receiver matches (`$X`), but the method name and the `msg` argument
+are still required. Placeholders inside string literals are left alone
+(`log("$X")` searches for the literal text `$X`).
+
+`--lang` is required (a snippet has no file extension). Use `-` to read the
+snippet from stdin. Bare expressions are auto-wrapped in a scratch function
+for languages that reject them at top level (C, C++, Go). Constructs with no
+abstract mapping fall back to raw tree-sitter passthrough queries
+(`try {} catch (e) {}` → `try_statement`). `--debug` shows candidates that
+failed self-verification and which node the snippet was classified from.
+
 ## Query language
 
 ### Abstract node types
@@ -280,6 +323,12 @@ ctsq -q '(*function @f).body(id#ARRAY_SIZE)' fixtures/example.c
 # calls to malloc inside any function definition
 ctsq -q '(*function @f).body((&function#malloc @call))' fixtures/example.c
 @f:4: "void process(int ARRAY_SIZE) {", @call:6: "malloc(ARRAY_SIZE)"
+
+# not sure what to write? derive the query from example code
+ctsq example 'malloc(n)' -l c
+&function#malloc  # calls to malloc
+function#malloc   # definitions of, or calls to, malloc
+&function         # any function call
 ```
 
 ## Supported languages
