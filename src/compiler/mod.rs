@@ -147,6 +147,12 @@ fn try_compile_scoped(query: &Query, lang: &dyn Lang) -> Option<(String, String,
         return None;
     }
 
+    // With two or more constrained fields, scoping on one would silently drop
+    // the others — let the Simple path inline them all conjunctively.
+    if query.head.fields.iter().filter(|fa| fa.inner.is_some() && fa.field != "params").count() > 1 {
+        return None;
+    }
+
     // Find the first field access that carries an inner query — that's the scope.
     // "params" uses structural embedding (not containment search) so it stays in the Simple path.
     let scoped_fa = query.head.fields.iter()
@@ -288,7 +294,11 @@ fn compile_selector_node(node: &SelectorNode, lang: &dyn Lang) -> Vec<Fragment> 
                             .push(name_predicate(&format!("@{}", cap), &nm));
                     }
                 }
-                frag.outer_capture = capture.clone();
+                // A named group overrides the fragment's capture; a bare group
+                // must not clobber the internal capture resolved above.
+                if capture.is_some() {
+                    frag.outer_capture = capture.clone();
+                }
             }
             inner
         }
@@ -562,6 +572,32 @@ mod tests {
         let out = compile_str("(&function#/malloc|calloc/ @f)", "c");
         assert!(out.contains("#match?"), "got: {}", out);
         assert!(out.contains("malloc|calloc"), "got: {}", out);
+    }
+
+    #[test]
+    fn test_captureless_group_keeps_name_capture() {
+        // (identifier#size) without @cap must still emit the internal capture
+        // its #eq? predicate references.
+        let out = compile_str("(identifier#size)", "javascript");
+        assert!(out.contains("(identifier) @_nm"), "got: {}", out);
+    }
+
+    #[test]
+    fn test_multiple_inner_fields_all_constrained() {
+        // Two constrained fields must both survive (Simple path, inlined),
+        // not be silently dropped by the scoped two-phase path.
+        let out = compile_str("binary_expression.left(identifier#x).right(identifier#y)", "javascript");
+        assert!(!out.starts_with("SCOPED"), "got: {}", out);
+        assert!(out.contains("\"x\""), "got: {}", out);
+        assert!(out.contains("\"y\""), "got: {}", out);
+    }
+
+    #[test]
+    fn test_python_method_call_matches_attribute() {
+        // &function#send_email must also match `u.send_email()` (attribute callee)
+        let out = compile_str("(&function#send_email @c)", "python");
+        assert!(out.contains("attribute"), "got: {}", out);
+        assert!(out.contains("\"send_email\""), "got: {}", out);
     }
 
     #[test]

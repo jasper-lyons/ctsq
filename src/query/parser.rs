@@ -133,6 +133,13 @@ impl Parser {
                     if self.is_selector_start_at(self.pos + 1) {
                         self.advance();
                         Combinator::Descendant
+                    } else if matches!(
+                        self.tokens.get(self.pos + 1),
+                        Some(Token::Gt | Token::Plus | Token::Tilde)
+                    ) {
+                        // `A > B` — the space belongs to the explicit combinator
+                        self.advance();
+                        continue;
                     } else {
                         break;
                     }
