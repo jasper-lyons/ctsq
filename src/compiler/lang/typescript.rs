@@ -97,22 +97,17 @@ fn ts_resolve(abstract_type: &str, sigil: Option<&Sigil>) -> Option<Vec<TsVarian
             always_constraint: None,
             parent_name_wrap: None, always_callee_eq: None,
         }]),
-        "type" => Some(vec![
-            TsVariant {
-                node: "type_alias_declaration",
-                name_field: Some("name"),
-                name_node: "type_identifier",
-                params_field: None,
-                params_container: None,
-                body_field: None,
-                body_container: None,
-                name_path: &[],
-                params_needs_bridge: false,
-                always_constraint: None,
-                parent_name_wrap: None, always_callee_eq: None,
-            },
-            simple("type_identifier"),
-        ]),
+        // `*type#X` must reach the declaration, not the bare name, so --body
+        // prints the alias or interface it belongs to.
+        "type" => Some(match sigil {
+            Some(Sigil::Ref) => vec![simple("type_identifier")],
+            Some(Sigil::Def) => type_decl_variants(),
+            None => {
+                let mut v = type_decl_variants();
+                v.push(simple("type_identifier"));
+                v
+            }
+        }),
         "id" => Some(vec![identifier(), simple("type_identifier")]),
         "var" => Some(vec![identifier()]),
         "param" => Some(vec![identifier()]),
@@ -286,6 +281,39 @@ fn identifier() -> TsVariant {
         always_constraint: None,
         parent_name_wrap: None, always_callee_eq: None,
     }
+}
+
+/// The declaration forms a TypeScript type name is introduced by: a type alias
+/// and an interface. Both carry a body worth printing with --body.
+fn type_decl_variants() -> Vec<TsVariant> {
+    vec![
+        TsVariant {
+            node: "type_alias_declaration",
+            name_field: Some("name"),
+            name_node: "type_identifier",
+            params_field: None,
+            params_container: None,
+            body_field: Some("value"),
+            body_container: None,
+            name_path: &[],
+            params_needs_bridge: false,
+            always_constraint: None,
+            parent_name_wrap: None, always_callee_eq: None,
+        },
+        TsVariant {
+            node: "interface_declaration",
+            name_field: Some("name"),
+            name_node: "type_identifier",
+            params_field: None,
+            params_container: None,
+            body_field: Some("body"),
+            body_container: Some("object_type"),
+            name_path: &[],
+            params_needs_bridge: false,
+            always_constraint: None,
+            parent_name_wrap: None, always_callee_eq: None,
+        },
+    ]
 }
 
 fn simple(node: &'static str) -> TsVariant {

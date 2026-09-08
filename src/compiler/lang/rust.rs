@@ -16,47 +16,19 @@ impl Lang for RustLang {
                 }
                 Some(Sigil::Ref) => vec![call_variant()],
             }),
-            "class" => Some(vec![
-                TsVariant {
-                    node: "struct_item",
-                    name_field: Some("name"),
-                    name_node: "type_identifier",
-                    params_field: None,
-                    params_container: None,
-                    body_field: Some("body"),
-                    body_container: Some("field_declaration_list"),
-                    name_path: &[],
-                    params_needs_bridge: false,
-                    always_constraint: None,
-                    parent_name_wrap: None, always_callee_eq: None,
-                },
-                TsVariant {
-                    node: "enum_item",
-                    name_field: Some("name"),
-                    name_node: "type_identifier",
-                    params_field: None,
-                    params_container: None,
-                    body_field: Some("body"),
-                    body_container: Some("enum_variant_list"),
-                    name_path: &[],
-                    params_needs_bridge: false,
-                    always_constraint: None,
-                    parent_name_wrap: None, always_callee_eq: None,
-                },
-                TsVariant {
-                    node: "trait_item",
-                    name_field: Some("name"),
-                    name_node: "type_identifier",
-                    params_field: None,
-                    params_container: None,
-                    body_field: Some("body"),
-                    body_container: Some("declaration_list"),
-                    name_path: &[],
-                    params_needs_bridge: false,
-                    always_constraint: None,
-                    parent_name_wrap: None, always_callee_eq: None,
-                },
-            ]),
+            "class" => Some(class_variants()),
+            // Bare `type` is the identifier node, so `*type#X` used to match the
+            // name and nothing else. The def sigil now reaches the item the name
+            // belongs to, which is what --body needs.
+            "type" => Some(match sigil {
+                Some(Sigil::Ref) => vec![simple("type_identifier")],
+                Some(Sigil::Def) => type_decl_variants(),
+                None => {
+                    let mut v = type_decl_variants();
+                    v.push(simple("type_identifier"));
+                    v
+                }
+            }),
             "module" => Some(vec![TsVariant {
                 node: "mod_item",
                 name_field: Some("name"),
@@ -97,7 +69,6 @@ impl Lang for RustLang {
                 always_constraint: None,
                 parent_name_wrap: None, always_callee_eq: None,
             }]),
-            "type" => Some(vec![simple("type_identifier")]),
             "import" => Some(vec![simple("use_declaration")]),
             "literal" => Some(vec![
                 simple("integer_literal"),
@@ -119,6 +90,52 @@ impl Lang for RustLang {
     fn ts_language(&self) -> tree_sitter::Language {
         tree_sitter_rust::LANGUAGE.into()
     }
+}
+
+fn named_item(node: &'static str, body_container: &'static str) -> TsVariant {
+    TsVariant {
+        node,
+        name_field: Some("name"),
+        name_node: "type_identifier",
+        params_field: None,
+        params_container: None,
+        body_field: Some("body"),
+        body_container: Some(body_container),
+        name_path: &[],
+        params_needs_bridge: false,
+        always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
+    }
+}
+
+fn class_variants() -> Vec<TsVariant> {
+    vec![
+        named_item("struct_item", "field_declaration_list"),
+        named_item("enum_item", "enum_variant_list"),
+        named_item("trait_item", "declaration_list"),
+    ]
+}
+
+/// The item forms a Rust type name is introduced by. Adds the alias and the
+/// union to the struct/enum/trait set, so `*type#X --body` prints whichever
+/// declaration the name belongs to.
+fn type_decl_variants() -> Vec<TsVariant> {
+    let mut v = class_variants();
+    v.push(named_item("union_item", "field_declaration_list"));
+    v.push(TsVariant {
+        node: "type_item",
+        name_field: Some("name"),
+        name_node: "type_identifier",
+        params_field: None,
+        params_container: None,
+        body_field: Some("type"),
+        body_container: None,
+        name_path: &[],
+        params_needs_bridge: false,
+        always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
+    });
+    v
 }
 
 fn identifier() -> TsVariant {

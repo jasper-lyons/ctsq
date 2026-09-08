@@ -31,7 +31,18 @@ impl Lang for CLang {
                 always_constraint: None,
                 parent_name_wrap: None, always_callee_eq: None,
             }]),
-            "type" => Some(vec![simple("type_identifier")]),
+            // Bare `type` is the identifier node, so `*type#X` used to match the
+            // name and nothing else. The def sigil now reaches the declaration
+            // the name belongs to, which is what --body needs.
+            "type" => Some(match sigil {
+                Some(Sigil::Ref) => vec![simple("type_identifier")],
+                Some(Sigil::Def) => type_decl_variants(),
+                None => {
+                    let mut v = type_decl_variants();
+                    v.push(simple("type_identifier"));
+                    v
+                }
+            }),
             "import" => Some(vec![simple("preproc_include")]),
             "literal" => Some(vec![
                 simple("number_literal"),
@@ -52,6 +63,42 @@ impl Lang for CLang {
     fn ts_language(&self) -> tree_sitter::Language {
         tree_sitter_c::LANGUAGE.into()
     }
+}
+
+/// The declaration forms a C type name is introduced by: the tagged struct,
+/// union and enum specifiers plus a typedef, whose name sits in `declarator`.
+pub(crate) fn type_decl_variants() -> Vec<TsVariant> {
+    let tagged = |node: &'static str, body_container: &'static str| TsVariant {
+        node,
+        name_field: Some("name"),
+        name_node: "type_identifier",
+        params_field: None,
+        params_container: None,
+        body_field: Some("body"),
+        body_container: Some(body_container),
+        name_path: &[],
+        params_needs_bridge: false,
+        always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
+    };
+    vec![
+        tagged("struct_specifier", "field_declaration_list"),
+        tagged("union_specifier", "field_declaration_list"),
+        tagged("enum_specifier", "enumerator_list"),
+        TsVariant {
+            node: "type_definition",
+            name_field: Some("declarator"),
+            name_node: "type_identifier",
+            params_field: None,
+            params_container: None,
+            body_field: Some("type"),
+            body_container: None,
+            name_path: &[],
+            params_needs_bridge: false,
+            always_constraint: None,
+            parent_name_wrap: None, always_callee_eq: None,
+        },
+    ]
 }
 
 fn call_variant() -> TsVariant {

@@ -624,6 +624,46 @@ mod tests {
     }
 
     #[test]
+    fn def_type_reaches_the_declaration_not_the_identifier() {
+        // `*type#X` used to compile to (type_identifier), so --body printed the
+        // name and nothing else.
+        let go = compile_str("(*type#Meta @t)", "go");
+        assert!(go.contains("type_spec"), "go: {}", go);
+        assert!(!go.contains("(type_identifier) @t"), "go still matches the bare name: {}", go);
+
+        let ts = compile_str("(*type#Meta @t)", "typescript");
+        assert!(ts.contains("type_alias_declaration"), "ts: {}", ts);
+        assert!(ts.contains("interface_declaration"), "ts interfaces: {}", ts);
+
+        let rs = compile_str("(*type#Meta @t)", "rust");
+        assert!(rs.contains("struct_item"), "rust: {}", rs);
+        assert!(rs.contains("type_item"), "rust alias: {}", rs);
+
+        let c = compile_str("(*type#Meta @t)", "c");
+        assert!(c.contains("struct_specifier"), "c: {}", c);
+        assert!(c.contains("type_definition"), "c typedef: {}", c);
+
+        let cpp = compile_str("(*type#Meta @t)", "cpp");
+        assert!(cpp.contains("class_specifier"), "cpp: {}", cpp);
+    }
+
+    #[test]
+    fn ref_type_still_matches_the_identifier() {
+        for lang in ["go", "typescript", "rust", "c", "cpp"] {
+            let out = compile_str("&type#Meta", lang);
+            assert!(out.contains("type_identifier"), "{}: {}", lang, out);
+            assert!(!out.contains("type_spec"), "{}: {}", lang, out);
+        }
+    }
+
+    #[test]
+    fn bare_type_matches_declaration_and_identifier_both() {
+        let out = compile_str("type#Meta", "go");
+        assert!(out.contains("type_spec"), "{}", out);
+        assert!(out.contains("type_identifier"), "{}", out);
+    }
+
+    #[test]
     fn test_control_flow_types() {
         assert!(compile_str("if", "c").contains("if_statement"));
         assert!(compile_str("if", "rust").contains("if_expression"));

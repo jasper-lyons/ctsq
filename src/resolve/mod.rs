@@ -144,29 +144,110 @@ pub fn resolver_for(lang_name: &str) -> Box<dyn Resolver> {
 
 /// Entry point for `ctsq def <name-or-expr> <path>`: print resolved
 /// definition locations for a name, qualified path, or method expression.
+///
+/// Resolution runs the two steps `explain` runs, in the same order: the
+/// call-graph definition index first, then the `tree` outline. The index only
+/// holds callable definitions, so without the outline step a struct, class,
+/// type alias or top-level variable resolved by `explain` reported nothing here.
 pub fn run_def(expr: &str, path: &str, lang_name: Option<&str>, no_ignore: bool) {
     let jobs = crate::files::resolve_jobs(path, lang_name, no_ignore);
+    let mut all_names: Vec<String> = Vec::new();
+    let rows = def_rows(expr, &jobs, &mut all_names);
+
+    if rows.is_empty() {
+        println!(
+            "no definition for '{}' in {} ({} files scanned)",
+            expr,
+            path,
+            jobs.len()
+        );
+        let similar = similar_names(crate::explain::bare_name(expr), &all_names);
+        if !similar.is_empty() {
+            println!("similar names: {}", similar.join(", "));
+        }
+        std::process::exit(1);
+    }
+
+    for (file, line, conf) in rows {
+        let line_text = std::fs::read_to_string(&file)
+            .ok()
+            .and_then(|s| s.lines().nth(line.saturating_sub(1)).map(|l| l.trim().to_string()))
+            .unwrap_or_default();
+        let mark = if conf == Confidence::Guess { "  ?" } else { "" };
+        println!("{}:{}: {}{}", file, line, line_text, mark);
+    }
+}
+
+/// Definition sites for `expr`, in the order `explain` resolves them: the
+/// call-graph definition index first, then the `tree` outline for everything
+/// the index cannot hold. `names_seen` collects every outline name met on the
+/// way, which is the pool the miss report suggests from.
+pub fn def_rows(
+    expr: &str,
+    jobs: &[(String, &'static str)],
+    names_seen: &mut Vec<String>,
+) -> Vec<(String, usize, Confidence)> {
     let mut index = DefIndex::default();
-    for (file, lang) in &jobs {
+    for (file, lang) in jobs {
         let Ok(source) = std::fs::read(file) else { continue };
         for def in resolver_for(lang).collect_defs(file, &source) {
             index.push(def);
         }
     }
-    let hits = resolve_def_query(expr, &index);
-    if hits.is_empty() {
-        eprintln!("no definition found for '{}'", expr);
-        std::process::exit(1);
+
+    let rows: Vec<(String, usize, Confidence)> = resolve_def_query(expr, &index)
+        .into_iter()
+        .map(|(i, conf)| {
+            let d = &index.defs[i];
+            (d.id.file.clone(), d.id.line, conf)
+        })
+        .collect();
+    if !rows.is_empty() {
+        return rows;
     }
-    for (i, conf) in hits {
-        let d = &index.defs[i];
-        let line_text = std::fs::read_to_string(&d.id.file)
-            .ok()
-            .and_then(|s| s.lines().nth(d.id.line.saturating_sub(1)).map(|l| l.trim().to_string()))
-            .unwrap_or_default();
-        let mark = if conf == Confidence::Guess { "  ?" } else { "" };
-        println!("{}:{}: {}{}", d.id.file, d.id.line, line_text, mark);
+
+    // A struct, class, type alias or top-level variable is not callable, so the
+    // index never held it. This is the step `explain` takes next.
+    let bare = crate::explain::bare_name(expr);
+    let mut found: Vec<(String, usize)> = Vec::new();
+    for (file, lang) in jobs {
+        for (_kind, name, line) in crate::tree::collect_def_locs(file, lang) {
+            if name == bare {
+                found.push((file.clone(), line));
+            }
+            names_seen.push(name);
+        }
     }
+    names_seen.extend(index.by_name.keys().cloned());
+    found.sort();
+    found.dedup();
+    let conf = if found.len() == 1 { Confidence::Exact } else { Confidence::Guess };
+    found.into_iter().map(|(f, l)| (f, l, conf)).collect()
+}
+
+/// Up to three names from `pool` that look like `name`, case-insensitively:
+/// one contains the other, either way round. Fragments under three characters
+/// are skipped, because they match nearly everything. Closest length first.
+pub fn similar_names(name: &str, pool: &[String]) -> Vec<String> {
+    let needle = name.to_lowercase();
+    if needle.len() < 3 {
+        return vec![];
+    }
+    let mut hits: Vec<String> = pool
+        .iter()
+        .filter(|n| {
+            let low = n.to_lowercase();
+            low.len() >= 3
+                && low != needle
+                && (low.contains(&needle) || needle.contains(&low))
+        })
+        .cloned()
+        .collect();
+    hits.sort();
+    hits.dedup();
+    hits.sort_by_key(|n| (n.len().abs_diff(name.len()), n.clone()));
+    hits.truncate(3);
+    hits
 }
 
 /// Context-free resolution of a textual query against the definition index.
@@ -291,5 +372,78 @@ mod tests {
         let idx = sample_index();
         assert!(resolve_def_query("nope", &idx).is_empty());
         assert!(resolve_def_query("wrong::helper", &idx).is_empty());
+    }
+
+    fn jobs_for(sub: &str) -> Vec<(String, &'static str)> {
+        let path = format!("{}/fixtures/{}", env!("CARGO_MANIFEST_DIR"), sub);
+        crate::files::resolve_jobs(&path, None, false)
+    }
+
+    #[test]
+    fn def_finds_a_type_the_call_graph_index_cannot_hold() {
+        // Server is a struct, so only the outline step resolves it. This is
+        // the case that printed "no definition found" and exited 1.
+        let mut names = Vec::new();
+        let rows = def_rows("Server", &jobs_for("example.go"), &mut names);
+        assert_eq!(rows.len(), 1, "{:?}", rows);
+        assert!(rows[0].0.ends_with("example.go"), "{:?}", rows);
+        assert_eq!(rows[0].1, 5, "{:?}", rows);
+    }
+
+    #[test]
+    fn def_agrees_with_explain_on_a_class() {
+        let jobs = jobs_for("example.cpp");
+        let mut names = Vec::new();
+        let rows = def_rows("Buffer", &jobs, &mut names);
+        assert!(!rows.is_empty(), "def must resolve what explain resolves");
+        let r = crate::explain::report("Buffer", &jobs, &crate::explain::Options::default());
+        assert!(
+            r.contains(&format!("{}:{}", rows[0].0, rows[0].1)),
+            "def site {:?} missing from explain: {}",
+            rows[0],
+            r
+        );
+    }
+
+    #[test]
+    fn def_still_prefers_the_call_graph_index_for_functions() {
+        let mut names = Vec::new();
+        let rows = def_rows("NewServer", &jobs_for("example.go"), &mut names);
+        assert_eq!(rows.len(), 1, "{:?}", rows);
+        assert_eq!(rows[0].2, Confidence::Exact, "{:?}", rows);
+    }
+
+    #[test]
+    fn a_miss_collects_the_names_it_could_have_meant() {
+        let mut names = Vec::new();
+        let rows = def_rows("NewServe", &jobs_for("example.go"), &mut names);
+        assert!(rows.is_empty(), "{:?}", rows);
+        assert!(names.contains(&"NewServer".to_string()), "{:?}", names);
+    }
+
+    #[test]
+    fn similar_names_picks_the_closest_by_length() {
+        let pool: Vec<String> = ["UpdateItem", "UpdateItemMeta", "Update", "unrelated"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let hits = similar_names("UpdateItemMet", &pool);
+        assert_eq!(hits.first().map(String::as_str), Some("UpdateItemMeta"), "{:?}", hits);
+        assert!(hits.len() <= 3, "{:?}", hits);
+        assert!(!hits.contains(&"unrelated".to_string()), "{:?}", hits);
+    }
+
+    #[test]
+    fn similar_names_ignores_fragments_too_short_to_mean_anything() {
+        let pool: Vec<String> = ["a", "ab", "abcdef"].iter().map(|s| s.to_string()).collect();
+        assert!(similar_names("ab", &pool).is_empty(), "a two-letter needle matches everything");
+        let hits = similar_names("abc", &pool);
+        assert_eq!(hits, vec!["abcdef".to_string()], "{:?}", hits);
+    }
+
+    #[test]
+    fn similar_names_skips_the_exact_name() {
+        let pool = vec!["helper".to_string()];
+        assert!(similar_names("helper", &pool).is_empty());
     }
 }

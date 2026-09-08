@@ -30,7 +30,9 @@ src/
 │       ├── rust.rs
 │       └── go.rs
 ├── runner.rs         Executes a CompiledQuery against source bytes; returns Match list
-├── tree.rs           `tree` subcommand — structural outline (classes, functions, vars)
+├── explain.rs        `explain` subcommand — composes def + body text + callers + callees + refs
+├── tree.rs           `tree` subcommand — structural outline, with a size header and per-entry signatures
+├── cooccur.rs        `files` subcommand — files where every one of several queries matches
 ├── files.rs          File discovery: extension filtering, .gitignore/.ignore respecting
 ├── calltree.rs       `callers`, `callees`, `callgraph` — walks DefIndex to trace call chains
 └── resolve/
@@ -46,6 +48,10 @@ src/
 **Abstract types** — a fixed vocabulary (`function`, `class`, `var`, `param`, `type`, `import`, `literal`, `block`, `if`, `for`, `while`, `switch`, `id`). Unknown identifiers pass through to TreeSitter verbatim as concrete node names — no escape syntax needed.
 
 **Sigils** — `*type` = definitions only, `&type` = references/calls only, bare `type` = both.
+
+The sigil also picks which node the abstract `type` reaches: `*type#X` resolves to the declaration the name is introduced by (Go `type_spec`/`type_alias`, TS `type_alias_declaration`/`interface_declaration`, Rust `struct_item`/`enum_item`/`trait_item`/`union_item`/`type_item`, C and C++ tagged specifiers plus `typedef`), while `&type#X` stays on the bare `type_identifier`. Without this, `*type#X --body` printed only the name.
+
+**Query output** — `-q` prints `path:LINE: <the whole source line, trimmed>`, the same rendering `explain` uses for its REFERENCES. `runner::run_rows` returns both that and the older node-text form; `--node` selects the latter, and a match with two or more captures or a multi-line `--body` match falls back to it because one line cannot carry them. No match prints a miss report on stdout and exits 1.
 
 **Multi-phase (scoped) queries** — field access `.body(inner)` compiles to a two-phase `CompiledQuery::Scoped`: run the outer query to find container nodes, then search their subtrees with the inner query.
 
@@ -66,4 +72,6 @@ src/
 cargo test
 ```
 
-Fixture source files live in `fixtures/` and are used by manual smoke tests. There are no automated integration tests yet — run the binary against fixtures to verify behaviour after changes.
+Unit tests live beside the code they cover. `tests/cli.rs` runs the built binary against `fixtures/` for the argument handling, printed forms and exit codes that only the process boundary shows.
+
+Two subcommands build their whole output as a string so tests can assert on it without capturing stdout: `explain::report` and `tree::report`. `resolve::def_rows` is the same split for `def`. Prefer adding to those over testing print paths.

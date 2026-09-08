@@ -17,19 +17,7 @@ impl Lang for GoLang {
                 }
                 Some(Sigil::Ref) => vec![call_ident(), call_selector()],
             }),
-            "class" => Some(vec![TsVariant {
-                node: "type_spec",
-                name_field: Some("name"),
-                name_node: "type_identifier",
-                params_field: None,
-                params_container: None,
-                body_field: Some("type"),
-                body_container: None,
-                name_path: &[],
-                params_needs_bridge: false,
-                always_constraint: None,
-                parent_name_wrap: None, always_callee_eq: None,
-            }]),
+            "class" => Some(type_decl_variants()),
             "id" => Some(vec![identifier(), field_identifier()]),
             "var" => Some(vec![TsVariant {
                 node: "var_spec",
@@ -57,7 +45,18 @@ impl Lang for GoLang {
                 always_constraint: None,
                 parent_name_wrap: None, always_callee_eq: None,
             }]),
-            "type" => Some(vec![simple("type_identifier")]),
+            // Bare `type` is the identifier node, so `*type#X` used to match the
+            // name and nothing else. The def sigil now reaches the declaration
+            // the name belongs to, which is what --body needs.
+            "type" => Some(match sigil {
+                Some(Sigil::Ref) => vec![simple("type_identifier")],
+                Some(Sigil::Def) => type_decl_variants(),
+                None => {
+                    let mut v = type_decl_variants();
+                    v.push(simple("type_identifier"));
+                    v
+                }
+            }),
             "import" => Some(vec![simple("import_declaration")]),
             "literal" => Some(vec![
                 simple("interpreted_string_literal"),
@@ -81,6 +80,40 @@ impl Lang for GoLang {
     fn ts_language(&self) -> tree_sitter::Language {
         tree_sitter_go::LANGUAGE.into()
     }
+}
+
+/// The declaration forms a Go type name is introduced by: `type X struct{…}`
+/// and `type X = Y`. Both hang the name off a spec node, so --body prints the
+/// whole declaration rather than the bare identifier.
+fn type_decl_variants() -> Vec<TsVariant> {
+    vec![
+        TsVariant {
+            node: "type_spec",
+            name_field: Some("name"),
+            name_node: "type_identifier",
+            params_field: None,
+            params_container: None,
+            body_field: Some("type"),
+            body_container: None,
+            name_path: &[],
+            params_needs_bridge: false,
+            always_constraint: None,
+            parent_name_wrap: None, always_callee_eq: None,
+        },
+        TsVariant {
+            node: "type_alias",
+            name_field: Some("name"),
+            name_node: "type_identifier",
+            params_field: None,
+            params_container: None,
+            body_field: Some("type"),
+            body_container: None,
+            name_path: &[],
+            params_needs_bridge: false,
+            always_constraint: None,
+            parent_name_wrap: None, always_callee_eq: None,
+        },
+    ]
 }
 
 fn identifier() -> TsVariant {

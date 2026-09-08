@@ -72,7 +72,18 @@ impl Lang for CppLang {
                 always_constraint: None,
                 parent_name_wrap: None, always_callee_eq: None,
             }]),
-            "type" => Some(vec![simple("type_identifier")]),
+            // Bare `type` is the identifier node, so `*type#X` used to match the
+            // name and nothing else. The def sigil now reaches the declaration
+            // the name belongs to, which is what --body needs.
+            "type" => Some(match sigil {
+                Some(Sigil::Ref) => vec![simple("type_identifier")],
+                Some(Sigil::Def) => cpp_type_decl_variants(),
+                None => {
+                    let mut v = cpp_type_decl_variants();
+                    v.push(simple("type_identifier"));
+                    v
+                }
+            }),
             "import" => Some(vec![simple("preproc_include")]),
             "literal" => Some(vec![
                 simple("number_literal"),
@@ -142,6 +153,26 @@ fn def_variants() -> Vec<TsVariant> {
             parent_name_wrap: None, always_callee_eq: None,
         },
     ]
+}
+
+/// The declaration forms a C++ type name is introduced by: everything C has,
+/// plus the class specifier.
+fn cpp_type_decl_variants() -> Vec<TsVariant> {
+    let mut v = super::c::type_decl_variants();
+    v.push(TsVariant {
+        node: "class_specifier",
+        name_field: Some("name"),
+        name_node: "type_identifier",
+        params_field: None,
+        params_container: None,
+        body_field: Some("body"),
+        body_container: Some("field_declaration_list"),
+        name_path: &[],
+        params_needs_bridge: false,
+        always_constraint: None,
+        parent_name_wrap: None, always_callee_eq: None,
+    });
+    v
 }
 
 fn call_variants() -> Vec<TsVariant> {

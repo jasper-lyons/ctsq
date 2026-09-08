@@ -3,12 +3,40 @@ use crate::compiler::CompiledQuery;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor};
 
+/// One match, in both renderings the CLI can print.
+///
+/// `node_text` is the historical form (`@cap:LINE: "text"`), kept behind
+/// `--node` and used verbatim by every internal caller that parses it back.
+/// `src_line` carries the whole source line the match sits on, which is what
+/// `-q` prints by default. It is None when the source line would lose
+/// information: a match with two or more user captures, or a multi-line node
+/// printed with --body.
+#[derive(Debug, Clone)]
+pub struct MatchRow {
+    pub line: usize,
+    pub src_line: Option<String>,
+    pub node_text: String,
+}
+
+/// Backwards-compatible wrapper: the node-text rendering only.
 pub fn run(
     compiled: &CompiledQuery,
     lang: &dyn Lang,
     source: &[u8],
     body: bool,
 ) -> Result<Vec<String>, String> {
+    Ok(run_rows(compiled, lang, source, body)?
+        .into_iter()
+        .map(|r| r.node_text)
+        .collect())
+}
+
+pub fn run_rows(
+    compiled: &CompiledQuery,
+    lang: &dyn Lang,
+    source: &[u8],
+    body: bool,
+) -> Result<Vec<MatchRow>, String> {
     if compiled.is_empty() {
         return Ok(vec![]);
     }
@@ -21,7 +49,26 @@ pub fn run(
     let tree = parser.parse(source, None).ok_or("failed to parse source")?;
 
     let source_bytes = source;
-    let mut results = Vec::new();
+    let mut results: Vec<MatchRow> = Vec::new();
+
+    let source_text = String::from_utf8_lossy(source);
+    let src_lines: Vec<&str> = source_text.lines().collect();
+
+    let make_row = |node_text: String, primary: tree_sitter::Node, user_caps: usize| -> MatchRow {
+        let start = primary.start_position().row + 1;
+        let multiline = primary.end_position().row != primary.start_position().row;
+        let src_line = if user_caps >= 2 || (body && multiline) {
+            None
+        } else {
+            Some(
+                src_lines
+                    .get(start.saturating_sub(1))
+                    .map(|l| l.trim().to_string())
+                    .unwrap_or_default(),
+            )
+        };
+        MatchRow { line: start, src_line, node_text }
+    };
 
     let loc = |node: tree_sitter::Node| -> String {
         let start = node.start_position().row + 1;
@@ -58,12 +105,14 @@ pub fn run(
 
             while let Some(m) = matches.next() {
                 let mut parts: Vec<String> = Vec::new();
+                let mut user_nodes: Vec<tree_sitter::Node> = Vec::new();
                 for capture in m.captures {
                     let name = &capture_names[capture.index as usize];
                     if name.starts_with('_') {
                         continue;
                     }
                     parts.push(fmt_cap(name, capture.node, body));
+                    user_nodes.push(capture.node);
                 }
                 if parts.is_empty() {
                     let root = m
@@ -79,16 +128,22 @@ pub fn run(
                         } else {
                             text.lines().next().unwrap_or("").to_string()
                         };
-                        if body {
-                            results.push(format!("<match>:{}: {}", loc(cap.node), display));
+                        let node_text = if body {
+                            format!("<match>:{}: {}", loc(cap.node), display)
                         } else {
-                            results.push(format!("<match>:{}: {:?}", loc(cap.node), display));
-                        }
+                            format!("<match>:{}: {:?}", loc(cap.node), display)
+                        };
+                        results.push(make_row(node_text, cap.node, 0));
                     } else {
-                        results.push("<match>".into());
+                        results.push(MatchRow {
+                            line: 0,
+                            src_line: None,
+                            node_text: "<match>".into(),
+                        });
                     }
                 } else {
-                    results.push(parts.join(", "));
+                    let primary = user_nodes[0];
+                    results.push(make_row(parts.join(", "), primary, user_nodes.len()));
                 }
             }
         }
@@ -171,8 +226,10 @@ pub fn run(
                         .collect();
 
                     let mut parts: Vec<String> = Vec::new();
+                    let mut user_nodes: Vec<tree_sitter::Node> = Vec::new();
                     for (name, node) in outer_named.iter().chain(inner_named.iter()) {
                         parts.push(fmt_cap(name, *node, body));
+                        user_nodes.push(*node);
                     }
 
                     if parts.is_empty() {
@@ -186,19 +243,16 @@ pub fn run(
                             } else {
                                 text.lines().next().unwrap_or("").to_string()
                             };
-                            if body {
-                                results
-                                    .push(format!("<match>:{}: {}", loc(cap.node), display));
+                            let node_text = if body {
+                                format!("<match>:{}: {}", loc(cap.node), display)
                             } else {
-                                results.push(format!(
-                                    "<match>:{}: {:?}",
-                                    loc(cap.node),
-                                    display
-                                ));
-                            }
+                                format!("<match>:{}: {:?}", loc(cap.node), display)
+                            };
+                            results.push(make_row(node_text, cap.node, 0));
                         }
                     } else {
-                        results.push(parts.join(", "));
+                        let primary = user_nodes[0];
+                        results.push(make_row(parts.join(", "), primary, user_nodes.len()));
                     }
                 }
             }
@@ -206,7 +260,7 @@ pub fn run(
     }
 
     let mut seen = std::collections::HashSet::new();
-    results.retain(|r| seen.insert(r.clone()));
+    results.retain(|r| seen.insert(r.node_text.clone()));
 
     Ok(results)
 }
@@ -221,6 +275,62 @@ mod tests {
         let l = lang::for_name(lang_name).unwrap();
         let compiled = crate::compiler::compile(&ast, l.as_ref());
         run(&compiled, l.as_ref(), source.as_bytes(), false).unwrap()
+    }
+
+    fn rows_for(query: &str, lang_name: &str, source: &str, body: bool) -> Vec<MatchRow> {
+        let ast = crate::query::parse(query).unwrap();
+        let l = lang::for_name(lang_name).unwrap();
+        let compiled = crate::compiler::compile(&ast, l.as_ref());
+        run_rows(&compiled, l.as_ref(), source.as_bytes(), body).unwrap()
+    }
+
+    #[test]
+    fn a_match_carries_the_whole_source_line_it_sits_on() {
+        let src = "package main\n\nconst itemCols = `id, kind`\n\nfunc f() { _ = itemCols }\n";
+        let rows = rows_for("id#itemCols", "go", src, false);
+        assert_eq!(rows.len(), 2, "{:?}", rows);
+        assert_eq!(rows[0].line, 3);
+        assert_eq!(
+            rows[0].src_line.as_deref(),
+            Some("const itemCols = `id, kind`"),
+            "the source line, not the token: {:?}",
+            rows[0]
+        );
+        assert_eq!(rows[1].src_line.as_deref(), Some("func f() { _ = itemCols }"));
+    }
+
+    #[test]
+    fn the_node_text_form_survives_alongside_it() {
+        let src = "package main\n\nconst itemCols = `id`\n";
+        let rows = rows_for("id#itemCols", "go", src, false);
+        assert_eq!(rows[0].node_text, "<match>:3: \"itemCols\"", "{:?}", rows[0]);
+    }
+
+    #[test]
+    fn a_multi_line_body_match_keeps_the_node_text_form() {
+        let src = "package main\n\ntype Meta struct {\n\tA string\n}\n";
+        let rows = rows_for("*type#Meta", "go", src, true);
+        assert_eq!(rows.len(), 1, "{:?}", rows);
+        assert!(rows[0].src_line.is_none(), "a body spanning lines has no one line: {:?}", rows[0]);
+        assert!(rows[0].node_text.contains("A string"), "{:?}", rows[0]);
+    }
+
+    #[test]
+    fn a_single_line_match_still_gets_a_source_line_under_body() {
+        let src = "package main\n\ntype Meters = float64\n";
+        let rows = rows_for("*type#Meters", "go", src, true);
+        assert_eq!(rows[0].src_line.as_deref(), Some("type Meters = float64"), "{:?}", rows[0]);
+    }
+
+    #[test]
+    fn two_captures_keep_the_node_text_form() {
+        // Collapsing to one source line would drop the second capture's site.
+        let src = "void DoStuff() {\n    Loading();\n}\n";
+        let rows = rows_for("(*function @f).body((&function#Loading @c))", "cpp", src, false);
+        assert!(!rows.is_empty(), "{:?}", rows);
+        assert!(rows[0].src_line.is_none(), "{:?}", rows[0]);
+        assert!(rows[0].node_text.contains("@f:"), "{:?}", rows[0]);
+        assert!(rows[0].node_text.contains("@c:"), "{:?}", rows[0]);
     }
 
     #[test]

@@ -1,5 +1,7 @@
 mod compiler;
+mod cooccur;
 mod example;
+mod explain;
 mod files;
 mod query;
 mod runner;
@@ -44,13 +46,21 @@ use std::io::{BufRead, IsTerminal, Read};
                   A + B  adjacent    A and B are adjacent siblings
                   A ~ B  sibling     A and B are siblings
 
+OUTPUT
+  Each match prints as path:LINE: <the whole source line, trimmed>, the same
+  rendering `explain` uses for its REFERENCES. --node prints the matched
+  node's own text instead. --body prints the full text of a multi-line match.
+  No match prints a one-line miss report on stdout and exits 1.
+
 EXAMPLES
   ctsq -q 'id#Symbol' file.cpp                             grep -n \"Symbol\" file.cpp
   ctsq -q 'id#/A|B|C/' file.cpp                           grep -n \"A\\|B\\|C\" file.cpp
   ctsq -l cpp -q 'id#Symbol' src/                         grep -rn \"Symbol\" src/ --include=*.cpp
   ctsq -q 'id#Symbol' a.cpp b.cpp                         grep -n \"Symbol\" a.cpp b.cpp
   ctsq -q '*function#Foo' file.cpp                        grep -n \"void Foo\" file.cpp
+  ctsq -q '*type#Config' --body file.go                   the whole type declaration
   ctsq -q '(*function @f).body(id#CONST)' file.cpp        functions that reference CONST
+  ctsq files -q 'id#A' -q 'id#B' src/                     grep -rl A | xargs grep -l B
 
 STDIN
   Pipe file paths (language detected per file from extension):
@@ -70,6 +80,8 @@ QUERY BY EXAMPLE
     ctsq example '$X.sendEmail(msg)' -l js   any receiver; method + arg pinned
 
 SUBCOMMANDS
+  ctsq explain Symbol src/              what a symbol is and how it is used, in one call
+  ctsq explain Symbol src/ --depth 2    more levels of callers and callees
   ctsq tree file.cpp                    structural outline of a file
   ctsq tree src/                        structural outline of all files in a directory
   ctsq callers ProcessMessages src/     who calls this function (up the call chain)
@@ -78,6 +90,7 @@ SUBCOMMANDS
   ctsq callgraph src/ --format edges    full call graph as plain caller -> callee pairs
   ctsq def helper src/                  where is this function defined (file:line)
   ctsq def Foo::method src/             resolve a qualified path or method to its definition
+  ctsq files -q 'id#A' -q 'id#B' src/   files where every one of several queries matches
   ctsq imports src/main.rs src/         what files this file imports (down the import tree)
   ctsq importers src/files.rs src/      what files import this file (up the import tree)
   ctsq importgraph src/                 full import graph in DOT format (pipe to dot -Tpng)
@@ -129,6 +142,10 @@ struct Cli {
     #[arg(long)]
     body: bool,
 
+    /// Print the matched node's own text instead of the whole source line
+    #[arg(long)]
+    node: bool,
+
     /// Ignore .gitignore and .ignore files (search all files)
     #[arg(long, global = true)]
     no_ignore: bool,
@@ -136,11 +153,55 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Everything about a symbol in one call: definition bodies, callers, callees, remaining references
+    #[command(after_help = "Answers \"what is this and how is it used\" without follow-up reads.
+Composes def, callers, callees and an id#Symbol scan into one report.
+
+  ctsq explain NewServer fixtures/
+  ctsq explain Server.Start src/ --depth 2
+  ctsq explain BigFunction src/ --max-lines 20
+  ctsq explain Config src/ --no-body
+
+Sections, in order: DEFINITION (file:line plus the full body text),
+CALLERS, CALLEES (call site, the function on the other end, where it is
+defined, and the call line), then REFERENCES (a per-file count of the
+id#Symbol matches not already shown). With --no-body the signature prints on
+its own `sig:` line, and a truncated body keeps the signature as the first
+line it prints. When the symbol resolves to nothing, the plain id#Symbol
+matches are listed instead.")]
+    Explain {
+        /// Symbol name, qualified path (a::b::f, Foo::method) or method expr (x.method)
+        symbol: String,
+        /// File or directory to search (default: current directory)
+        #[arg(default_value = ".")]
+        path: String,
+        /// Levels of callers and callees to walk
+        #[arg(long, default_value = "1")]
+        depth: usize,
+        /// Maximum body lines printed per definition
+        #[arg(long = "max-lines", default_value = "80")]
+        max_lines: usize,
+        /// Print signatures only, never definition bodies
+        #[arg(long = "no-body")]
+        no_body: bool,
+    },
     /// Structural outline of a file or directory: classes, functions, variables
+    #[command(after_help = "Each file gets a header line — path, line count, rough token count,
+number of entries — then one line per entry: its declaration line, the line it
+starts on, and a (N lines) span for anything over 10 lines.
+
+  ctsq tree file.cpp
+  ctsq tree src/
+
+There is no --body: `tree` is the outline. For one entry's body use
+  ctsq -q '*function#Name' --body FILE")]
     Tree {
         /// Files or directories to outline
         #[arg(num_args(1..))]
         paths: Vec<String>,
+        /// Rejected with a pointer to the query that does this.
+        #[arg(long, hide = true)]
+        body: bool,
     },
     /// Show what calls a given function (walk up the call chain)
     Callers {
@@ -169,6 +230,21 @@ enum Commands {
         /// Output format: dot (default) or edges
         #[arg(long, default_value = "dot")]
         format: String,
+    },
+    /// Files where every one of several queries matches
+    #[command(after_help = "Replaces `grep -rl A | xargs grep -l B`. Repeat -q once per query; a file is
+listed only when every query matched in it, with the per-query match counts
+in query order as the trailing column.
+
+  ctsq files -q 'id#Modal' -q 'id#useAuth' src/
+  ctsq files -q '*function#render' -q 'id#Props' src/ --lang tsx")]
+    Files {
+        /// Query that must match; repeat -q for each one
+        #[arg(long, short, num_args(1), required = true)]
+        query: Vec<String>,
+        /// File or directory to search
+        #[arg(default_value = ".")]
+        path: String,
     },
     /// Resolve a name to its definition location(s)
     Def {
@@ -245,7 +321,16 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Tree { paths }) => {
+        Some(Commands::Explain { symbol, path, depth, max_lines, no_body }) => {
+            let opts = explain::Options { depth, max_lines, no_body };
+            explain::run(&symbol, &path, cli.lang.as_deref(), &opts, cli.no_ignore);
+            return;
+        }
+        Some(Commands::Tree { paths, body }) => {
+            if body {
+                eprintln!("tree has no --body, use ctsq -q '*function#Name' --body FILE");
+                std::process::exit(2);
+            }
             let jobs: Vec<_> = paths.iter()
                 .flat_map(|p| files::resolve_jobs(p, cli.lang.as_deref(), cli.no_ignore))
                 .collect();
@@ -266,6 +351,10 @@ fn main() {
         }
         Some(Commands::Callgraph { path, format }) => {
             calltree::callgraph(&path, cli.lang.as_deref(), cli.no_ignore, &format);
+            return;
+        }
+        Some(Commands::Files { query, path }) => {
+            cooccur::run(&query, &path, cli.lang.as_deref(), cli.no_ignore);
             return;
         }
         Some(Commands::Def { name_or_expr, path }) => {
@@ -449,6 +538,7 @@ fn main() {
     }
 
     let multiple = jobs.len() > 1;
+    let mut total_matches = 0usize;
 
     let mut compiled_cache: HashMap<&'static str, (Box<dyn lang::Lang>, compiler::CompiledQuery)> =
         HashMap::new();
@@ -491,18 +581,26 @@ fn main() {
 
         let display = if file == "-" { "<stdin>" } else { file.as_str() };
 
-        match runner::run(compiled, lang_box.as_ref(), &source, cli.body) {
-            Ok(matches) if matches.is_empty() => {
+        match runner::run_rows(compiled, lang_box.as_ref(), &source, cli.body) {
+            Ok(rows) if rows.is_empty() => {
                 if cli.show_query && !multiple {
                     println!("(no matches)");
                 }
             }
-            Ok(matches) => {
-                for m in &matches {
-                    if multiple {
-                        println!("{}:{}", display, m);
-                    } else {
-                        println!("{}", m);
+            Ok(rows) => {
+                let mut seen = std::collections::HashSet::new();
+                for r in &rows {
+                    let out = match (&r.src_line, cli.node) {
+                        // Default: the whole source line, the way explain prints
+                        // its REFERENCES, always prefixed with the path.
+                        (Some(src), false) => format!("{}:{}: {}", display, r.line, src),
+                        // --node, or a match the source line cannot carry.
+                        _ if multiple => format!("{}:{}", display, r.node_text),
+                        _ => r.node_text.clone(),
+                    };
+                    if seen.insert(out.clone()) {
+                        total_matches += 1;
+                        println!("{}", out);
                     }
                 }
             }
@@ -510,6 +608,21 @@ fn main() {
                 eprintln!("Runner error in {}: {}", file, e);
             }
         }
+    }
+
+    if total_matches == 0 && !jobs.is_empty() {
+        let where_ = if files_from_stdin {
+            "the files on stdin".to_string()
+        } else {
+            effective_files.join(" ")
+        };
+        println!(
+            "no match for {} in {} ({} files scanned)",
+            query_str,
+            where_,
+            jobs.len()
+        );
+        std::process::exit(1);
     }
 }
 
