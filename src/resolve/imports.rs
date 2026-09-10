@@ -144,6 +144,7 @@ pub fn import_resolver_for(lang: &'static str) -> Box<dyn ImportResolver> {
         "c" | "cpp" => Box::new(CImports { lang }),
         "javascript" | "typescript" | "tsx" => Box::new(JsTsImports { lang }),
         "python" => Box::new(PyImports),
+        "ruby" => Box::new(RubyImports),
         "rust" => Box::new(RustImports),
         _ => Box::new(NoImports),
     }
@@ -625,6 +626,107 @@ fn py_probe(base: &Path, known: &HashSet<String>) -> Vec<String> {
     let pkg = base.join("__init__.py").to_string_lossy().into_owned();
     if known.contains(&pkg) { hits.push(pkg); }
     hits
+}
+
+// ── Ruby ──────────────────────────────────────────────────────────────────────
+//
+// Ruby has no import statement. `require`, `require_relative` and `load` are
+// ordinary method calls, so the resolver looks for calls by name and reads the
+// string literal argument. A call with a computed argument is skipped, since
+// there is no path to resolve.
+
+struct RubyImports;
+
+impl RubyImports {
+    fn parse(&self, source: &[u8]) -> Option<tree_sitter::Tree> {
+        let mut parser = Parser::new();
+        parser.set_language(&tree_sitter_ruby::LANGUAGE.into()).ok()?;
+        parser.parse(source, None)
+    }
+}
+
+/// The literal text of the first string argument, or None when the call takes
+/// something that is not a plain string.
+fn ruby_string_arg(call: Node, source: &[u8]) -> Option<String> {
+    let args = call.child_by_field_name("arguments")?;
+    let mut cur = args.walk();
+    let first = args.named_children(&mut cur).next()?;
+    if first.kind() != "string" {
+        return None;
+    }
+    let inner = first.named_children(&mut first.walk())
+        .find(|c| c.kind() == "string_content")
+        .map(|c| text(c, source).to_string())
+        .unwrap_or_else(|| unquote(text(first, source)));
+    if inner.is_empty() { None } else { Some(inner) }
+}
+
+/// `active_support/core_ext` is a file inside the `active_support` gem, so an
+/// unresolved require collapses to the gem name the way Rust collapses
+/// `std::collections::HashMap` to `std`.
+fn ruby_gem_label(spec: &str) -> String {
+    spec.split('/').next().unwrap_or(spec).to_string()
+}
+
+impl ImportResolver for RubyImports {
+    fn imports(&self, source: &[u8]) -> Vec<RawImport> {
+        let Some(tree) = self.parse(source) else { return vec![] };
+        let mut out = Vec::new();
+        walk(tree.root_node(), &mut |n| {
+            if n.kind() != "call" { return; }
+            let Some(method) = n.child_by_field_name("method") else { return };
+            let line = n.start_position().row + 1;
+            let spec = match text(method, source) {
+                // `require_relative "x"` names a file next to this one.
+                "require_relative" => {
+                    let Some(s) = ruby_string_arg(n, source) else { return };
+                    out.push(RawImport::new(s, ImportKind::Relative, line));
+                    return;
+                }
+                // `load "x.rb"` also takes a path, and in practice a relative one.
+                "load" => {
+                    let Some(s) = ruby_string_arg(n, source) else { return };
+                    out.push(RawImport::new(s, ImportKind::Relative, line));
+                    return;
+                }
+                "require" => ruby_string_arg(n, source),
+                _ => return,
+            };
+            // `require "x"` searches the load path, so it is either a project
+            // file reached through `lib/` or a gem.
+            if let Some(s) = spec {
+                let label = ruby_gem_label(&s);
+                out.push(RawImport::new(s, ImportKind::Absolute, line).ext(label));
+            }
+        });
+        out
+    }
+
+    fn resolve(&self, imp: &RawImport, importer: &Path, known: &HashSet<String>) -> Vec<String> {
+        match imp.kind {
+            ImportKind::Relative => {
+                let dir = importer.parent().unwrap_or_else(|| Path::new("/"));
+                let joined = normalize_lexical(&dir.join(&imp.specifier));
+                let mut path = joined.to_string_lossy().into_owned();
+                if !path.ends_with(".rb") {
+                    path.push_str(".rb");
+                }
+                if known.contains(&path) { vec![path] } else { vec![] }
+            }
+            ImportKind::Absolute => {
+                let spec = imp.specifier.trim_end_matches(".rb");
+                if spec.is_empty() { return vec![]; }
+                let suffix = format!("/{}.rb", spec);
+                let mut hits: Vec<String> = known.iter()
+                    .filter(|k| k.ends_with(&suffix))
+                    .cloned()
+                    .collect();
+                hits.sort();
+                hits
+            }
+            ImportKind::System => vec![],
+        }
+    }
 }
 
 // ── Rust ──────────────────────────────────────────────────────────────────────

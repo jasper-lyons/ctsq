@@ -20,7 +20,7 @@ pub fn run(snippet_arg: &str, lang_flag: Option<&str>, debug: bool) -> i32 {
         return 1;
     };
     let Some(lang) = lang::for_name(lang_name) else {
-        eprintln!("unknown language: {} (known: c, cpp, javascript, typescript, tsx, python, rust, go)", lang_name);
+        eprintln!("unknown language: {} (known: c, cpp, javascript, typescript, tsx, python, ruby, rust, go)", lang_name);
         return 1;
     };
     let snippet = match read_snippet(snippet_arg) {
@@ -268,12 +268,21 @@ fn parse_snippet(lang: &dyn Lang, canon: &str, snippet: &str) -> Result<Parsed, 
 // ---------------------------------------------------------------------------
 
 /// Transparent containers between the parse root and the construct the user
-/// actually wrote: file roots, statement wrappers, and harness function bodies.
+/// actually wrote: statement wrappers and harness function bodies.
 const WRAPPERS: &[&str] = &[
-    "program", "module", "source_file", "translation_unit",
     "expression_statement", "parenthesized_expression",
     "block", "statement_block", "compound_statement",
 ];
+
+/// Whole-file root nodes, transparent only at the top of the tree. Python names
+/// its root `module`, while in Ruby `module Foo … end` is a real construct that
+/// must survive to be classified.
+const ROOT_WRAPPERS: &[&str] = &["program", "module", "source_file", "translation_unit"];
+
+fn is_wrapper(node: Node) -> bool {
+    WRAPPERS.contains(&node.kind())
+        || (ROOT_WRAPPERS.contains(&node.kind()) && node.parent().is_none())
+}
 
 fn focus_nodes<'t>(tree: &'t Tree, src: &[u8], range: &Range<usize>) -> Vec<Node<'t>> {
     let mut start = range.start;
@@ -288,7 +297,7 @@ fn focus_nodes<'t>(tree: &'t Tree, src: &[u8], range: &Range<usize>) -> Vec<Node
 
 fn unwrap_construct(mut node: Node) -> Vec<Node> {
     loop {
-        if !WRAPPERS.contains(&node.kind()) {
+        if !is_wrapper(node) {
             return vec![node];
         }
         let mut cursor = node.walk();
@@ -848,6 +857,44 @@ mod tests {
     fn python_indented_snippet_dedents() {
         let c = candidates("    u.send_email()", "python");
         assert!(c.contains(&"&function#send_email".to_string()), "got: {:?}", c);
+    }
+
+    #[test]
+    fn ruby_def() {
+        let c = candidates("def foo; end", "ruby");
+        assert!(c[0].starts_with("method"), "got: {:?}", c);
+        assert!(c.contains(&"*function#foo".to_string()), "got: {:?}", c);
+    }
+
+    #[test]
+    fn ruby_method_call() {
+        let c = candidates("u.send_email()", "ruby");
+        assert!(c[0].starts_with("call"), "got: {:?}", c);
+        assert!(c[0].contains("identifier#send_email"), "got: {:?}", c);
+        assert!(c.contains(&"&function#send_email".to_string()), "got: {:?}", c);
+    }
+
+    #[test]
+    fn ruby_require_is_a_call_by_name() {
+        // `require` is an ordinary method call, so the named call rung wins over
+        // the `import` rung the way CommonJS `require(...)` does in JavaScript.
+        let c = candidates("require 'json'", "ruby");
+        assert!(c[0].contains("string_content#json"), "got: {:?}", c);
+        assert!(c.contains(&"&function#require".to_string()), "got: {:?}", c);
+    }
+
+    #[test]
+    fn ruby_class() {
+        let c = candidates("class User; end", "ruby");
+        assert!(c.contains(&"class#User".to_string()), "got: {:?}", c);
+    }
+
+    #[test]
+    fn ruby_module_is_not_mistaken_for_a_file_root() {
+        // Python names its whole-file root `module`, so an unguarded wrapper
+        // list would unwrap a real Ruby module and classify only its name.
+        let c = candidates("module Foo; end", "ruby");
+        assert!(c.contains(&"module#Foo".to_string()), "got: {:?}", c);
     }
 
     #[test]

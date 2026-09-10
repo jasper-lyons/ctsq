@@ -321,7 +321,8 @@ ctsq importgraph src/ --format edges    # plain "source -> target" pairs
 
 Resolution is per language: C/C++ `#include`, JS/TS relative paths (with
 extension and `index` probing, plus `require`, dynamic `import()`, and
-`export … from`), Python dotted and relative imports, and Rust `use` paths.
+`export … from`), Python dotted and relative imports, Ruby `require` /
+`require_relative` / `load` calls, and Rust `use` paths.
 JS/TS path aliases (`~/…`, `@/…`, `@app/…`) resolve through the nearest
 `tsconfig.json` / `jsconfig.json` (`baseUrl` + `paths`, following `extends`);
 projects without one fall back to matching the specifier's path tail.
@@ -505,6 +506,7 @@ function#malloc   # definitions of, or calls to, malloc
 | C++ | `.cpp` `.cc` `.cxx` `.hpp` `.hxx` |
 | JavaScript | `.js` `.mjs` `.cjs` `.jsx` |
 | Python | `.py` |
+| Ruby | `.rb` `.rake` `.gemspec` |
 | Rust | `.rs` |
 | Go | `.go` |
 

@@ -366,6 +366,29 @@ mod tests {
     }
 
     #[test]
+    fn ruby_require_relative_load_path_and_gem() {
+        let (_d, jobs) = setup("ruby", &[
+            ("app.rb", "require 'json'\nrequire_relative 'helpers'\nrequire 'util/geo'\n"),
+            ("helpers.rb", "def do_thing\n  Geo.new\nend\n"),
+            ("lib/util/geo.rb", "class Geo\nend\n"),
+        ]);
+        let es = edges(&jobs);
+        assert!(has(&es, "app.rb", "helpers.rb"), "require_relative resolves: {:?}", es);
+        assert!(has(&es, "app.rb", "geo.rb"), "require finds it under lib/: {:?}", es);
+        assert!(has(&es, "app.rb", "json"), "an unresolved require is an external gem: {:?}", es);
+    }
+
+    #[test]
+    fn ruby_gem_subpath_collapses_to_the_gem_name() {
+        let (_d, jobs) = setup("ruby", &[
+            ("app.rb", "require 'active_support/core_ext'\n"),
+        ]);
+        let es = edges(&jobs);
+        assert!(has(&es, "app.rb", "active_support"),
+            "the external node is the gem, not the file inside it: {:?}", es);
+    }
+
+    #[test]
     fn rust_crate_module_and_external_crate() {
         let (_d, jobs) = setup("rust", &[
             ("src/main.rs", "use crate::util::geo::Geo;\nuse serde::Serialize;\nfn main() {}\n"),

@@ -334,6 +334,16 @@ mod tests {
     }
 
     #[test]
+    fn a_ruby_method_query_with_body_prints_the_whole_definition() {
+        let src = "class Job\n  def run\n    perform\n  end\nend\n";
+        let rows = rows_for("*function#run", "ruby", src, true);
+        assert_eq!(rows.len(), 1, "{:?}", rows);
+        assert_eq!(rows[0].line, 2);
+        assert!(rows[0].node_text.contains("def run"), "{:?}", rows[0]);
+        assert!(rows[0].node_text.contains("perform"), "the body comes with it: {:?}", rows[0]);
+    }
+
+    #[test]
     fn test_body_combinator_finds_call() {
         let src = "void DoStuff() {\n    int x = 1;\n    Loading();\n    x++;\n}\n";
         let results = run_str("(*function @f).body((&function#Loading @c))", "cpp", src);

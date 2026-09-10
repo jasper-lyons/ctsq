@@ -16,7 +16,7 @@ pub const ABSTRACT_TYPES: &[&str] = &[
 
 /// Every language, in canonical form (tsx included — it adds JSX call forms).
 const ALL_LANGS: &[&str] = &[
-    "c", "cpp", "javascript", "typescript", "tsx", "python", "rust", "go",
+    "c", "cpp", "javascript", "typescript", "tsx", "python", "ruby", "rust", "go",
 ];
 
 pub fn run(langs: &[String], lang_flag: Option<&str>) {

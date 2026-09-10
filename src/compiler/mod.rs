@@ -679,6 +679,40 @@ mod tests {
     }
 
     #[test]
+    fn test_main_def_ruby() {
+        let out = compile_str("(*function#main @f)", "ruby");
+        assert!(out.contains("method"), "got: {}", out);
+        assert!(out.contains("singleton_method"), "def self.main counts too: {}", out);
+        assert!(out.contains("\"main\""), "got: {}", out);
+    }
+
+    #[test]
+    fn test_ruby_call_matches_receiver_and_receiverless() {
+        // One `call` variant covers `send_email(x)` and `u.send_email(x)` alike,
+        // because Ruby hangs both names off the same `method` field.
+        let out = compile_str("(&function#send_email @c)", "ruby");
+        assert!(out.contains("(call method:"), "got: {}", out);
+        assert!(out.contains("\"send_email\""), "got: {}", out);
+    }
+
+    #[test]
+    fn test_ruby_import_matches_both_require_forms() {
+        let out = compile_str("import", "ruby");
+        assert!(out.contains("\"require\""), "got: {}", out);
+        assert!(out.contains("\"require_relative\""), "got: {}", out);
+    }
+
+    #[test]
+    fn test_ruby_class_and_module() {
+        let cls = compile_str("class#Foo", "ruby");
+        assert!(cls.contains("(class name: (constant)"), "got: {}", cls);
+        assert!(cls.contains("\"Foo\""), "got: {}", cls);
+        let module = compile_str("module#Foo", "ruby");
+        assert!(module.contains("(module name: (constant)"), "got: {}", module);
+        assert!(module.contains("\"Foo\""), "got: {}", module);
+    }
+
+    #[test]
     fn test_body_combinator_cpp() {
         let q = parse("(*function @f).body((&function#Loading @c))").expect("parse failed");
         let lang = for_name("cpp").expect("unknown lang");
@@ -830,6 +864,8 @@ mod tests {
         assert!(compile_str("switch", "javascript").contains("switch_statement"));
         assert!(compile_str("switch", "rust").contains("match_expression"));
         assert!(compile_str("switch", "python").is_empty(), "Python has no switch");
+        assert!(compile_str("switch", "ruby").contains("case"), "Ruby has case");
+        assert!(compile_str("while", "ruby").contains("until"), "Ruby has until");
         assert!(compile_str("switch", "go").contains("expression_switch_statement"));
         assert!(compile_str("switch", "go").contains("type_switch_statement"));
         // call is now a known-absent no-op in all languages

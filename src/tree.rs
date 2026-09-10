@@ -131,6 +131,7 @@ fn try_extract(node: Node, source: &[u8], lang_name: &str, top: bool) -> Option<
         "python"               => extract_python(node, source, top),
         "javascript"           => extract_js(node, source, top),
         "typescript" | "tsx"   => extract_ts(node, source, top),
+        "ruby"                 => extract_ruby(node, source, top),
         "rust"                 => extract_rust(node, source, top),
         "go"                   => extract_go(node, source, top),
         _                      => None,
@@ -264,6 +265,53 @@ fn extract_python(node: Node, source: &[u8], top: bool) -> Option<Item> {
             let lhs = assign.child_by_field_name("left")?;
             if lhs.kind() == "identifier" {
                 Some(item("var", node_text(lhs, source).to_string(), node, source, vec![]))
+            } else { None }
+        }
+        _ => None,
+    }
+}
+
+// ── Ruby ─────────────────────────────────────────────────────────────────────
+
+fn extract_ruby(node: Node, source: &[u8], top: bool) -> Option<Item> {
+    match node.kind() {
+        "method" => {
+            let name = node.child_by_field_name("name")
+                .map(|n| node_text(n, source).to_string())?;
+            Some(item("fn", name, node, source, vec![]))
+        }
+        "singleton_method" => {
+            // `def self.foo`. The object the method hangs off belongs in the
+            // name, or two singleton methods on different objects read alike.
+            let name = node.child_by_field_name("name")
+                .map(|n| node_text(n, source).to_string())?;
+            let object = node.child_by_field_name("object")
+                .map(|n| node_text(n, source).to_string())
+                .unwrap_or_else(|| "self".into());
+            Some(item("fn", format!("{}.{}", object, name), node, source, vec![]))
+        }
+        "class" | "module" => {
+            let name = node.child_by_field_name("name")
+                .map(|n| node_text(n, source).to_string())
+                .unwrap_or_else(|| "(anonymous)".into());
+            let mut children = Vec::new();
+            if let Some(body) = node.child_by_field_name("body") {
+                let mut cur = body.walk();
+                for child in body.children(&mut cur) {
+                    if let Some(it) = extract_ruby(child, source, false) {
+                        children.push(it);
+                    }
+                }
+            }
+            let kind = if node.kind() == "class" { "class" } else { "module" };
+            Some(item(kind, name, node, source, children))
+        }
+        "assignment" if top => {
+            // `X = …` at top level. Only a constant is worth an outline entry.
+            // A lowercase local would list every temporary in the file.
+            let lhs = node.child_by_field_name("left")?;
+            if lhs.kind() == "constant" {
+                Some(item("const", node_text(lhs, source).to_string(), node, source, vec![]))
             } else { None }
         }
         _ => None,
@@ -613,6 +661,16 @@ mod tests {
     fn indentation_still_nests_children_under_their_parent() {
         let out = outline("example.cpp");
         assert!(out.contains("│   ├── ") || out.contains("    └── "), "{}", out);
+    }
+
+    #[test]
+    fn a_ruby_class_nests_its_methods_and_names_the_singleton() {
+        let out = outline("example.rb");
+        assert!(out.contains("├── class MyClass  :11"), "{}", out);
+        assert!(out.contains("│   ├── def run  :12"), "methods nest under the class: {}", out);
+        assert!(out.contains("def self.build"), "a singleton method keeps its object: {}", out);
+        assert!(out.contains("module Shapes"), "a module is an entry too: {}", out);
+        assert!(out.contains("MAX_SIZE = 64"), "a top-level constant is an entry: {}", out);
     }
 
     #[test]

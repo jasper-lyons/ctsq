@@ -27,6 +27,7 @@ src/
 │       ├── cpp.rs    C++ mappings
 │       ├── javascript.rs
 │       ├── python.rs
+│       ├── ruby.rs
 │       ├── rust.rs
 │       └── go.rs
 ├── runner.rs         Executes a CompiledQuery against source bytes; returns Match list

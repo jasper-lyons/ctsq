@@ -495,7 +495,7 @@ fn main() {
                 Some(ln) => match lang::lang_for_name_canonical(ln) {
                     Some(n) => n,
                     None => {
-                        eprintln!("Unknown language: {}. Supported: c, cpp, javascript, python, rust, go", ln);
+                        eprintln!("Unknown language: {}. Supported: c, cpp, javascript, python, ruby, rust, go", ln);
                         std::process::exit(1);
                     }
                 },
@@ -541,7 +541,7 @@ fn main() {
                 match lang::lang_for_name_canonical(ln) {
                     Some(n) => n,
                     None => {
-                        eprintln!("Unknown language: {}. Supported: c, cpp, javascript, python, rust, go", ln);
+                        eprintln!("Unknown language: {}. Supported: c, cpp, javascript, python, ruby, rust, go", ln);
                         std::process::exit(1);
                     }
                 }
@@ -799,7 +799,7 @@ fn require_lang(name: &str) -> Box<dyn lang::Lang> {
     match lang::for_name(name) {
         Some(l) => l,
         None => {
-            eprintln!("Unknown language: {}. Supported: c, cpp, javascript, python, rust, go", name);
+            eprintln!("Unknown language: {}. Supported: c, cpp, javascript, python, ruby, rust, go", name);
             std::process::exit(1);
         }
     }

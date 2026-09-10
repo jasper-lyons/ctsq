@@ -5,6 +5,7 @@ pub mod cpp;
 pub mod go;
 pub mod javascript;
 pub mod python;
+pub mod ruby;
 pub mod rust;
 pub mod typescript;
 
@@ -81,6 +82,7 @@ pub fn for_name(name: &str) -> Option<Box<dyn Lang>> {
         "typescript" | "ts" => Some(Box::new(typescript::TsLang)),
         "tsx" => Some(Box::new(typescript::TsxLang)),
         "python" | "py" => Some(Box::new(python::PyLang)),
+        "ruby" | "rb" => Some(Box::new(ruby::RubyLang)),
         "rust" | "rs" => Some(Box::new(rust::RustLang)),
         "go" => Some(Box::new(go::GoLang)),
         _ => None,
@@ -95,6 +97,7 @@ pub fn lang_for_name_canonical(name: &str) -> Option<&'static str> {
         "typescript" | "ts" => Some("typescript"),
         "tsx" => Some("tsx"),
         "python" | "py" => Some("python"),
+        "ruby" | "rb" => Some("ruby"),
         "rust" | "rs" => Some("rust"),
         "go" => Some("go"),
         _ => None,
@@ -109,6 +112,7 @@ pub fn extensions_for_name(name: &str) -> &'static [&'static str] {
         "typescript" | "ts" => &["ts"],
         "tsx" => &["tsx"],
         "python" | "py" => &["py"],
+        "ruby" | "rb" => &["rb", "rake", "gemspec"],
         "rust" | "rs" => &["rs"],
         "go" => &["go"],
         _ => &[],
@@ -116,7 +120,7 @@ pub fn extensions_for_name(name: &str) -> &'static [&'static str] {
 }
 
 pub fn all_known_extensions() -> &'static [&'static str] {
-    &["c", "h", "cpp", "cc", "cxx", "hpp", "hxx", "js", "mjs", "cjs", "jsx", "ts", "tsx", "py", "rs", "go"]
+    &["c", "h", "cpp", "cc", "cxx", "hpp", "hxx", "js", "mjs", "cjs", "jsx", "ts", "tsx", "py", "rb", "rake", "gemspec", "rs", "go"]
 }
 
 pub fn lang_for_extension(ext: &str) -> Option<&'static str> {
@@ -127,6 +131,7 @@ pub fn lang_for_extension(ext: &str) -> Option<&'static str> {
         "ts" => Some("typescript"),
         "tsx" => Some("tsx"),
         "py" => Some("python"),
+        "rb" | "rake" | "gemspec" => Some("ruby"),
         "rs" => Some("rust"),
         "go" => Some("go"),
         _ => None,

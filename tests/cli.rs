@@ -198,6 +198,17 @@ fn a_js_const_query_finds_the_declaration() {
 }
 
 #[test]
+fn a_ruby_file_is_detected_by_its_extension() {
+    // No --lang: the .rb suffix has to pick the language on its own.
+    let f = fixture("example.rb");
+    let out = ctsq(&["-q", "*function#main", "--body", &f]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(text.starts_with(&format!("{}:6-9: def main", f)), "{}", text);
+    assert!(text.contains("allocate_buffer(MAX_SIZE)"), "expected the body: {}", text);
+}
+
+#[test]
 fn an_unknown_kind_names_the_valid_ones() {
     let out = ctsq(&["-q", "*bogus#X", &fixture("typescript/example.ts")]);
     let err = stderr(&out);
