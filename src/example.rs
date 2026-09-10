@@ -386,10 +386,15 @@ fn classify(node: Node, src: &[u8], index: &[InvEntry]) -> Vec<Classification> {
 /// Walk the TsVariant's name shape against a real node to pull out its name.
 fn extract_name(node: Node, v: &TsVariant, src: &[u8]) -> Option<String> {
     if let Some(field) = v.name_field {
-        let mut n = node.child_by_field_name(field)?;
-        for &(outer, inner) in v.name_path {
+        // An empty field name means the name hangs off a positional child (the
+        // declarator in a JS `const x = 1`); name_path says which child.
+        let mut n = if field.is_empty() { node } else { node.child_by_field_name(field)? };
+        for (i, &(outer, inner)) in v.name_path.iter().enumerate() {
+            if i == 0 && field.is_empty() {
+                n = named_child_of_kind(n, outer)?;
+            }
             if n.kind() != outer { return None; }
-            n = n.child_by_field_name(inner)?;
+            n = if inner.is_empty() { n.named_child(0)? } else { n.child_by_field_name(inner)? };
         }
         if n.kind() != v.name_node { return None; }
         return Some(n.utf8_text(src).ok()?.to_string());
@@ -409,6 +414,12 @@ fn extract_name(node: Node, v: &TsVariant, src: &[u8]) -> Option<String> {
     None
 }
 
+fn named_child_of_kind<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
+    let mut cursor = node.walk();
+    let found = node.named_children(&mut cursor).find(|c| c.kind() == kind);
+    found
+}
+
 /// always_constraint strings all have the form " field: (kind)".
 fn constraint_holds(node: Node, constraint: &str) -> bool {
     let Some((field, rest)) = constraint.trim().split_once(':') else { return true };
@@ -426,9 +437,29 @@ fn classify_with_descent<'t>(focus: Node<'t>, src: &[u8], index: &[InvEntry])
     -> (Node<'t>, Vec<Classification>)
 {
     let cls = classify(focus, src, index);
-    if !cls.is_empty() {
+    if let Some(top) = cls.first() {
+        // A binding that holds a named construct — `const f = () => {}` — is
+        // better described by the construct than by the binding. Only when the
+        // two carry the same name, so `const x = foo()` stays a variable.
+        if let Some((node, inner)) = best_descendant(focus, src, index) {
+            if inner.priority < top.priority && inner.name.is_some() && inner.name == top.name {
+                return (node, vec![inner]);
+            }
+        }
         return (focus, cls);
     }
+    match best_descendant(focus, src, index) {
+        Some((node, c)) => (node, vec![c]),
+        None => (focus, vec![]),
+    }
+}
+
+/// The most meaningful classified construct below `focus`, lowest priority
+/// first. Leaves are skipped so identifiers and literals can't hijack a
+/// structural snippet.
+fn best_descendant<'t>(focus: Node<'t>, src: &[u8], index: &[InvEntry])
+    -> Option<(Node<'t>, Classification)>
+{
     let mut best: Option<(Node, Classification)> = None;
     let mut queue: VecDeque<(Node, usize)> = VecDeque::new();
     let mut cursor = focus.walk();
@@ -448,10 +479,7 @@ fn classify_with_descent<'t>(focus: Node<'t>, src: &[u8], index: &[InvEntry])
             queue.extend(node.named_children(&mut cursor).map(|c| (c, depth + 1)));
         }
     }
-    match best {
-        Some((node, c)) => (node, vec![c]),
-        None => (focus, vec![]),
-    }
+    best
 }
 
 // ---------------------------------------------------------------------------

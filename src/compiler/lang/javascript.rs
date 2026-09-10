@@ -31,6 +31,17 @@ impl Lang for JsLang {
             }]),
             "id" => Some(vec![identifier()]),
             "var" => Some(vec![identifier()]),
+            // `*variable#X` reaches the whole `const X = …` statement, so --body
+            // prints it. `&variable#X` stays on the uses. `const` is an alias.
+            "variable" | "const" => Some(match sigil {
+                Some(Sigil::Ref) => vec![identifier()],
+                Some(Sigil::Def) => var_decl_variants(),
+                None => {
+                    let mut v = var_decl_variants();
+                    v.push(identifier());
+                    v
+                }
+            }),
             "param" => Some(vec![identifier()]),
             "type" => Some(vec![simple("type_identifier")]),
             "import" => Some(import_variants()),
@@ -168,6 +179,40 @@ fn call_variants() -> Vec<TsVariant> {
             body_field: None,
             body_container: None,
             name_path: &[],
+            params_needs_bridge: false,
+            always_constraint: None,
+            parent_name_wrap: None, always_callee_eq: None,
+        },
+    ]
+}
+
+/// The statement a `const`, `let` or `var` name is introduced by. The declarator
+/// holding the name is a positional child, hence the empty name_field. Shared
+/// with TypeScript, whose grammar has the same two nodes.
+pub(super) fn var_decl_variants() -> Vec<TsVariant> {
+    vec![
+        TsVariant {
+            node: "lexical_declaration",
+            name_field: Some(""),
+            name_node: "identifier",
+            params_field: None,
+            params_container: None,
+            body_field: None,
+            body_container: None,
+            name_path: &[("variable_declarator", "name")],
+            params_needs_bridge: false,
+            always_constraint: None,
+            parent_name_wrap: None, always_callee_eq: None,
+        },
+        TsVariant {
+            node: "variable_declaration",
+            name_field: Some(""),
+            name_node: "identifier",
+            params_field: None,
+            params_container: None,
+            body_field: None,
+            body_container: None,
+            name_path: &[("variable_declarator", "name")],
             params_needs_bridge: false,
             always_constraint: None,
             parent_name_wrap: None, always_callee_eq: None,

@@ -56,6 +56,17 @@ impl Lang for RustLang {
                 always_constraint: None,
                 parent_name_wrap: None, always_callee_eq: None,
             }]),
+            // `*variable#X` reaches the whole `let`, `const` or `static` item, so
+            // --body prints it. `&variable#X` stays on the uses. `const` is an alias.
+            "variable" | "const" => Some(match sigil {
+                Some(Sigil::Ref) => vec![identifier()],
+                Some(Sigil::Def) => var_decl_variants(),
+                None => {
+                    let mut v = var_decl_variants();
+                    v.push(identifier());
+                    v
+                }
+            }),
             "param" => Some(vec![TsVariant {
                 node: "parameter",
                 name_field: Some("pattern"),
@@ -136,6 +147,52 @@ fn type_decl_variants() -> Vec<TsVariant> {
         parent_name_wrap: None, always_callee_eq: None,
     });
     v
+}
+
+/// The item a Rust value name is introduced by: `let x = …`, `const X: T = …`
+/// and `static X: T = …`.
+fn var_decl_variants() -> Vec<TsVariant> {
+    vec![
+        TsVariant {
+            node: "let_declaration",
+            name_field: Some("pattern"),
+            name_node: "identifier",
+            params_field: None,
+            params_container: None,
+            body_field: None,
+            body_container: None,
+            name_path: &[],
+            params_needs_bridge: false,
+            always_constraint: None,
+            parent_name_wrap: None, always_callee_eq: None,
+        },
+        TsVariant {
+            node: "const_item",
+            name_field: Some("name"),
+            name_node: "identifier",
+            params_field: None,
+            params_container: None,
+            body_field: None,
+            body_container: None,
+            name_path: &[],
+            params_needs_bridge: false,
+            always_constraint: None,
+            parent_name_wrap: None, always_callee_eq: None,
+        },
+        TsVariant {
+            node: "static_item",
+            name_field: Some("name"),
+            name_node: "identifier",
+            params_field: None,
+            params_container: None,
+            body_field: None,
+            body_container: None,
+            name_path: &[],
+            params_needs_bridge: false,
+            always_constraint: None,
+            parent_name_wrap: None, always_callee_eq: None,
+        },
+    ]
 }
 
 fn identifier() -> TsVariant {

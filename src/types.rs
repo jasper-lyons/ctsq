@@ -9,8 +9,9 @@ use std::collections::HashSet;
 /// The fixed abstract-type vocabulary, in a sensible reading order.
 /// Also the classification priority order for `example` (query-by-example).
 pub const ABSTRACT_TYPES: &[&str] = &[
-    "id", "function", "call", "class", "module", "type", "var", "param",
-    "import", "literal", "block", "if", "for", "while", "switch", "op",
+    "id", "function", "call", "class", "module", "type", "var", "variable",
+    "const", "param", "import", "literal", "block", "if", "for", "while",
+    "switch", "op",
 ];
 
 /// Every language, in canonical form (tsx included — it adds JSX call forms).

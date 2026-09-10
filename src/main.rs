@@ -22,9 +22,12 @@ use std::io::{BufRead, IsTerminal, Read};
     about = "Cascading TreeSitter Queries",
     after_help = "QUERY SYNTAX
   Abstract types  id        any identifier — replaces grep -n \"Symbol\" (see examples below)
-                  function  class  var  param  type  import  literal  block
-                  if  for  while  switch
-                  Unknown identifiers pass through as raw tree-sitter node types.
+                  function  class  var  variable  const  param  type  import
+                  literal  block  if  for  while  switch
+                  variable (alias const) is a variable declaration: *variable#X
+                  reaches the whole `const X = …` statement, &variable#X the uses.
+                  Unknown identifiers pass through as raw tree-sitter node types;
+                  anything else is rejected with the valid kinds for the language.
 
   Sigils (scope)  *type    definitions only   (function_definition, class declaration…)
                   &type    references only     (call_expression, variable use…)
@@ -49,16 +52,24 @@ use std::io::{BufRead, IsTerminal, Read};
 OUTPUT
   Each match prints as path:LINE: <the whole source line, trimmed>, the same
   rendering `explain` uses for its REFERENCES. --node prints the matched
-  node's own text instead. --body prints the full text of a multi-line match.
+  node's own text instead. --body prints the full text of a multi-line match,
+  as path:START-END: <text>. Every form opens with the file the match is in
+  (<stdin> for piped source), so nothing needs a second look to be located.
   No match prints a one-line miss report on stdout and exits 1.
+
+  -C N (--context N) adds N source lines either side of each match, like
+  grep -C: matched lines keep path:LINE:, context lines use path-LINE-, groups
+  are separated by --, and lines keep their indentation. Not valid with --node.
 
 EXAMPLES
   ctsq -q 'id#Symbol' file.cpp                             grep -n \"Symbol\" file.cpp
   ctsq -q 'id#/A|B|C/' file.cpp                           grep -n \"A\\|B\\|C\" file.cpp
   ctsq -l cpp -q 'id#Symbol' src/                         grep -rn \"Symbol\" src/ --include=*.cpp
   ctsq -q 'id#Symbol' a.cpp b.cpp                         grep -n \"Symbol\" a.cpp b.cpp
+  ctsq -q 'id#Symbol' -C 2 file.ts                        grep -n -C 2 \"Symbol\" file.ts
   ctsq -q '*function#Foo' file.cpp                        grep -n \"void Foo\" file.cpp
   ctsq -q '*type#Config' --body file.go                   the whole type declaration
+  ctsq -q '*variable#config' --body file.ts               the whole const declaration
   ctsq -q '(*function @f).body(id#CONST)' file.cpp        functions that reference CONST
   ctsq files -q 'id#A' -q 'id#B' src/                     grep -rl A | xargs grep -l B
 
@@ -145,6 +156,10 @@ struct Cli {
     /// Print the matched node's own text instead of the whole source line
     #[arg(long)]
     node: bool,
+
+    /// Print N source lines either side of each match, like grep -C
+    #[arg(short = 'C', long = "context", value_name = "N")]
+    context: Option<usize>,
 
     /// Ignore .gitignore and .ignore files (search all files)
     #[arg(long, global = true)]
@@ -406,10 +421,20 @@ fn main() {
         }
     };
 
+    if cli.context.is_some() && cli.node {
+        eprintln!("-C/--context does not apply to --node, which already prints the whole node");
+        std::process::exit(2);
+    }
+
     // --show-query with explicit --lang: print and maybe exit
     if cli.show_query {
         if let Some(lang_name) = &cli.lang {
             let lang = require_lang(lang_name);
+            let canonical = lang::lang_for_name_canonical(lang_name).unwrap_or(lang_name);
+            if let Err(msg) = compiler::validate(&ast, lang.as_ref(), canonical) {
+                eprintln!("{}", msg);
+                std::process::exit(1);
+            }
             let compiled = compiler::compile(&ast, lang.as_ref());
             println!("=== Compiled S-expression ({}) ===", lang_name);
             if compiled.is_empty() {
@@ -539,6 +564,21 @@ fn main() {
 
     let multiple = jobs.len() > 1;
     let mut total_matches = 0usize;
+    let mut printed_a_block = false;
+
+    // Reject an abstract kind no language in the scan knows before running
+    // anything, so the message names the kind rather than the tree-sitter fallout.
+    let mut checked: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+    for (_, lang_name) in &jobs {
+        if !checked.insert(lang_name) {
+            continue;
+        }
+        let l = lang::for_name(lang_name).expect("lang_name always valid here");
+        if let Err(msg) = compiler::validate(&ast, l.as_ref(), lang_name) {
+            eprintln!("{}", msg);
+            std::process::exit(1);
+        }
+    }
 
     let mut compiled_cache: HashMap<&'static str, (Box<dyn lang::Lang>, compiler::CompiledQuery)> =
         HashMap::new();
@@ -587,23 +627,34 @@ fn main() {
                     println!("(no matches)");
                 }
             }
-            Ok(rows) => {
-                let mut seen = std::collections::HashSet::new();
-                for r in &rows {
-                    let out = match (&r.src_line, cli.node) {
-                        // Default: the whole source line, the way explain prints
-                        // its REFERENCES, always prefixed with the path.
-                        (Some(src), false) => format!("{}:{}: {}", display, r.line, src),
-                        // --node, or a match the source line cannot carry.
-                        _ if multiple => format!("{}:{}", display, r.node_text),
-                        _ => r.node_text.clone(),
-                    };
-                    if seen.insert(out.clone()) {
-                        total_matches += 1;
-                        println!("{}", out);
+            Ok(rows) => match cli.context {
+                Some(ctx) => {
+                    print_with_context(
+                        display,
+                        &source,
+                        &rows,
+                        ctx,
+                        &mut printed_a_block,
+                        &mut total_matches,
+                    );
+                }
+                None => {
+                    let mut seen = std::collections::HashSet::new();
+                    for r in &rows {
+                        let out = match (&r.src_line, cli.node) {
+                            // Default: the whole source line, the way explain prints
+                            // its REFERENCES, always prefixed with the path.
+                            (Some(src), false) => format!("{}:{}: {}", display, r.line, src),
+                            // --node, or a match the source line cannot carry.
+                            _ => with_path(display, &r.node_text),
+                        };
+                        if seen.insert(out.clone()) {
+                            total_matches += 1;
+                            println!("{}", out);
+                        }
                     }
                 }
-            }
+            },
             Err(e) => {
                 eprintln!("Runner error in {}: {}", file, e);
             }
@@ -626,6 +677,89 @@ fn main() {
     }
 }
 
+/// `-C N` output, modelled on grep -C: every match prints with the N source
+/// lines either side of it. Matched lines keep the `path:LINE: text` form,
+/// context lines use `path-LINE- text`, groups are separated by a `--` line, and
+/// windows that overlap or touch merge into one group. Lines keep their own
+/// indentation here, unlike the one-line form, because the point of asking for
+/// context is to read the block as it sits in the file.
+///
+/// A match the source line cannot carry (two or more captures, or a multi-line
+/// --body match) keeps its node form and gets no context.
+fn print_with_context(
+    display: &str,
+    source: &[u8],
+    rows: &[runner::MatchRow],
+    ctx: usize,
+    printed_a_block: &mut bool,
+    total_matches: &mut usize,
+) {
+    let text = String::from_utf8_lossy(source);
+    let lines: Vec<&str> = text.lines().collect();
+
+    let mut matched: Vec<usize> = rows
+        .iter()
+        .filter(|r| r.src_line.is_some() && r.line > 0)
+        .map(|r| r.line)
+        .collect();
+    matched.sort_unstable();
+    matched.dedup();
+    *total_matches += matched.len();
+    let is_match: std::collections::HashSet<usize> = matched.iter().copied().collect();
+
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    for &m in &matched {
+        let start = m.saturating_sub(ctx).max(1);
+        let end = (m + ctx).min(lines.len());
+        match groups.last_mut() {
+            // Touching or overlapping windows read as one block.
+            Some((_, prev_end)) if start <= *prev_end + 1 => {
+                if end > *prev_end {
+                    *prev_end = end;
+                }
+            }
+            _ => groups.push((start, end)),
+        }
+    }
+
+    for (start, end) in groups {
+        if *printed_a_block {
+            println!("--");
+        }
+        *printed_a_block = true;
+        for ln in start..=end {
+            let line = lines.get(ln - 1).map(|l| l.trim_end()).unwrap_or("");
+            let marker = if is_match.contains(&ln) { ':' } else { '-' };
+            // A blank line keeps no trailing space after the marker.
+            if line.is_empty() {
+                println!("{}{}{}{}", display, marker, ln, marker);
+            } else {
+                println!("{}{}{}{} {}", display, marker, ln, marker, line);
+            }
+        }
+    }
+
+    for r in rows.iter().filter(|r| r.src_line.is_none()) {
+        if *printed_a_block {
+            println!("--");
+        }
+        *printed_a_block = true;
+        *total_matches += 1;
+        println!("{}", with_path(display, &r.node_text));
+    }
+}
+
+/// The node-text form has to say which file it came from, or a multi-line hit
+/// sends the reader back to the file to find it. `<match>` is a placeholder for
+/// exactly that, so the path replaces it. The capture form (`@f:4: …, @c:6: …`)
+/// has no slot of its own and takes the path as a prefix.
+fn with_path(display: &str, node_text: &str) -> String {
+    match node_text.strip_prefix("<match>") {
+        Some(rest) => format!("{}{}", display, rest),
+        None => format!("{}:{}", display, node_text),
+    }
+}
+
 fn run_refs(name: &str, path: &str, lang_override: Option<&str>, no_ignore: bool) {
     let query_str = format!("id#{}", name);
     let ast = match query::parse(&query_str) {
@@ -637,8 +771,6 @@ fn run_refs(name: &str, path: &str, lang_override: Option<&str>, no_ignore: bool
     if jobs.is_empty() {
         return;
     }
-    let multiple = jobs.len() > 1 || std::path::Path::new(path).is_dir();
-
     let mut compiled_cache: HashMap<&'static str, (Box<dyn lang::Lang>, compiler::CompiledQuery)> =
         HashMap::new();
 
@@ -655,11 +787,7 @@ fn run_refs(name: &str, path: &str, lang_override: Option<&str>, no_ignore: bool
         match runner::run(compiled, lang_box.as_ref(), &source, false) {
             Ok(matches) => {
                 for m in &matches {
-                    if multiple {
-                        println!("{}:{}", file, m);
-                    } else {
-                        println!("{}", m);
-                    }
+                    println!("{}", with_path(file, m));
                 }
             }
             Err(e) => eprintln!("Runner error in {}: {}", file, e),

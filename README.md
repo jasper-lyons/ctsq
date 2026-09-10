@@ -163,7 +163,25 @@ fixtures/example.go:14: func NewServer(host string, port int) *Server {
 fixtures/example.go:19: 	s := NewServer("localhost", 8080)
 ```
 
-A match with two or more captures, and a multi-line match under `--body`, keep the node-text form instead, because one source line cannot carry them. Nothing matched prints a one-line miss report on stdout and exits 1:
+**Context (`-C N`).** Print N source lines either side of each match, the way `grep -C` does. Matched lines keep the `path:LINE:` form, context lines use `path-LINE-` with dashes, and groups are separated by a `--` line. Windows that overlap or touch merge into one group, and lines keep their own indentation here, because the point of asking for context is to read the block as it sits in the file:
+
+```sh
+ctsq -q 'id#NewServer' -C 2 fixtures/example.go
+fixtures/example.go-12- }
+fixtures/example.go-13-
+fixtures/example.go:14: func NewServer(host string, port int) *Server {
+fixtures/example.go-15- 	return &Server{host: host, port: port}
+fixtures/example.go-16- }
+fixtures/example.go-17-
+fixtures/example.go-18- func main() {
+fixtures/example.go:19: 	s := NewServer("localhost", 8080)
+fixtures/example.go-20- 	s.Start()
+fixtures/example.go-21- }
+```
+
+`-C` is rejected with exit 2 alongside `--node`, which already prints the whole node.
+
+A match with two or more captures, and a multi-line match under `--body`, keep the node-text form instead, because one source line cannot carry them. Those get no context. They still open with the file they came from, as `path:11-19: …` for a multi-line body and `path:@f:4: …, @call:6: …` for captures, so there is never a match without a file to open. Source read from stdin says `<stdin>`. Nothing matched prints a one-line miss report on stdout and exits 1:
 
 ```sh
 ctsq -q 'id#nope' fixtures/example.go
@@ -171,6 +189,7 @@ no match for id#nope in fixtures/example.go (1 files scanned)
 ```
 
 **Flags:**
+- `-C N`, `--context N`: print N source lines either side of each match, like `grep -C`
 - `--show-query` — print the compiled TreeSitter S-expression
 - `--body` — show the full body of matched nodes (default: first line only)
 - `--node` — print the matched node's own text instead of the source line (the pre-0.2 form)
@@ -364,6 +383,7 @@ failed self-verification and which node the snippet was classified from.
 | `function` | function definitions and/or calls |
 | `class` | class / struct definitions |
 | `var` | variable declarations and/or uses |
+| `variable` (alias `const`) | the declaration statement a name is bound by (`*variable`) and its uses (`&variable`) |
 | `param` | function parameters |
 | `type` | type declarations (`*type`) and type annotations (`&type`) |
 | `import` | import / use statements |
@@ -371,7 +391,14 @@ failed self-verification and which node the snippet was classified from.
 | `block` | block / body nodes |
 | `if` `for` `while` `switch` | control-flow nodes |
 
-Unknown identifiers pass through to TreeSitter verbatim as concrete node names.
+Unknown identifiers pass through to TreeSitter verbatim as concrete node names. An identifier that is neither an abstract type nor a real node type in the language is rejected before anything runs:
+
+```sh
+ctsq -q '*bogus#X' file.ts
+unknown kind 'bogus' for typescript, valid kinds: id, function, call, class, module, type, var, variable, const, param, import, literal, block, if, for, while, switch, op
+```
+
+`variable` and `const` are the same kind under two names. They cover JavaScript, TypeScript, JSX and TSX (`lexical_declaration`, `variable_declaration`), Go (`var`, `const` and `:=`) and Rust (`let`, `const`, `static`). C, C++ and Python have no mapping: a C declaration mixes variables, prototypes and pointer declarators in one node, so `*variable#X` there would need real disambiguation rather than a table entry.
 
 ### Sigils (scope)
 
@@ -382,6 +409,8 @@ Unknown identifiers pass through to TreeSitter verbatim as concrete node names.
 | _(none)_ | both (widest net) |
 
 The sigil changes which node the abstract `type` reaches. `*type#Name` matches the declaration the name is introduced by, so `--body` prints the whole thing: `type_spec` and `type_alias` in Go, `type_alias_declaration` and `interface_declaration` in TypeScript, `struct_item` / `enum_item` / `trait_item` / `union_item` / `type_item` in Rust, and the tagged specifiers plus `typedef` in C and C++. `&type#Name` matches the bare `type_identifier`, which is the annotation site.
+
+`variable` works the same way. `*variable#Name` matches the statement the name is bound by, so `--body` on a TypeScript `const Name = { … }` prints the whole object. `&variable#Name` matches the bare identifier, which is every use.
 
 ### Name matching
 
@@ -433,12 +462,25 @@ fixtures/example.cpp:15: char *buf = (char *)malloc(ARRAY_SIZE);
 ctsq -q '*function#process' fixtures/example.c
 fixtures/example.c:4: void process(int ARRAY_SIZE) {
 
+# the match with a line either side of it, like grep -C 1
+ctsq -q '*function#NewServer' -C 1 fixtures/example.go
+fixtures/example.go-13-
+fixtures/example.go:14: func NewServer(host string, port int) *Server {
+fixtures/example.go-15- 	return &Server{host: host, port: port}
+
 # the whole declaration a type name is introduced by
 ctsq -q '*type#Server' --body fixtures/example.go
-<match>:5-8: Server struct {
+fixtures/example.go:5-8: Server struct {
 	host string
 	port int
 }
+
+# the whole statement a variable name is bound by
+ctsq -q '*variable#defaults' --body fixtures/typescript/example.ts
+fixtures/typescript/example.ts:38-41: const defaults = {
+  retries: 3,
+  label: "ctsq",
+};
 
 # functions that reference ARRAY_SIZE
 ctsq -q '(*function @f).body(id#ARRAY_SIZE)' fixtures/example.c
@@ -446,7 +488,7 @@ fixtures/example.c:4: void process(int ARRAY_SIZE) {
 
 # calls to malloc inside any function definition
 ctsq -q '(*function @f).body((&function#malloc @call))' fixtures/example.c
-@f:4: "void process(int ARRAY_SIZE) {", @call:6: "malloc(ARRAY_SIZE)"
+fixtures/example.c:@f:4: "void process(int ARRAY_SIZE) {", @call:6: "malloc(ARRAY_SIZE)"
 
 # not sure what to write? derive the query from example code
 ctsq example 'malloc(n)' -l c

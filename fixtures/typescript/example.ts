@@ -34,3 +34,8 @@ export class Dog extends Animal {
     console.log("Woof!");
   }
 }
+
+export const defaults = {
+  retries: 3,
+  label: "ctsq",
+};

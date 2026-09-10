@@ -32,6 +32,17 @@ impl Lang for GoLang {
                 always_constraint: None,
                 parent_name_wrap: None, always_callee_eq: None,
             }]),
+            // `*variable#X` reaches the whole declaration statement, so --body
+            // prints it. `&variable#X` stays on the uses. `const` is an alias.
+            "variable" | "const" => Some(match sigil {
+                Some(Sigil::Ref) => vec![identifier()],
+                Some(Sigil::Def) => var_decl_variants(),
+                None => {
+                    let mut v = var_decl_variants();
+                    v.push(identifier());
+                    v
+                }
+            }),
             "param" => Some(vec![TsVariant {
                 node: "parameter_declaration",
                 name_field: Some("name"),
@@ -109,6 +120,53 @@ fn type_decl_variants() -> Vec<TsVariant> {
             body_field: Some("type"),
             body_container: None,
             name_path: &[],
+            params_needs_bridge: false,
+            always_constraint: None,
+            parent_name_wrap: None, always_callee_eq: None,
+        },
+    ]
+}
+
+/// The statement a Go variable or constant name is introduced by: `var x = …`,
+/// `const x = …` and `x := …`. The spec node holding the name is a positional
+/// child, hence the empty name_field.
+fn var_decl_variants() -> Vec<TsVariant> {
+    vec![
+        TsVariant {
+            node: "var_declaration",
+            name_field: Some(""),
+            name_node: "identifier",
+            params_field: None,
+            params_container: None,
+            body_field: None,
+            body_container: None,
+            name_path: &[("var_spec", "name")],
+            params_needs_bridge: false,
+            always_constraint: None,
+            parent_name_wrap: None, always_callee_eq: None,
+        },
+        TsVariant {
+            node: "const_declaration",
+            name_field: Some(""),
+            name_node: "identifier",
+            params_field: None,
+            params_container: None,
+            body_field: None,
+            body_container: None,
+            name_path: &[("const_spec", "name")],
+            params_needs_bridge: false,
+            always_constraint: None,
+            parent_name_wrap: None, always_callee_eq: None,
+        },
+        TsVariant {
+            node: "short_var_declaration",
+            name_field: Some("left"),
+            name_node: "identifier",
+            params_field: None,
+            params_container: None,
+            body_field: None,
+            body_container: None,
+            name_path: &[("expression_list", "")],
             params_needs_bridge: false,
             always_constraint: None,
             parent_name_wrap: None, always_callee_eq: None,

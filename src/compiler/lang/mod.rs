@@ -14,6 +14,9 @@ pub struct TsVariant {
     pub node: &'static str,
     /// The field containing the callee/name identifier (e.g. "function" for call_expression).
     /// None means the node itself IS the name (e.g. identifier).
+    /// `Some("")` means the name lives in a positional child with no field name
+    /// (e.g. the variable_declarator inside a JS/TS lexical_declaration); use it
+    /// with `name_path` to say which child.
     pub name_field: Option<&'static str>,
     /// The TS node type of the name child (e.g. "identifier").
     pub name_node: &'static str,
@@ -29,6 +32,8 @@ pub struct TsVariant {
     /// Empty = name_node is a direct child of name_field.
     /// Example: &[("function_declarator", "declarator")] means
     ///   name_field: (function_declarator declarator: (name_node) @cap)
+    /// An empty inner_field means the next node down is a positional child with
+    /// no field name, e.g. &[("expression_list", "")] for a Go `x := 1`.
     pub name_path: &'static [(&'static str, &'static str)],
     /// When true, .params() injects via a wildcard bridge node (`_ params_field: ...`)
     /// instead of directly. Needed for C/C++ function_definition where `parameters`

@@ -110,6 +110,17 @@ fn ts_resolve(abstract_type: &str, sigil: Option<&Sigil>) -> Option<Vec<TsVarian
         }),
         "id" => Some(vec![identifier(), simple("type_identifier")]),
         "var" => Some(vec![identifier()]),
+        // `*variable#X` reaches the whole `const X = …` statement, so --body
+        // prints it. `&variable#X` stays on the uses. `const` is an alias.
+        "variable" | "const" => Some(match sigil {
+            Some(Sigil::Ref) => vec![identifier()],
+            Some(Sigil::Def) => super::javascript::var_decl_variants(),
+            None => {
+                let mut v = super::javascript::var_decl_variants();
+                v.push(identifier());
+                v
+            }
+        }),
         "param" => Some(vec![identifier()]),
         "import" => Some(super::javascript::import_variants()),
         "literal" => Some(vec![

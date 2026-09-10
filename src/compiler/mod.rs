@@ -138,6 +138,67 @@ pub fn compile(query: &Query, lang: &dyn Lang) -> CompiledQuery {
     CompiledQuery::Simple(emit_alternation(frags))
 }
 
+/// The abstract kinds this language resolves, in vocabulary order. Used for the
+/// "valid kinds" list in the unknown-kind error and by nothing else.
+pub fn known_kinds(lang: &dyn Lang) -> Vec<&'static str> {
+    crate::types::ABSTRACT_TYPES
+        .iter()
+        .copied()
+        .filter(|t| lang.resolve(t, None).is_some())
+        .collect()
+}
+
+/// Reject a node type that is neither an abstract kind this language knows nor a
+/// real tree-sitter node type in it. Without this the query compiles to a
+/// nonsense pattern and tree-sitter reports "Invalid node type" from deep inside
+/// the runner, which says nothing about what would have worked.
+pub fn validate(query: &Query, lang: &dyn Lang, lang_name: &str) -> Result<(), String> {
+    let mut kinds = Vec::new();
+    collect_node_types(query, &mut kinds);
+
+    let ts_lang = lang.ts_language();
+    for kind in kinds {
+        if lang.resolve(&kind, None).is_some() {
+            continue;
+        }
+        // Unknown identifiers pass through as concrete tree-sitter node types.
+        if ts_lang.id_for_node_kind(&kind, true) != 0 || ts_lang.id_for_node_kind(&kind, false) != 0
+        {
+            continue;
+        }
+        return Err(format!(
+            "unknown kind '{}' for {}, valid kinds: {}",
+            kind,
+            lang_name,
+            known_kinds(lang).join(", ")
+        ));
+    }
+    Ok(())
+}
+
+fn collect_node_types(query: &Query, out: &mut Vec<String>) {
+    collect_selector_node_types(&query.head, out);
+    for (_, sel) in &query.tail {
+        collect_selector_node_types(sel, out);
+    }
+}
+
+fn collect_selector_node_types(sel: &Selector, out: &mut Vec<String>) {
+    match &sel.node {
+        SelectorNode::Bare(atom) => {
+            if let Some(t) = &atom.node_type {
+                out.push(t.clone());
+            }
+        }
+        SelectorNode::Group { query, .. } => collect_node_types(query, out),
+    }
+    for fa in &sel.fields {
+        if let Some(inner) = &fa.inner {
+            collect_node_types(inner, out);
+        }
+    }
+}
+
 /// If the query has a head-selector with exactly one field access that has an inner
 /// query and no tail combinators, compile it as a two-phase scoped query.
 /// The scope_field is the field name used to navigate from each outer match to the
@@ -360,13 +421,23 @@ fn compile_variant(variant: &TsVariant, atom: &Atom) -> Fragment {
         match variant.name_field {
             Some(name_field) => {
                 // Name lives in a child field — use an internal capture on that child.
+                // An empty field name means a positional child instead, which is how
+                // a JS/TS declaration holds its declarator.
                 let cap = format!("@_n{}", id);
                 let pred = name_predicate(&cap, nm);
                 let mut inner = format!("({}) {}", variant.name_node, cap);
                 for &(outer_node, inner_field) in variant.name_path.iter().rev() {
-                    inner = format!("({} {}: {})", outer_node, inner_field, inner);
+                    inner = if inner_field.is_empty() {
+                        format!("({} {})", outer_node, inner)
+                    } else {
+                        format!("({} {}: {})", outer_node, inner_field, inner)
+                    };
                 }
-                node_body.push_str(&format!(" {}: {}", name_field, inner));
+                if name_field.is_empty() {
+                    node_body.push_str(&format!(" {}", inner));
+                } else {
+                    node_body.push_str(&format!(" {}: {}", name_field, inner));
+                }
                 predicates.push(pred);
             }
             None if variant.name_node == variant.node => {
@@ -661,6 +732,91 @@ mod tests {
         let out = compile_str("type#Meta", "go");
         assert!(out.contains("type_spec"), "{}", out);
         assert!(out.contains("type_identifier"), "{}", out);
+    }
+
+    /// Capture names carry a global counter, so two compilations of the same
+    /// query differ only in their digits. Strip them to compare shapes.
+    fn shape(s: &str) -> String {
+        s.chars().filter(|c| !c.is_ascii_digit()).collect()
+    }
+
+    #[test]
+    fn def_variable_reaches_the_declaration_not_the_identifier() {
+        // `*variable#X` used to hit no mapping at all and pass through as a
+        // node type called "variable", which tree-sitter rejects.
+        for lang in ["typescript", "tsx", "javascript"] {
+            let out = compile_str("(*variable#config @v)", lang);
+            assert!(out.contains("lexical_declaration"), "{}: {}", lang, out);
+            assert!(out.contains("variable_declaration"), "{} var form: {}", lang, out);
+            assert!(out.contains("variable_declarator name: (identifier)"), "{}: {}", lang, out);
+            assert!(!out.contains("(identifier) @v"), "{} still matches the bare name: {}", lang, out);
+        }
+    }
+
+    #[test]
+    fn ref_variable_stays_on_the_identifier() {
+        for lang in ["typescript", "javascript"] {
+            let out = compile_str("&variable#config", lang);
+            assert!(out.contains("identifier"), "{}: {}", lang, out);
+            assert!(!out.contains("lexical_declaration"), "{}: {}", lang, out);
+        }
+    }
+
+    #[test]
+    fn bare_variable_matches_declaration_and_uses_both() {
+        let out = compile_str("variable#config", "typescript");
+        assert!(out.contains("lexical_declaration"), "{}", out);
+        assert!(out.contains("(identifier)"), "{}", out);
+    }
+
+    #[test]
+    fn const_is_an_alias_of_variable() {
+        for lang in ["typescript", "javascript", "go", "rust"] {
+            for sigil in ["*", "&", ""] {
+                let v = compile_str(&format!("{}variable#config", sigil), lang);
+                let c = compile_str(&format!("{}const#config", sigil), lang);
+                assert_eq!(shape(&v), shape(&c), "{} {}variable: {} vs {}", lang, sigil, v, c);
+            }
+        }
+    }
+
+    #[test]
+    fn go_and_rust_variables_reach_their_declaration_statements() {
+        let go = compile_str("*variable#Timeout", "go");
+        assert!(go.contains("var_declaration"), "{}", go);
+        assert!(go.contains("const_declaration"), "{}", go);
+        assert!(go.contains("short_var_declaration left: (expression_list (identifier)"), "{}", go);
+
+        let rs = compile_str("*variable#MAX", "rust");
+        assert!(rs.contains("let_declaration"), "{}", rs);
+        assert!(rs.contains("const_item"), "{}", rs);
+        assert!(rs.contains("static_item"), "{}", rs);
+    }
+
+    #[test]
+    fn an_unknown_kind_is_rejected_with_the_valid_ones() {
+        let q = parse("*bogus#X").unwrap();
+        let lang = for_name("typescript").unwrap();
+        let err = validate(&q, lang.as_ref(), "typescript").unwrap_err();
+        assert!(err.starts_with("unknown kind 'bogus' for typescript, valid kinds: "), "{}", err);
+        assert!(err.contains("variable"), "the new kinds are listed: {}", err);
+        assert!(err.contains("id, function"), "vocabulary order: {}", err);
+    }
+
+    #[test]
+    fn a_real_tree_sitter_node_type_still_passes_validation() {
+        let lang = for_name("typescript").unwrap();
+        for q in ["call_expression", "arrow_function", "id#foo", "*variable#foo"] {
+            let parsed = parse(q).unwrap();
+            assert!(validate(&parsed, lang.as_ref(), "typescript").is_ok(), "{}", q);
+        }
+    }
+
+    #[test]
+    fn validation_reaches_inside_groups_and_field_access() {
+        let lang = for_name("cpp").unwrap();
+        let q = parse("(*function @f).body(bogus#X)").unwrap();
+        assert!(validate(&q, lang.as_ref(), "cpp").is_err(), "inner query is checked too");
     }
 
     #[test]
