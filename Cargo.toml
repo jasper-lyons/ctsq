@@ -16,3 +16,6 @@ tree-sitter-typescript = "0.23.2"
 tree-sitter-python = "0.25.0"
 tree-sitter-rust = "0.24.2"
 tree-sitter-ruby = "0.23.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

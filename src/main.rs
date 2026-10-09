@@ -332,7 +332,18 @@ Constructs with no abstract mapping fall back to raw tree-sitter node kinds.")]
     },
 }
 
+/// Restore the kernel default for SIGPIPE. The Rust runtime sets it to SIG_IGN before
+/// main, so writes to a closed pipe (ctsq ... | head) return EPIPE and println! panics.
+/// With the default disposition the process exits quietly like grep or cat.
+#[cfg(unix)]
+fn reset_sigpipe() {
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL); }
+}
+#[cfg(not(unix))]
+fn reset_sigpipe() {}
+
 fn main() {
+    reset_sigpipe();
     let cli = Cli::parse();
 
     match cli.command {
