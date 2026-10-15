@@ -92,7 +92,8 @@ fn with_no_end_the_repository_and_reflection_helper_are_walked() {
     assert_eq!(o.status.code(), Some(0), "{t}");
     assert!(row(&t, "repo.Create(b)").1.ends_with("moved, via repo.Create"), "{t}");
     assert!(row(&t, "return insert(r.db, \"bookings\", b)").1.ends_with("via insert"), "{t}");
-    assert!(row(&t, "rv := reflect.ValueOf(v)").1.ends_with("outside"), "{t}");
+    // reflect.ValueOf's result goes on to db.Exec, so it is mid-route, not an end.
+    assert!(row(&t, "rv := reflect.ValueOf(v)").1.ends_with("derived"), "{t}");
     assert!(row(&t, "db.Exec(").1.ends_with("outside"), "{t}");
     assert!(row(&t, "json.NewEncoder(w).Encode(v)").1.ends_with("outside"), "{t}");
 }

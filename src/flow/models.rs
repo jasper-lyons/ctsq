@@ -216,6 +216,16 @@ mod tests {
     }
 
     #[test]
+    fn comparison_clears() {
+        let src = "package a\nfunc F(t string) {\n\tok := t == \"a\"\n\tsink(ok)\n\tlt := t < \"b\"\n\tsink(lt)\n\tc := t + \"x\"\n\tsink(c)\n}\n";
+        let r = run(src, "F(", "t");
+        assert!(!has_hop(&r, "sink(ok)"));
+        assert!(!has_hop(&r, "sink(lt)"));
+        assert!(has_hop(&r, "sink(c)"), "a concatenation still carries the data");
+        assert_eq!(r.sinks(), 1);
+    }
+
+    #[test]
     fn unknown_outside_call_continues_unmodelled() {
         let src = "package a\nimport \"example.com/x/y\"\nfunc F(t string) {\n\tu := y.Do(t)\n\tsink(u)\n}\n";
         let r = run(src, "F(", "t");

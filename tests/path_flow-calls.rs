@@ -95,11 +95,14 @@ fn no_end_lists_outside_leaves() {
     let t = out(&o);
     assert_eq!(code(&o), 0, "{t}");
     assert!(row(&t, "log.Printf(\"got %s\", out)").1.ends_with("outside"), "{t}");
-    assert!(row(&t, "json.Marshal(out)").1.ends_with("derived, outside"), "{t}");
+    // An outside call whose result goes on to another end is mid-route:
+    // tagged by its effect, not `outside`, and not counted (decisions 09, 16).
+    assert!(row(&t, "json.Marshal(out)").1.ends_with("derived"), "{t}");
     assert!(row(&t, "w.Write(data)").1.ends_with("outside"), "{t}");
-    assert!(row(&t, "strings.TrimSpace(s)").1.ends_with("moved, outside"), "{t}");
+    // TrimSpace's result is returned up to handle, which logs it.
+    assert!(row(&t, "strings.TrimSpace(s)").1.ends_with("moved"), "{t}");
     assert!(!t.contains("sink"), "{t}");
-    assert!(t.contains("4 routes to outside\n"), "{t}");
+    assert!(t.contains("2 routes to outside\n"), "{t}");
 }
 
 #[test]

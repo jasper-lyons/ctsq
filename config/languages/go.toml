@@ -65,3 +65,5 @@ plain_assign = ["=", ":="]
 blank        = ["_"]
 # Token that makes a range header declare its names.
 declare      = [":="]
+# Operators whose result is about the data but is not the data.
+clear_ops    = ["==", "!=", "<", "<=", ">", ">="]

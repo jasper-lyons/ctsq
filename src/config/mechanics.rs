@@ -161,4 +161,7 @@ pub struct Tokens {
     pub blank: Vec<String>,
     /// Token that makes a loop header declare its names, as `:=` in a range.
     pub declare: Vec<String>,
+    /// Operators whose result is about the data but is not the data, such as
+    /// comparisons (decision 11). Their result carries nothing.
+    pub clear_ops: Vec<String>,
 }

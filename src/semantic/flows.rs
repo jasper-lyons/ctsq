@@ -226,7 +226,7 @@ pub fn evaluate_flows(
     for g in &groups {
         let mut root = g.root.clone();
         if !has_end {
-            retag(&mut root);
+            retag(&mut root, false);
         }
         let mut pruned = prune(&root, end_tag, eventually, 0, false).unwrap_or_else(|| Hop { children: vec![], ..root.clone() });
         let routes_through = through_unmodelled(&pruned, end_tag, false);
@@ -545,16 +545,34 @@ fn is_outside_call(
     }
 }
 
-/// With no end selector the engine marks outside calls `sink`, shown as `outside`.
-fn retag(h: &mut Hop) {
-    for t in h.tags.iter_mut() {
-        if t == "sink" {
-            *t = "outside".into();
+/// With no end selector the engine marks outside calls `sink`, shown as
+/// `outside`. `outside` ends a route (decisions 09, 16), so an outside call
+/// whose result goes on to another end keeps only its effect tags
+/// (`derived`, `unmodelled`) and is not counted as a route. The result goes
+/// on when a hop reading it reaches an end, or when it is returned and the
+/// caller's use of the call reaches one. `up` says the latter for returns of
+/// the function `h` sits in. Returns whether the data reaches an end from
+/// `h`, by its readers or by returning.
+fn retag(h: &mut Hop, up: bool) -> bool {
+    let mut cont = h.returns && up;
+    for c in h.children.iter_mut().filter(|c| !c.into) {
+        cont |= retag(c, up);
+    }
+    let mut below = false;
+    for c in h.children.iter_mut().filter(|c| c.into) {
+        below |= retag(c, cont);
+    }
+    let end = h.has("sink");
+    if cont {
+        h.tags.retain(|t| t != "sink");
+    } else {
+        for t in h.tags.iter_mut() {
+            if t == "sink" {
+                *t = "outside".into();
+            }
         }
     }
-    for c in h.children.iter_mut() {
-        retag(c);
-    }
+    cont || below || end
 }
 
 /// Keep branches that reach an `end` hop. For `=>` only ends one step from
@@ -1191,6 +1209,15 @@ impl Outside for Walk<'_> {
             return e;
         }
         self.models.effect(site)
+    }
+
+    /// With no end selector every end is an outside call, so its model
+    /// decides whether the walk follows the result on.
+    fn end_effect(&self, site: &CallSite) -> Option<CallEffect> {
+        if self.tail.is_some() {
+            return None;
+        }
+        Some(self.models.effect(site))
     }
 }
 

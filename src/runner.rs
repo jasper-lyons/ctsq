@@ -16,10 +16,9 @@ pub struct MatchRow {
     pub line: usize,
     pub src_line: Option<String>,
     pub node_text: String,
-    /// Byte range and tree-sitter kind of the primary node: the node `line` points at.
+    /// Byte range of the primary node: the node `line` points at.
     pub start_byte: usize,
     pub end_byte: usize,
-    pub kind: &'static str,
 }
 
 /// Backwards-compatible wrapper: the node-text rendering only.
@@ -77,7 +76,6 @@ pub fn run_rows(
             node_text,
             start_byte: primary.start_byte(),
             end_byte: primary.end_byte(),
-            kind: primary.kind(),
         }
     };
 
@@ -152,7 +150,6 @@ pub fn run_rows(
                             node_text: "<match>".into(),
                             start_byte: 0,
                             end_byte: 0,
-                            kind: "",
                         });
                     }
                 } else {
@@ -431,8 +428,7 @@ mod tests {
         assert!(r.end_byte > r.start_byte, "{:?}", r);
         let text = &DEEP_GO[r.start_byte..r.end_byte];
         assert!(text.contains("name"), "the byte range is the inner node: {:?} {:?}", text, r);
-        assert!(!r.kind.is_empty(), "{:?}", r);
-        assert_ne!(r.kind, "function_declaration", "{:?}", r);
+        assert!(!text.starts_with("func"), "not the function_declaration head: {:?}", r);
     }
 
     #[test]
@@ -446,7 +442,7 @@ mod tests {
         let rows2 = rows_for("(&function#g @c) id#h", "cpp", src2, false);
         assert!(!rows2.is_empty(), "scoped to the g call node, which holds h: {:?}", rows2);
         assert!(rows2[0].node_text.contains("@c:"), "{:?}", rows2[0]);
-        assert_eq!(rows2[0].kind, "identifier", "{:?}", rows2[0]);
+        assert_eq!(&src2[rows2[0].start_byte..rows2[0].end_byte], "h", "the identifier: {:?}", rows2[0]);
     }
 
     #[test]
@@ -457,10 +453,9 @@ mod tests {
     }
 
     #[test]
-    fn match_rows_carry_byte_range_and_kind() {
+    fn match_rows_carry_byte_range() {
         let src = "package main\n\nconst itemCols = 1\n";
         let rows = rows_for("id#itemCols", "go", src, false);
         assert_eq!(&src[rows[0].start_byte..rows[0].end_byte], "itemCols");
-        assert_eq!(rows[0].kind, "identifier");
     }
 }

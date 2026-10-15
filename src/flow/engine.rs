@@ -1650,6 +1650,20 @@ impl<'a, 't> Walker<'a, 't> {
         for c in parts {
             v.join(self.eval(c, st));
         }
+        // A comparison is about the data but is not the data (decision 11).
+        // Calls inside it keep their side effects, the result carries nothing.
+        let clears = kids(n, &m.fields.operator).iter().any(|o| m.tokens.clear_ops.iter().any(|c| c == self.t(*o)));
+        if clears {
+            return Val {
+                used: v.used,
+                calls: v.calls,
+                sink: v.sink,
+                trees: v.trees,
+                whole: v.whole,
+                writes: v.writes,
+                ..Val::default()
+            };
+        }
         v
     }
 
@@ -2015,13 +2029,6 @@ impl<'a, 't> Walker<'a, 't> {
         // A sink that takes `&x` may still write the data into x (a template
         // rendering into a buffer), so its effect is asked for those writes.
         let sink_writes = !tracked_args.is_empty() && is_end && args.iter().any(|a| self.t(*a).starts_with('&'));
-        if !tracked_args.is_empty() && is_end && !sink_writes {
-            out.calls += 1;
-            out.sink = true;
-            out.carry = inner.carry;
-            out.paths = inner.paths;
-            return out;
-        }
         let callee = func.map(|f| self.t(f).to_string()).unwrap_or_default();
         let mut site = CallSite {
             node: n,
@@ -2049,6 +2056,26 @@ impl<'a, 't> Walker<'a, 't> {
                     }
                 }
             }
+        }
+        if !tracked_args.is_empty() && is_end && !sink_writes {
+            out.calls += 1;
+            out.sink = true;
+            // With no end selector an end is an outside call that may hand
+            // its result on, and its model says whether the result carries
+            // the data (decisions 09, 11, 16).
+            match self.outside.end_effect(&site) {
+                Some(CallEffect::Clear) => {}
+                Some(CallEffect::Unknown) => {
+                    out.carry = inner.carry;
+                    out.paths = inner.paths;
+                    out.unmodelled.get_or_insert(callee);
+                }
+                _ => {
+                    out.carry = inner.carry;
+                    out.paths = inner.paths;
+                }
+            }
+            return out;
         }
         let effect = self.outside.effect(&site);
         if sink_writes {
