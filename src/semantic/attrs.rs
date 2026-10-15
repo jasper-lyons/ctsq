@@ -159,10 +159,17 @@ impl Facts {
         let qualifier = qualifier_of(name);
         let qual_root = qualifier.and_then(root_ident).map(|n| text(n, source).to_string());
         let qual_text = qualifier.map(|q| text(q, source).to_string());
-        let (from, qual_is_import) = match &qual_root {
+        let (mut from, qual_is_import) = match &qual_root {
             Some(q) => (imports.get(q).cloned(), imports.contains_key(q)),
             None => (imports.get(text(name, source)).cloned(), false),
         };
+        // A method on a variable (`logger.info`, `l.Info`) comes from the
+        // import whose call created the variable.
+        if from.is_none() && !qual_is_import {
+            if let Some(r) = qualifier.and_then(root_ident) {
+                from = receiver_origin(r, root, source, lang_name, imports);
+            }
+        }
         // `u.Email` in Go belongs to u's type, not to the code around it, and
         // `u.Contact.Email` to the type of `u.Contact`.
         let typed_qualifier = match (qualifier, lang_name) {
@@ -265,6 +272,62 @@ fn qualifier_of(name: Node) -> Option<Node> {
         return None;
     }
     parent.child_by_field_name(qual_field)
+}
+
+/// The import a receiver variable was created from. Go walks the variable
+/// back through its assignments (`flow::upward::creating_import`). JS and TS
+/// follow a declaration in the same file whose value is a call or `new` of an
+/// import (`const logger = pino()`) or of `require('pino')`.
+fn receiver_origin(var: Node, root: Node, source: &[u8], lang_name: &str, imports: &HashMap<String, String>) -> Option<String> {
+    match lang_name {
+        "go" => crate::flow::upward::creating_import(root, source, text(var, source), var.start_byte(), imports),
+        "javascript" | "typescript" | "tsx" => js_binding_origin(root, source, text(var, source), imports, 0),
+        _ => None,
+    }
+}
+
+fn js_binding_origin(root: Node, source: &[u8], name: &str, imports: &HashMap<String, String>, depth: usize) -> Option<String> {
+    if depth > 8 {
+        return None;
+    }
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "variable_declarator"
+            && n.child_by_field_name("name").is_some_and(|x| x.kind() == "identifier" && text(x, source) == name)
+        {
+            if let Some(v) = n.child_by_field_name("value") {
+                if let Some(o) = js_value_origin(v, root, source, imports, depth) {
+                    return Some(o);
+                }
+            }
+        }
+        let mut c = n.walk();
+        stack.extend(n.named_children(&mut c));
+    }
+    None
+}
+
+/// The import a JS value is made from: `pino()`, `new Client()`,
+/// `require('pino')()`, `pino().child()`, `await make()`.
+fn js_value_origin(v: Node, root: Node, source: &[u8], imports: &HashMap<String, String>, depth: usize) -> Option<String> {
+    match v.kind() {
+        "identifier" => imports
+            .get(text(v, source))
+            .cloned()
+            .or_else(|| js_binding_origin(root, source, text(v, source), imports, depth + 1)),
+        "call_expression" => {
+            let f = v.child_by_field_name("function")?;
+            if f.kind() == "identifier" && text(f, source) == "require" {
+                let arg = v.child_by_field_name("arguments")?.named_child(0)?;
+                return Some(text(arg, source).trim_matches(['"', '\'', '`']).to_string());
+            }
+            js_value_origin(f, root, source, imports, depth)
+        }
+        "new_expression" => js_value_origin(v.child_by_field_name("constructor")?, root, source, imports, depth),
+        "member_expression" => js_value_origin(v.child_by_field_name("object")?, root, source, imports, depth),
+        "await_expression" | "parenthesized_expression" => js_value_origin(v.named_child(0)?, root, source, imports, depth),
+        _ => None,
+    }
 }
 
 /// Type of a Go operand: the variable's type for `u`, and for a chain
@@ -399,6 +462,31 @@ mod tests {
         assert!(op_matches(&AttrOp::Suffix, "slog", "log/slog"));
         assert!(op_matches(&AttrOp::Regex, "^log$", "log"));
         assert!(!op_matches(&AttrOp::Regex, "^log$", "log/slog"));
+    }
+
+    fn from_of(lang: &str, ts: tree_sitter::Language, src: &str, needle: &str) -> Option<String> {
+        let mut p = Parser::new();
+        p.set_language(&ts).unwrap();
+        let tree = p.parse(src, None).unwrap();
+        let root = tree.root_node();
+        let at = src.find(needle).unwrap();
+        let node = root.descendant_for_byte_range(at, at + needle.len()).unwrap();
+        let imports = file_imports(root, src.as_bytes(), lang);
+        Facts::of(node, root, src.as_bytes(), lang, &imports).from
+    }
+
+    #[test]
+    fn from_of_a_method_on_a_variable_is_the_import_that_created_it() {
+        let js = "import pino from 'pino';\nconst logger = pino();\nlogger.info(x);\n";
+        let ts_js: tree_sitter::Language = tree_sitter_javascript::LANGUAGE.into();
+        assert_eq!(from_of("javascript", ts_js.clone(), js, "info").as_deref(), Some("pino"));
+        let req = "const log = require('pino')();\nconst child = log.child();\nchild.warn(x);\n";
+        assert_eq!(from_of("javascript", ts_js.clone(), req, "warn").as_deref(), Some("pino"));
+        let local = "function mk() {}\nconst l = mk();\nl.info(x);\n";
+        assert_eq!(from_of("javascript", ts_js, local, "info"), None);
+        let go = "package t\nimport \"go.uber.org/zap\"\nfunc F() {\n\tl := zap.NewExample()\n\tl.Info(\"x\")\n}\n";
+        let ts_go: tree_sitter::Language = tree_sitter_go::LANGUAGE.into();
+        assert_eq!(from_of("go", ts_go, go, "Info").as_deref(), Some("go.uber.org/zap"));
     }
 
     #[test]
