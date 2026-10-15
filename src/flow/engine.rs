@@ -4,8 +4,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use tree_sitter::Node;
 
+use super::models::qualify_type;
 use super::{CallEffect, CallSite, EndFn, FlowCtx, FlowResult, Hop, Outside, Start, StartKind};
-use crate::config::Mechanics;
+use crate::config::{Mechanics, Slot};
 use crate::resolve::go::{binding_type, go_imports};
 use crate::resolve::DefIndex;
 
@@ -128,6 +129,8 @@ struct Val {
     cond: Option<usize>,
     exact: bool,
     unmodelled: Option<String>,
+    /// In-repo function the value passed through.
+    via: Option<String>,
     sink: bool,
     calls: usize,
     /// Receiver variables that now carry the data.
@@ -147,6 +150,9 @@ impl Val {
         }
         if self.unmodelled.is_none() {
             self.unmodelled = o.unmodelled;
+        }
+        if self.via.is_none() {
+            self.via = o.via;
         }
         self.exact = false;
         self.sink |= o.sink;
@@ -172,6 +178,8 @@ struct Walker<'a, 't> {
     func: String,
     hops: Vec<HopData>,
     by_key: HashMap<usize, usize>,
+    /// Names of the functions declared at the top of this file.
+    local_fns: Vec<String>,
     /// Byte of a variable start inside the body, not yet reached.
     pending: Option<usize>,
     /// Whether the start node is the bound side of an assignment.
@@ -198,6 +206,11 @@ pub fn analyse_function(
         func: function_name(func, cx.src, m),
         hops: vec![HopData { parent: 0, line: start.line, tags: vec!["source".into()], unmodelled: None }],
         by_key: HashMap::new(),
+        local_fns: named(cx.root)
+            .into_iter()
+            .filter(|n| Mechanics::is(&m.nodes.function, n.kind()))
+            .filter_map(|n| kids(n, &m.fields.name).first().map(|x| text(*x, cx.src).to_string()))
+            .collect(),
         pending: None,
         start_is_decl: false,
     };
@@ -270,6 +283,9 @@ impl<'a, 't> Walker<'a, 't> {
     /// Record a hop for statement `n`, merging tags when a loop pass sees it again.
     fn hop(&mut self, n: Node, v: &Val, primary: &[String]) -> usize {
         let mut tags: Vec<String> = primary.to_vec();
+        if let Some(f) = &v.via {
+            tags.push(format!("via {}", f));
+        }
         if let Some(c) = v.cond {
             tags.push(format!("conditional@{}", c));
         }
@@ -404,11 +420,11 @@ impl<'a, 't> Walker<'a, 't> {
             if self.is(&self.m.nodes.name, n) {
                 return Some(self.t(n).to_string());
             }
-            if self.is(&self.m.nodes.field, n) || self.is(&self.m.nodes.index, n) {
-                n = *kids(n, &self.m.fields.operand).first()?;
-            } else {
+            if self.is(&self.m.nodes.call, n) {
                 return None;
             }
+            // `o.f`, `m[k]`, `&o` and `*p` are all rooted at their operand.
+            n = *kids(n, &self.m.fields.operand).first()?;
         }
     }
 
@@ -474,8 +490,9 @@ impl<'a, 't> Walker<'a, 't> {
         }
         let carried = acts.iter().any(|a| matches!(a, Act::Set(..)));
         let mut id = None;
-        if carried || summary.sink {
+        if carried || summary.sink || !summary.whole.is_empty() {
             let mut prim: Vec<String> = match (any_carry, any_derived) {
+                (false, _) if !summary.whole.is_empty() && !summary.sink => vec!["moved".into()],
                 (false, _) => vec![],
                 (true, true) => vec!["derived".into()],
                 (true, false) => vec!["exact".into()],
@@ -688,11 +705,71 @@ impl<'a, 't> Walker<'a, 't> {
         }
     }
 
+    /// The import path form of a receiver type, as `strings.Builder`.
+    /// `binding_type` drops the package part, so an unqualified name is
+    /// looked up as `pkg.Name` text in the enclosing function, then the file,
+    /// for each import name. The first import that matches wins.
+    fn qualify_recv(&self, ty: &str, call: Node<'t>) -> Option<String> {
+        if let Some(q) = qualify_type(ty, &self.imports) {
+            return Some(q);
+        }
+        let name = ty.trim_start_matches('*');
+        let scopes = [enclosing_function(self.cx.root, self.m, call.start_byte()), Some(self.cx.root)];
+        let mut names: Vec<(&String, &String)> = self.imports.iter().collect();
+        names.sort();
+        for scope in scopes.into_iter().flatten() {
+            let body = self.t(scope);
+            for (local, path) in &names {
+                let needle = format!("{}.{}", local, name);
+                let hit = body.match_indices(&needle).any(|(i, _)| {
+                    let before = body[..i].chars().next_back();
+                    let after = body[i + needle.len()..].chars().next();
+                    !before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                        && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+                });
+                if hit {
+                    return Some(format!("{}.{}", path, name));
+                }
+            }
+        }
+        None
+    }
+
+    /// The variable an argument names, through `&` and `*`: `u` in `&u`.
+    fn object_name(&self, mut n: Node<'t>) -> Option<String> {
+        loop {
+            if self.is(&self.m.nodes.name, n) {
+                return Some(self.t(n).to_string());
+            }
+            if self.is(&self.m.nodes.field, n) || self.is(&self.m.nodes.index, n) || self.is(&self.m.nodes.call, n) {
+                return None;
+            }
+            n = *kids(n, &self.m.fields.operand).first()?;
+        }
+    }
+
+    /// Untracked arguments whose type declares the start field.
+    fn whole_args(&self, n: Node<'t>, args: &[Node<'t>], argvals: &[Val]) -> Vec<usize> {
+        let StartKind::Field { owner: Some(owner), .. } = &self.start.kind else {
+            return vec![];
+        };
+        let line = line_of(n);
+        (0..args.len())
+            .filter(|&i| argvals[i].carry.is_none())
+            .filter(|&i| {
+                self.object_name(args[i]).is_some_and(|v| {
+                    binding_type(self.cx.root, self.cx.src, self.cx.file, &v, line, &DefIndex::default()).as_deref()
+                        == Some(owner.as_str())
+                })
+            })
+            .collect()
+    }
+
     fn call(&self, n: Node<'t>, st: &State) -> Val {
         let m = self.m;
         let func = kids(n, &m.fields.function).first().copied();
         let args: Vec<Node> = kids(n, &m.fields.arguments).first().map(|a| named(*a)).unwrap_or_default();
-        let argvals: Vec<Val> = args.iter().map(|a| self.eval(*a, st)).collect();
+        let mut argvals: Vec<Val> = args.iter().map(|a| self.eval(*a, st)).collect();
         let mut recv_node = None;
         let recv = match func {
             Some(f) if self.is(&m.nodes.field, f) => {
@@ -703,26 +780,37 @@ impl<'a, 't> Walker<'a, 't> {
             Some(f) if !self.is(&m.nodes.name, f) => Some(self.eval(f, st)),
             _ => None,
         };
-        let mut inner = Val::default();
-        for v in argvals.iter().cloned().chain(recv.clone()) {
-            inner.join(v);
-        }
-        let tracked_args: Vec<usize> = argvals.iter().enumerate().filter(|(_, v)| v.carry.is_some()).map(|(i, _)| i).collect();
-        let recv_tracked = recv.as_ref().is_some_and(|r| r.carry.is_some());
-        let mut out = Val {
-            used: inner.used,
-            cond: inner.cond,
-            unmodelled: inner.unmodelled.clone(),
-            sink: inner.sink,
-            calls: inner.calls,
-            whole: inner.whole.clone(),
-            ..Val::default()
+        let tracked = |vals: &[Val]| -> Vec<usize> {
+            vals.iter().enumerate().filter(|(_, v)| v.carry.is_some()).map(|(i, _)| i).collect()
         };
-        if tracked_args.is_empty() && !recv_tracked {
+        let mut tracked_args = tracked(&argvals);
+        let recv_tracked = recv.as_ref().is_some_and(|r| r.carry.is_some());
+        let whole_args = self.whole_args(n, &args, &argvals);
+        let mut out = Val::default();
+        let fold = |argvals: &[Val], out: &mut Val| -> Val {
+            let mut inner = Val::default();
+            for v in argvals.iter().cloned().chain(recv.clone()) {
+                inner.join(v);
+            }
+            *out = Val {
+                used: inner.used,
+                cond: inner.cond,
+                unmodelled: inner.unmodelled.clone(),
+                via: inner.via.clone(),
+                sink: inner.sink,
+                calls: inner.calls,
+                whole: inner.whole.clone(),
+                ..Val::default()
+            };
+            inner
+        };
+        let mut inner = fold(&argvals, &mut out);
+        if tracked_args.is_empty() && !recv_tracked && whole_args.is_empty() {
             return out;
         }
-        out.calls += 1;
-        if !tracked_args.is_empty() && (self.is_end)(n, self.cx.src) {
+        let is_end = (self.is_end)(n, self.cx.src);
+        if !tracked_args.is_empty() && is_end {
+            out.calls += 1;
             out.sink = true;
             out.carry = inner.carry;
             return out;
@@ -734,8 +822,11 @@ impl<'a, 't> Walker<'a, 't> {
             package: None,
             method: None,
             recv_type: None,
-            tracked_args,
+            recv_path: None,
+            tracked_args: tracked_args.clone(),
             recv_tracked,
+            whole_args: whole_args.clone(),
+            local: func.is_some_and(|f| self.is(&m.nodes.name, f)) && self.local_fns.iter().any(|x| *x == callee),
         };
         if let (Some(f), Some(o)) = (func, recv_node) {
             site.method = kids(f, &m.fields.field).first().map(|x| self.t(*x).to_string());
@@ -745,12 +836,31 @@ impl<'a, 't> Walker<'a, 't> {
                     Some(path) if !st.contains_key(on) => site.package = Some(path.clone()),
                     _ => {
                         site.recv_type =
-                            binding_type(self.cx.root, self.cx.src, self.cx.file, on, line_of(n), &DefIndex::default())
+                            binding_type(self.cx.root, self.cx.src, self.cx.file, on, line_of(n), &DefIndex::default());
+                        site.recv_path = site.recv_type.as_deref().and_then(|t| self.qualify_recv(t, n));
                     }
                 }
             }
         }
-        match self.outside.effect(&site) {
+        let effect = self.outside.effect(&site);
+        if matches!(effect, CallEffect::Model { whole: true, .. }) && !whole_args.is_empty() {
+            // The object carries every field, the start field among them.
+            for &i in &whole_args {
+                argvals[i] = Val { carry: Some(0), used: Some(0), ..Val::default() };
+            }
+            tracked_args = tracked(&argvals);
+            inner = fold(&argvals, &mut out);
+        }
+        if tracked_args.is_empty() && !recv_tracked {
+            return out;
+        }
+        out.calls += 1;
+        if !tracked_args.is_empty() && is_end {
+            out.sink = true;
+            out.carry = inner.carry;
+            return out;
+        }
+        match effect {
             CallEffect::Unknown => {
                 out.carry = inner.carry;
                 out.unmodelled.get_or_insert(callee);
@@ -761,6 +871,40 @@ impl<'a, 't> Walker<'a, 't> {
                 out.carry = inner.carry;
                 if let Some(name) = recv_node.and_then(|o| self.root_name(o)) {
                     out.whole.push(name);
+                }
+            }
+            CallEffect::Via(name) => {
+                out.carry = inner.carry;
+                out.via.get_or_insert(name);
+            }
+            CallEffect::Model { pass, .. } => {
+                let all: Vec<usize> = (0..args.len()).collect();
+                for p in pass {
+                    let from: Vec<&Val> = match p.from {
+                        Slot::Arg(i) => argvals.get(i).into_iter().collect(),
+                        Slot::AllArgs => argvals.iter().collect(),
+                        Slot::Receiver => recv.iter().collect(),
+                        Slot::Return => vec![],
+                    };
+                    let Some(carry) = from.iter().find_map(|v| v.carry) else {
+                        continue;
+                    };
+                    let targets: Vec<Node> = match p.to {
+                        Slot::Return => {
+                            out.carry.get_or_insert(carry);
+                            vec![]
+                        }
+                        Slot::Arg(j) => args.get(j).copied().into_iter().collect(),
+                        Slot::AllArgs => all.iter().map(|&j| args[j]).collect(),
+                        Slot::Receiver => recv_node.into_iter().collect(),
+                    };
+                    for t in targets {
+                        if let Some(name) = self.root_name(t) {
+                            if !out.whole.contains(&name) {
+                                out.whole.push(name);
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -401,3 +401,17 @@ For Go, a call is outside when the import path is neither the module path from `
 10. A call statement that receives tracked data is `moved`, and so is a return of a tracked value.
 11. A hop's tags read in the order primary (`exact`, `derived`, `moved`), `field`, `conditional@`, `unmodelled`, `sink`. A hop's parent is the hop that produced the first tracked value it reads.
 12. Names are tracked without scopes, so shadowing is not modelled. Function literals inside the function are not walked.
+
+## Models in the flow
+
+`flow::ModelOutside::new(&LangConfig)` is the `Outside` that answers from model files. `flow::model_key(&LangConfig, &CallSite)` returns the first key with a model among `flow::candidate_keys`:
+
+1. A package call gives `importpath.Func`, the import path taken from the file's imports.
+2. A method on a typed receiver gives `(*importpath.Type).Method`, then `(importpath.Type).Method`. `binding_type` drops the package part of a type, so the engine finds it again as `pkg.Type` text in the enclosing function, then in the file, for each import name, and puts the result in `CallSite::recv_path`.
+3. A plain name gives `builtin.name`.
+
+A model maps to an effect. `clear` gives `Clear`. Anything else gives `CallEffect::Model { pass, whole }`, which the engine applies entry by entry: an entry whose `from` slot holds tracked data moves it to the result, or to the variable an argument or the receiver is rooted at, so `json.Unmarshal(body, &form)` tracks `form`. An assignment whose only effect is such a move records a `moved` hop. A model with no `pass` and no `clear`, such as a source or a template model, moves nothing.
+
+`whole` (decision 13): for a field start with a known owner type, an argument whose type is the owner counts as tracked when the call's model is `whole`, so `fmt.Printf("%v", u)` reaches an end predicate on `Printf` from `User.Email`. The engine lists such arguments in `CallSite::whole_args` and asks `Outside` about the call even when nothing else is tracked.
+
+With no model, a call into the repo gives `CallEffect::Via(name)`: the result carries the data and the hop is tagged `via <name>`, placed after `field` and before `conditional@`. A call is in the repo when its callee is a plain name declared as a function in the same file (`CallSite::local`), its package lies inside the go.mod module, or its receiver type has no package part. Every other call gives `Unknown` and is tagged `unmodelled` (decision 18).
