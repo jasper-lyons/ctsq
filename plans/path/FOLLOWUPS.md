@@ -11,3 +11,5 @@ Minor findings from the mid-build adversarial review (2026-10-15) that were not 
 - [ ] Call route rows drift out of column alignment at deeper indents (`print.rs` pads before indenting)
 - [ ] `c := b` copies have no resolved type, so `field#Contact.Phone` still matches `c.Phone` when the owner is unknown (fixer A gap b)
 - [ ] Pointer detection reads source text (`*` prefix, `&`, `new(`) instead of mechanics keys for unary and result nodes (fixer A gap c)
+- [ ] Call routes: a start with some routes inside `--max` and longer ones beyond it is not flagged as cut (fixer B)
+- [ ] The flow effect memo key has no call depth, so an effect computed at a cut depth can be reused at a shallower one (fixer B, pre-existing)
