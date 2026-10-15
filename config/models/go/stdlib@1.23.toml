@@ -284,9 +284,11 @@ pass = ["0 -> return"]
 
 ["(*html/template.Template).Execute"]
 template = { data_arg = 1 }
+pass = ["1 -> 0"]
 
 ["(*html/template.Template).ExecuteTemplate"]
 template = { data_arg = 2 }
+pass = ["2 -> 0"]
 
 ["(*html/template.Template).Parse"]
 template_load = { text_arg = 0 }
@@ -317,9 +319,11 @@ pass = ["0 -> return"]
 
 ["(*text/template.Template).Execute"]
 template = { data_arg = 1 }
+pass = ["1 -> 0"]
 
 ["(*text/template.Template).ExecuteTemplate"]
 template = { data_arg = 2 }
+pass = ["2 -> 0"]
 
 ["(*text/template.Template).Parse"]
 template_load = { text_arg = 0 }
@@ -377,3 +381,56 @@ pass = ["* -> return"]
 
 ["(*database/sql.Tx).QueryRowContext"]
 pass = ["* -> return"]
+
+["(*database/sql.Stmt).Exec"]
+pass = ["* -> return"]
+
+["(database/sql.Result).RowsAffected"]
+clear = true
+
+["(database/sql.Result).LastInsertId"]
+clear = true
+
+# Reflection: a Value carries what it reflects, its type and counts do not.
+
+["reflect.ValueOf"]
+pass = ["0 -> return"]
+
+["reflect.Indirect"]
+pass = ["0 -> return"]
+
+["(reflect.Value).Field"]
+pass = ["receiver -> return"]
+
+["(reflect.Value).Interface"]
+pass = ["receiver -> return"]
+
+["(reflect.Value).Elem"]
+pass = ["receiver -> return"]
+
+["(reflect.Value).Index"]
+pass = ["receiver -> return"]
+
+["(reflect.Value).String"]
+pass = ["receiver -> return"]
+
+["(reflect.Type).Field"]
+clear = true
+
+["(reflect.Value).Type"]
+clear = true
+
+["(reflect.Value).NumField"]
+clear = true
+
+["(reflect.Type).NumField"]
+clear = true
+
+["(reflect.Value).SetBool"]
+pass = ["0 -> receiver"]
+
+["(reflect.Value).SetString"]
+pass = ["0 -> receiver"]
+
+["(reflect.Value).Set"]
+pass = ["0 -> receiver"]

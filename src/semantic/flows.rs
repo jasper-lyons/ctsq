@@ -127,7 +127,13 @@ pub fn evaluate_flows(
         }
     }
     let imports_cache: RefCell<HashMap<String, HashMap<String, String>>> = RefCell::new(HashMap::new());
-    let module = cfg.module_path.clone();
+    let files: Vec<(&str, Node, &[u8])> = store
+        .iter()
+        .filter(|(_, pf)| pf.lang == "go")
+        .filter_map(|(f, pf)| pf.tree.as_ref().map(|t| (f, t.root_node(), pf.source.as_slice())))
+        .collect();
+    let module = Module::build(&files, &cfg.mechanics);
+    let modpath = cfg.module_path.clone();
     let has_end = tail.is_some();
     let is_end = |n: Node, src: &[u8]| -> bool {
         let Some(file) = ptrs.get(&(src.as_ptr() as usize)) else { return false };
@@ -138,15 +144,14 @@ pub fn evaluate_flows(
                 .get(file)
                 .is_some_and(|rs| rs.iter().any(|&(s, e)| s <= name.start_byte() && name.end_byte() <= e));
         }
-        is_outside_call(n, f, src, file, module.as_deref(), &imports_cache)
+        let mut root = n;
+        while let Some(p) = root.parent() {
+            root = p;
+        }
+        let cx = FlowCtx { file, src, root, mech: &cfg.mechanics, module: &module };
+        is_outside_call(&cx, n, f, modpath.as_deref(), &imports_cache)
     };
 
-    let files: Vec<(&str, Node, &[u8])> = store
-        .iter()
-        .filter(|(_, pf)| pf.lang == "go")
-        .filter_map(|(f, pf)| pf.tree.as_ref().map(|t| (f, t.root_node(), pf.source.as_slice())))
-        .collect();
-    let module = Module::build(&files, &cfg.mechanics);
     let mut walk = Walk::new(store, graph, &cfg, &module, &is_end, eventually, opts.max);
     walk.expand = opts.expand;
     walk.tail = tail;
@@ -480,14 +485,25 @@ fn field_users(
 /// `pkg.F` call on an import outside it, or a method on a variable whose
 /// type comes from such a package.
 fn is_outside_call(
+    cx: &FlowCtx,
     n: Node,
     f: Node,
-    src: &[u8],
-    file: &str,
     module: Option<&str>,
     cache: &RefCell<HashMap<String, HashMap<String, String>>>,
 ) -> bool {
+    let (src, file) = (cx.src, cx.file);
     let Some(mut operand) = f.child_by_field_name("operand") else { return false };
+    // `d.db.Exec`: the type of field `db` as the struct declares it.
+    if operand.kind() == "selector_expression" {
+        if let Some((_, path)) = flow::field_type_path(cx, operand, n.start_position().row + 1) {
+            return match (path, module) {
+                (Some(p), Some(m)) => gomod::is_outside(m, p.rsplit_once('.').map(|(p, _)| p).unwrap_or(&p)),
+                (Some(_), None) => true,
+                // A type without a package part is declared in the module or unknown.
+                (None, _) => false,
+            };
+        }
+    }
     // `json.NewEncoder(w).Encode` is outside when `json` is.
     while operand.kind() != "identifier" {
         let next = match operand.kind() {
@@ -500,20 +516,28 @@ fn is_outside_call(
             None => return false,
         }
     }
-    let mut root = n;
-    while let Some(p) = root.parent() {
-        root = p;
-    }
+    let root = cx.root;
     let imports = cache.borrow_mut().entry(file.to_string()).or_insert_with(|| go_imports(root, src)).clone();
     let on = operand.utf8_text(src).unwrap_or("");
     let line = n.start_position().row + 1;
-    let path = match binding_type_qualified(root, src, file, on, line, &DefIndex::default()) {
-        Some(t) => match flow::qualify_type(&t, &imports) {
-            Some(q) => q.rsplit_once('.').map(|(p, _)| p.to_string()),
-            None => None,
-        },
+    let typed = binding_type_qualified(root, src, file, on, line, &DefIndex::default());
+    let path = match &typed {
+        Some(t) => flow::qualify_type(t, &imports).and_then(|q| q.rsplit_once('.').map(|(p, _)| p.to_string())),
         None => imports.get(on).cloned(),
     };
+    // A variable of unknown or undeclared type bound from `pkg.F(...)` on an imported
+    // package holds a value of that package (`c := ses.NewFromConfig(cfg)`).
+    let path = path.or_else(|| {
+        // A type the module declares is not outside.
+        if typed.as_deref().is_some_and(|t| t.contains('.') || cx.module.types.contains(flow::base_type(t).as_str())) {
+            return None;
+        }
+        flow::bound_from(cx.mech, src, operand)
+            .and_then(|c| c.child_by_field_name("function"))
+            .and_then(|f| f.child_by_field_name("operand"))
+            .filter(|o| o.kind() == "identifier")
+            .and_then(|o| imports.get(o.utf8_text(src).unwrap_or("")).cloned())
+    });
     match (path, module) {
         (Some(p), Some(m)) => gomod::is_outside(m, &p),
         (Some(_), None) => true,
@@ -669,7 +693,7 @@ impl<'a> Walk<'a> {
             graph,
             cfg,
             module,
-            models: ModelOutside::new(cfg),
+            models: ModelOutside::with_module(cfg, module),
             follow,
             max,
             sites,
@@ -762,6 +786,17 @@ impl<'a> Walk<'a> {
     }
 
     fn callee_effect(&self, site: &CallSite, file: &str) -> Option<CallEffect> {
+        // A method on a receiver whose type comes from outside the module is
+        // not a call into the repo, whatever a name match in the graph says.
+        if let Some(pkg) = site.recv_path.as_deref().and_then(|p| p.rsplit_once('.')).map(|(p, _)| p) {
+            let outside = match &self.cfg.module_path {
+                Some(m) => gomod::is_outside(m, pkg),
+                None => true,
+            };
+            if outside {
+                return None;
+            }
+        }
         let ids = self.sites.get(&(file.to_string(), site.node.start_byte(), site.node.end_byte()))?;
         let targets: Vec<usize> = ids.iter().filter_map(|&i| self.graph.sites[i].target.map(|(t, _)| t)).collect();
         if targets.is_empty() {
@@ -773,8 +808,14 @@ impl<'a> Walk<'a> {
             // An interface with no implementation in the scanned files.
             return Some(CallEffect::Stop { tag: "stopped: interface".into(), rows: vec![] });
         }
+        // A field receiver (`r.driver.Insert`) keeps the callee text.
+        let field_recv = site
+            .node
+            .child_by_field_name("function")
+            .and_then(|f| f.child_by_field_name("operand"))
+            .is_some_and(|o| o.kind() == "selector_expression");
         let name = match (&site.recv_type, &site.method) {
-            (Some(t), Some(m)) => format!("{}.{}", t, m),
+            (Some(t), Some(m)) if !field_recv => format!("{}.{}", t, m),
             _ => site.callee.clone(),
         };
         Some(self.walk_targets(site, file, &targets, name))
@@ -1012,8 +1053,12 @@ impl Walk<'_> {
         if sets.is_empty() {
             return None;
         }
-        let trees = sets.iter().flat_map(|s| template::render(s, mech, paths.clone(), self.tail)).collect();
-        Some(CallEffect::Into { name: site.callee.clone(), returns: vec![], writes: vec![], trees })
+        let trees: Vec<Hop> = sets.iter().flat_map(|s| template::render(s, mech, paths.clone(), self.tail)).collect();
+        // The writer (argument 0) holds the rendered text, so it carries the
+        // data when any action prints it.
+        let rendered = trees.iter().any(|t| t.walk().iter().any(|h| h.has("rendered")));
+        let writes = if rendered { vec![(Slot::Arg(0), None)] } else { vec![] };
+        Some(CallEffect::Into { name: site.callee.clone(), returns: vec![], writes, trees })
     }
 }
 

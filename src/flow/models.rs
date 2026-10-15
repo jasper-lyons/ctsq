@@ -2,18 +2,57 @@
 
 use std::collections::HashMap;
 
-use super::{CallEffect, CallSite, Outside};
+use super::{CallEffect, CallSite, Module, Outside};
 use crate::config::{gomod, LangConfig, Model};
 
 /// Answers outside calls from a language's loaded models.
 pub struct ModelOutside<'c> {
     pub cfg: &'c LangConfig,
+    /// The scanned files' declarations. With it, a receiver type without a
+    /// package part is in the repo only when one of them declares it.
+    pub module: Option<&'c Module>,
 }
 
 impl<'c> ModelOutside<'c> {
     pub fn new(cfg: &'c LangConfig) -> ModelOutside<'c> {
-        ModelOutside { cfg }
+        ModelOutside { cfg, module: None }
     }
+
+    pub fn with_module(cfg: &'c LangConfig, module: &'c Module) -> ModelOutside<'c> {
+        ModelOutside { cfg, module: Some(module) }
+    }
+}
+
+/// Result types of outside calls, keyed like models, for receivers whose
+/// variable is bound from such a call (`v := reflect.ValueOf(x)` then
+/// `v.Field(i)`). Only the first result is listed.
+const RESULT_TYPES: &[(&str, &str)] = &[
+    ("reflect.ValueOf", "reflect.Value"),
+    ("reflect.Indirect", "reflect.Value"),
+    ("reflect.TypeOf", "reflect.Type"),
+    ("(reflect.Value).Elem", "reflect.Value"),
+    ("(reflect.Value).Field", "reflect.Value"),
+    ("(reflect.Value).FieldByName", "reflect.Value"),
+    ("(reflect.Value).Index", "reflect.Value"),
+    ("(reflect.Value).Type", "reflect.Type"),
+    ("(reflect.Type).Elem", "reflect.Type"),
+    ("(reflect.Type).Field", "reflect.StructField"),
+    ("(*database/sql.DB).Exec", "database/sql.Result"),
+    ("(*database/sql.DB).ExecContext", "database/sql.Result"),
+    ("(*database/sql.Tx).Exec", "database/sql.Result"),
+    ("(*database/sql.Tx).ExecContext", "database/sql.Result"),
+    ("(*database/sql.Stmt).Exec", "database/sql.Result"),
+];
+
+/// The type (as `path.T`) a call returns: `path.F` for a package function,
+/// or a method `m` on a receiver of type `recv` (as `path.T`).
+pub fn result_type(func: Option<&str>, recv: Option<&str>, m: Option<&str>) -> Option<String> {
+    let keys: Vec<String> = match (func, recv, m) {
+        (Some(f), _, _) => vec![f.to_string()],
+        (None, Some(t), Some(m)) => vec![format!("(*{}).{}", t, m), format!("({}).{}", t, m)],
+        _ => return None,
+    };
+    keys.iter().find_map(|k| RESULT_TYPES.iter().find(|(x, _)| x == k).map(|(_, t)| t.to_string()))
 }
 
 /// `pkg.T` or `*pkg.T` with `pkg` an import name, as `path.T`. None when the
@@ -47,8 +86,9 @@ pub fn model_key(cfg: &LangConfig, site: &CallSite) -> Option<String> {
 
 /// The name for `via` when the callee is a function in this repo: a plain
 /// name declared in the file, a package inside the module, or a method on a
-/// type without a package part.
-fn in_repo(cfg: &LangConfig, site: &CallSite) -> Option<String> {
+/// type without a package part that the module declares. A receiver whose
+/// type is unknown is not in the repo.
+fn in_repo(cfg: &LangConfig, module: Option<&Module>, site: &CallSite) -> Option<String> {
     if site.local {
         return Some(site.callee.clone());
     }
@@ -59,7 +99,8 @@ fn in_repo(cfg: &LangConfig, site: &CallSite) -> Option<String> {
     }
     if let (Some(t), None, Some(m)) = (&site.recv_type, &site.recv_path, &site.method) {
         let t = t.trim_start_matches('*');
-        if !t.contains('.') {
+        let declared = module.is_none_or(|md| md.types.contains(t));
+        if !t.is_empty() && !t.contains('.') && declared {
             return Some(format!("{}.{}", t, m));
         }
     }
@@ -81,7 +122,7 @@ impl Outside for ModelOutside<'_> {
         if let Some(model) = model_key(self.cfg, site).and_then(|k| self.cfg.model(&k)) {
             return effect_of(model);
         }
-        match in_repo(self.cfg, site) {
+        match in_repo(self.cfg, self.module, site) {
             Some(name) => CallEffect::Via(name),
             None => CallEffect::Unknown,
         }
@@ -247,6 +288,34 @@ mod tests {
         let r = run(src, "F(", "t");
         assert_eq!(tags(&r, "u := clean"), vec!["derived", "via clean"]);
         assert!(r.unmodelled_ends().is_empty());
+    }
+
+    #[test]
+    fn a_receiver_type_is_in_repo_only_when_the_module_declares_it() {
+        let d = tmp("inrepo");
+        let cfg = cfg_in(&d);
+        let src = "package a\nfunc F() { x.M() }\n";
+        let tree = parse(src);
+        let site = |t: &str| CallSite {
+            node: tree.root_node(),
+            callee: "x.M".into(),
+            package: None,
+            method: Some("M".into()),
+            recv_type: Some(t.into()),
+            recv_path: None,
+            tracked_args: vec![0],
+            arg_paths: vec![None],
+            recv_tracked: false,
+            recv_paths: None,
+            whole_args: vec![],
+            local: false,
+        };
+        let mut md = Module::default();
+        md.types.insert("Local".into());
+        let mo = ModelOutside::with_module(&cfg, &md);
+        assert_eq!(mo.effect(&site("*Local")), CallEffect::Via("Local.M".into()));
+        assert_eq!(mo.effect(&site("Elsewhere")), CallEffect::Unknown);
+        assert_eq!(mo.effect(&site("")), CallEffect::Unknown);
     }
 
     #[test]
