@@ -10,6 +10,9 @@ mod calltree;
 mod importgraph;
 mod types;
 mod resolve;
+mod config;
+mod flow;
+mod semantic;
 
 use clap::{Parser, Subcommand};
 use compiler::lang;
@@ -330,6 +333,88 @@ Constructs with no abstract mapping fall back to raw tree-sitter node kinds.")]
         #[arg(num_args(0..))]
         langs: Vec<String>,
     },
+    /// Walk call or data-flow routes between definitions: ctsq path 'function#main --> function#save'
+    #[command(after_help = "Joins two or more selectors with a call or data-flow arrow and prints each
+route as an indented tree, every row starting path:line.
+
+Call arrows, between functions:
+  ->    calls directly
+  -->   calls eventually, through any number of functions
+  <-    called by directly
+  <--   called by eventually
+
+Data-flow arrows, between values:
+  =>    flows in one step to
+  ==>   flows eventually to, through called functions
+  <=    comes in one step from
+  <==   comes eventually from, back through callers
+A query ending in => or ==> has no end selector and lists every call that
+hands the data to code outside the module. One ending in <= or <== lists
+every origin.
+
+Tags on each data-flow hop:
+  source              where the walk started, or where data enters from outside
+  exact               the same value, moved or copied unchanged
+  derived             built from a tracked value
+  moved               passed into a call or returned
+  field F             stored into field F, the walk now follows the object
+  conditional@L       only tracked on some branches, L is the line of the condition
+  widened             reached through an interface, one of several implementations
+  unmodelled          passed through an outside call with no model
+  via F               passed through the in-repo function F
+  sink                matched the end selector
+  rendered            printed by a template action
+  outside             handed to code outside the module, the end of a route
+  stopped: reason     the walk would have to guess, so it stops and lists the choices
+A guessed hop prints ? after its tag or callee.
+
+Examples:
+  ctsq path 'field#Booking.CustomerPhone ==> function#log.Printf' .
+  ctsq path 'function#main --> function#save' .
+
+A query reads one way, downward or upward. Upward queries print in the order
+written, the first selector first.
+
+Exit codes: 0 routes found, 1 no routes or an unknown kind, 2 usage or query error.")]
+    Path {
+        /// Query with at least one call or data-flow combinator
+        query: String,
+        /// Files or directories to search (default: current directory)
+        #[arg(num_args(0..))]
+        paths: Vec<String>,
+        /// Longest call route in hops, or how many functions deep a data-flow walk follows
+        #[arg(long, default_value = "12")]
+        max: usize,
+        /// Print every call route, not just the 5 shortest per start (call routes only)
+        #[arg(long)]
+        all: bool,
+        /// Keep only hops carrying these tags, comma-separated (data-flow queries)
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
+        /// Print each hop's definition body under its row
+        #[arg(long)]
+        body: bool,
+        /// List the outside implementations a widened interface call groups (data-flow queries)
+        #[arg(long)]
+        expand: bool,
+    },
+    /// Show where config and model files are read from, or the merged result for a language
+    #[command(after_help = "Language mechanics and outside-call models are TOML files, looked up in order:
+repo .ctsq/, then $XDG_CONFIG_HOME/ctsq (default ~/.config/ctsq), then
+$XDG_CACHE_HOME/ctsq (default ~/.cache/ctsq), then built-in defaults.
+
+  ctsq config path
+  ctsq config dump go")]
+    Config {
+        /// `path` or `dump <lang>`
+        #[arg(num_args(1..=2), required = true)]
+        args: Vec<String>,
+        // The global --lang and --no-ignore do nothing here, so they are hidden.
+        #[arg(long, short, hide = true)]
+        lang: Option<String>,
+        #[arg(long, hide = true)]
+        no_ignore: bool,
+    },
 }
 
 /// Restore the kernel default for SIGPIPE. The Rust runtime sets it to SIG_IGN before
@@ -410,6 +495,12 @@ fn main() {
             types::run(&langs, cli.lang.as_deref());
             return;
         }
+        Some(Commands::Path { query, paths, max, all, only, body, expand }) => {
+            std::process::exit(run_path(&query, &paths, cli.lang.as_deref(), cli.no_ignore, max, all, &only, body, expand));
+        }
+        Some(Commands::Config { args, .. }) => {
+            std::process::exit(config::run(&args));
+        }
         None => {}
     }
 
@@ -432,6 +523,15 @@ fn main() {
         }
     };
 
+    // Attributes are filtered after matching, against the last selector's node.
+    let attrs = match semantic::attrs::last_selector_attrs(&ast) {
+        Ok(a) => a,
+        Err(msg) => {
+            eprintln!("{}", msg);
+            std::process::exit(2);
+        }
+    };
+
     if cli.context.is_some() && cli.node {
         eprintln!("-C/--context does not apply to --node, which already prints the whole node");
         std::process::exit(2);
@@ -444,7 +544,7 @@ fn main() {
             let canonical = lang::lang_for_name_canonical(lang_name).unwrap_or(lang_name);
             if let Err(msg) = compiler::validate(&ast, lang.as_ref(), canonical) {
                 eprintln!("{}", msg);
-                std::process::exit(1);
+                std::process::exit(validate_exit_code(&msg));
             }
             let compiled = compiler::compile(&ast, lang.as_ref());
             println!("=== Compiled S-expression ({}) ===", lang_name);
@@ -587,7 +687,11 @@ fn main() {
         let l = lang::for_name(lang_name).expect("lang_name always valid here");
         if let Err(msg) = compiler::validate(&ast, l.as_ref(), lang_name) {
             eprintln!("{}", msg);
-            std::process::exit(1);
+            std::process::exit(validate_exit_code(&msg));
+        }
+        if let Err(msg) = semantic::attrs::check_lang(&attrs, lang_name) {
+            eprintln!("{}", msg);
+            std::process::exit(2);
         }
     }
 
@@ -632,7 +736,10 @@ fn main() {
 
         let display = if file == "-" { "<stdin>" } else { file.as_str() };
 
-        match runner::run_rows(compiled, lang_box.as_ref(), &source, cli.body) {
+        let result = runner::run_rows(compiled, lang_box.as_ref(), &source, cli.body).map(|rows| {
+            semantic::attrs::filter_rows(rows, &attrs, lang_name, &lang_box.ts_language(), &source)
+        });
+        match result {
             Ok(rows) if rows.is_empty() => {
                 if cli.show_query && !multiple {
                     println!("(no matches)");
@@ -804,6 +911,96 @@ fn run_refs(name: &str, path: &str, lang_override: Option<&str>, no_ignore: bool
             Err(e) => eprintln!("Runner error in {}: {}", file, e),
         }
     }
+}
+
+/// `ctsq path`. Returns the exit code: 0 routes found, 1 none or an unknown
+/// kind, 2 usage or query error.
+#[allow(clippy::too_many_arguments)]
+fn run_path(
+    query_str: &str,
+    paths: &[String],
+    lang_override: Option<&str>,
+    no_ignore: bool,
+    max: usize,
+    all: bool,
+    only: &[String],
+    body: bool,
+    expand: bool,
+) -> i32 {
+    // A query ending in `=>` or `==>` has no end selector.
+    let open = semantic::flows::open_end(query_str);
+    let parsed = match &open {
+        Some((head, _)) => query::parse(head),
+        None => query::parse(query_str),
+    };
+    let ast = match parsed {
+        Ok(q) => q,
+        Err(e) => {
+            eprintln!("Parse error: {}", e);
+            return 2;
+        }
+    };
+    let flows = open.is_some()
+        || ast.tail.iter().any(|(c, _)| {
+            c.is_semantic()
+                && !matches!(
+                    c,
+                    query::ast::Combinator::Calls
+                        | query::ast::Combinator::CallsEventually
+                        | query::ast::Combinator::CalledBy
+                        | query::ast::Combinator::CalledByEventually
+                )
+        });
+
+    let default = [".".to_string()];
+    let paths = if paths.is_empty() { &default[..] } else { paths };
+    let jobs: Vec<_> = paths
+        .iter()
+        .flat_map(|p| files::resolve_jobs(p, lang_override, no_ignore))
+        .collect();
+    let store = resolve::TreeStore::build(&jobs);
+    let graph = resolve::graph::build_from_store(&store);
+    if flows {
+        let scan = std::path::Path::new(&paths[0]);
+        let root = config::find_repo_root(scan);
+        let opts = semantic::flows::FlowOptions { max, only: only.to_vec(), expand };
+        return match semantic::flows::evaluate_flows(&ast, open.map(|(_, c)| c), &store, &graph, &root, scan, &opts) {
+            Ok(r) => {
+                print!("{}", r.text);
+                if r.found > 0 { 0 } else { 1 }
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                path_error_code(&e)
+            }
+        };
+    }
+    let opts = semantic::calls::CallOptions { max, all, ..Default::default() };
+    match semantic::calls::evaluate_calls(&ast, &store, &graph, &opts) {
+        Ok(routes) => {
+            print!(
+                "{}",
+                semantic::print::print_call_routes(&routes, &store, &semantic::print::PrintOpts { body })
+            );
+            if routes.routes.is_empty() { 1 } else { 0 }
+        }
+        Err(e) => {
+            eprintln!("{}", e);
+            path_error_code(&e)
+        }
+    }
+}
+
+/// Exit code for a `ctsq path` error: 1 for an unknown kind, as with `-q`,
+/// and 2 for any other usage or query error.
+fn path_error_code(msg: &str) -> i32 {
+    if msg.starts_with("unknown kind") { 1 } else { 2 }
+}
+
+/// A semantic query is a usage error with a pointer to `ctsq path` (exit 2).
+/// Any other validation failure is an unknown kind (exit 1).
+fn validate_exit_code(msg: &str) -> i32 {
+    if compiler::is_semantic_query_error(msg) { 2 } else { 1 }
 }
 
 fn require_lang(name: &str) -> Box<dyn lang::Lang> {

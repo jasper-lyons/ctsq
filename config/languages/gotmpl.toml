@@ -1,0 +1,56 @@
+# Go template flow mechanics (text/template and html/template).
+# Each key lists tree-sitter node kinds of the vendored grammar.
+[nodes]
+# `{{$x := .A}}` declares, `{{$x = .B}}` assigns.
+assign    = ["variable_definition", "assignment"]
+declare   = ["variable_definition"]
+# Template function calls such as printf, and method calls such as .M arg.
+call      = ["function_call", "method_call"]
+# `.Name` is a field of dot, `.A.B` a selector on a field.
+field     = ["field", "selector_expression"]
+field_name = ["identifier", "field_identifier"]
+# `$x` names.
+name      = ["variable"]
+# `if` and `with` take a condition and two arms. `with` also rebinds dot.
+branch    = ["if_action", "with_action"]
+# `range` rebinds dot to each element.
+loop      = ["range_action"]
+range     = ["range_variable_definition"]
+# `define` and `block` bodies are what a template call runs.
+function  = ["define_action", "block_action"]
+# The file root holds the top-level actions in order.
+block     = ["template"]
+composite = ["parenthesized_pipeline"]
+
+# `.` is the data of the template being run.
+dot       = ["dot"]
+# `range` and `with` run their body with `.` rebound.
+rebind    = ["range_action", "with_action"]
+# `{{template "x" .}}` and `{{block "x" .}}` run a named template on an argument.
+template_call = ["template_action", "block_action"]
+# `{{define "x"}}` and `{{block "x"}}` name a template body.
+define    = ["define_action", "block_action"]
+pipeline  = ["chained_pipeline"]
+# An action that prints its pipeline, unless the pipeline only assigns.
+print     = ["pipeline_action"]
+
+[fields]
+left        = ["variable"]
+right       = ["value"]
+condition   = ["condition"]
+consequence = ["consequence"]
+alternative = ["alternative"]
+body        = ["body"]
+function    = ["function", "method"]
+arguments   = ["arguments"]
+operand     = ["operand"]
+field       = ["field", "name"]
+name        = ["name"]
+value       = ["value", "element"]
+key         = ["index"]
+argument    = ["argument"]
+range       = ["range"]
+
+[tokens]
+plain_assign = ["=", ":="]
+declare      = [":="]

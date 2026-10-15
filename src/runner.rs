@@ -16,6 +16,9 @@ pub struct MatchRow {
     pub line: usize,
     pub src_line: Option<String>,
     pub node_text: String,
+    /// Byte range of the primary node: the node `line` points at.
+    pub start_byte: usize,
+    pub end_byte: usize,
 }
 
 /// Backwards-compatible wrapper: the node-text rendering only.
@@ -67,7 +70,13 @@ pub fn run_rows(
                     .unwrap_or_default(),
             )
         };
-        MatchRow { line: start, src_line, node_text }
+        MatchRow {
+            line: start,
+            src_line,
+            node_text,
+            start_byte: primary.start_byte(),
+            end_byte: primary.end_byte(),
+        }
     };
 
     let loc = |node: tree_sitter::Node| -> String {
@@ -139,6 +148,8 @@ pub fn run_rows(
                             line: 0,
                             src_line: None,
                             node_text: "<match>".into(),
+                            start_byte: 0,
+                            end_byte: 0,
                         });
                     }
                 } else {
@@ -181,12 +192,14 @@ pub fn run_rows(
                         })
                         .collect();
 
+                    // An explicit `@_root` marks the head node and wins over user captures.
                     let root = m
                         .captures
                         .iter()
-                        .find(|cap| {
+                        .find(|cap| outer_cap_names[cap.index as usize] == "_root")
+                        .or_else(|| m.captures.iter().find(|cap| {
                             !outer_cap_names[cap.index as usize].starts_with('_')
-                        })
+                        }))
                         .or_else(|| {
                             m.captures.iter().find(|cap| {
                                 outer_cap_names[cap.index as usize].starts_with("_root")
@@ -204,14 +217,23 @@ pub fn run_rows(
             // Phase 2: for each outer node, navigate to scope_field then run inner query.
             // tree-sitter searches all descendants of the scope node automatically.
             for (outer_root, outer_named) in &outer_data {
-                let scope_node = outer_root
-                    .child_by_field_name(scope_field)
-                    .unwrap_or(*outer_root);
+                // An empty scope field means a top-level descendant: search the whole node.
+                let descendant = scope_field.is_empty();
+                let scope_node = if descendant {
+                    *outer_root
+                } else {
+                    outer_root.child_by_field_name(scope_field).unwrap_or(*outer_root)
+                };
                 let mut cursor = QueryCursor::new();
                 let mut matches =
                     cursor.matches(&inner_q, scope_node, source_bytes);
 
                 while let Some(m) = matches.next() {
+                    // A descendant is strictly below the head: the head matching its own
+                    // inner pattern does not count.
+                    if descendant && m.captures.iter().any(|c| c.node.id() == outer_root.id()) {
+                        continue;
+                    }
                     let inner_named: CapList = m
                         .captures
                         .iter()
@@ -251,7 +273,16 @@ pub fn run_rows(
                             results.push(make_row(node_text, cap.node, 0));
                         }
                     } else {
-                        let primary = user_nodes[0];
+                        // A descendant row sits on the inner match, not on the head.
+                        let primary = if descendant {
+                            inner_named
+                                .first()
+                                .map(|(_, n)| *n)
+                                .or_else(|| m.captures.first().map(|c| c.node))
+                                .unwrap_or(user_nodes[0])
+                        } else {
+                            user_nodes[0]
+                        };
                         results.push(make_row(parts.join(", "), primary, user_nodes.len()));
                     }
                 }
@@ -378,5 +409,53 @@ mod tests {
         // DoWork is in the body, not the condition — should NOT match with .condition()
         let neg = run_str("(if @s).condition((&function#DoWork @c))", "cpp", src);
         assert!(neg.is_empty(), "DoWork is in body not condition, got: {:?}", neg);
+    }
+
+    const DEEP_GO: &str = "package main\n\nfunc handle(a int) {\n\tif a > 0 {\n\t\tfor i := 0; i < a; i++ {\n\t\t\tname := i\n\t\t\t_ = name\n\t\t}\n\t}\n}\n\nfunc other() {\n\tname := 1\n\t_ = name\n}\n";
+
+    #[test]
+    fn a_top_level_descendant_finds_a_variable_three_blocks_deep() {
+        let rows = rows_for("function#handle variable#name", "go", DEEP_GO, false);
+        assert!(!rows.is_empty(), "{:?}", rows);
+        assert!(rows.iter().any(|r| r.line == 6), "the declaration line: {:?}", rows);
+        assert!(rows.iter().all(|r| r.line <= 7), "nothing from other(): {:?}", rows);
+    }
+
+    #[test]
+    fn a_descendant_row_sits_on_the_inner_match_with_its_node_fields() {
+        let rows = rows_for("function#handle variable#name", "go", DEEP_GO, false);
+        let r = rows.iter().find(|r| r.line == 6).expect("row on line 6");
+        assert!(r.end_byte > r.start_byte, "{:?}", r);
+        let text = &DEEP_GO[r.start_byte..r.end_byte];
+        assert!(text.contains("name"), "the byte range is the inner node: {:?} {:?}", text, r);
+        assert!(!text.starts_with("func"), "not the function_declaration head: {:?}", r);
+    }
+
+    #[test]
+    fn root_capture_beats_a_user_capture_elsewhere_in_the_head() {
+        // The user capture @c sits on a call inside the head. Scoping must still
+        // use the head node, so the identifier below the head is found.
+        let src = "void f() { g(); h(); }\nvoid z() { h(); }\n";
+        let rows = rows_for("(&function#g @c) id#g", "cpp", src, false);
+        assert!(rows.is_empty() || rows.iter().all(|r| r.line == 1), "{:?}", rows);
+        let src2 = "void f() { g(h()); }\n";
+        let rows2 = rows_for("(&function#g @c) id#h", "cpp", src2, false);
+        assert!(!rows2.is_empty(), "scoped to the g call node, which holds h: {:?}", rows2);
+        assert!(rows2[0].node_text.contains("@c:"), "{:?}", rows2[0]);
+        assert_eq!(&src2[rows2[0].start_byte..rows2[0].end_byte], "h", "the identifier: {:?}", rows2[0]);
+    }
+
+    #[test]
+    fn the_head_matching_its_own_inner_pattern_is_not_a_descendant() {
+        let src = "package main\n\nfunc a() {}\n";
+        let rows = rows_for("function#a function#a", "go", src, false);
+        assert!(rows.is_empty(), "{:?}", rows);
+    }
+
+    #[test]
+    fn match_rows_carry_byte_range() {
+        let src = "package main\n\nconst itemCols = 1\n";
+        let rows = rows_for("id#itemCols", "go", src, false);
+        assert_eq!(&src[rows[0].start_byte..rows[0].end_byte], "itemCols");
     }
 }

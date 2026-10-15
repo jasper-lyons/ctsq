@@ -11,12 +11,12 @@ use std::collections::HashSet;
 pub const ABSTRACT_TYPES: &[&str] = &[
     "id", "function", "call", "class", "module", "type", "var", "variable",
     "const", "param", "import", "literal", "block", "if", "for", "while",
-    "switch", "op",
+    "switch", "op", "field", "template_action",
 ];
 
 /// Every language, in canonical form (tsx included — it adds JSX call forms).
 const ALL_LANGS: &[&str] = &[
-    "c", "cpp", "javascript", "typescript", "tsx", "python", "ruby", "rust", "go",
+    "c", "cpp", "javascript", "typescript", "tsx", "python", "ruby", "rust", "go", "gotmpl",
 ];
 
 pub fn run(langs: &[String], lang_flag: Option<&str>) {

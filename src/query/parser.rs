@@ -12,6 +12,23 @@ enum Token {
     RParen,
     At,
     Hash,
+    LBracket,
+    RBracket,
+    Colon,
+    Eq,
+    PrefixEq,
+    ContainsEq,
+    SuffixEq,
+    Calls,
+    CallsEventually,
+    CalledBy,
+    CalledByEventually,
+    Flows,
+    FlowsEventually,
+    FlowsFrom,
+    FlowsFromEventually,
+    /// A character that starts no token. `parse` turns it into an error.
+    Invalid(char),
     Ident(String),
     QuotedStr(String),
     Regex(String),
@@ -37,7 +54,92 @@ impl<'a> Lexer<'a> {
                 }
                 Token::Whitespace
             }
-            Some('*') => { self.chars.next(); Token::Star }
+            Some('*') => {
+                self.chars.next();
+                if self.chars.peek() == Some(&'=') {
+                    self.chars.next();
+                    Token::ContainsEq
+                } else {
+                    Token::Star
+                }
+            }
+            Some('^') => {
+                self.chars.next();
+                if self.chars.peek() == Some(&'=') {
+                    self.chars.next();
+                    Token::PrefixEq
+                } else {
+                    Token::Invalid('^')
+                }
+            }
+            Some('$') => {
+                self.chars.next();
+                if self.chars.peek() == Some(&'=') {
+                    self.chars.next();
+                    Token::SuffixEq
+                } else {
+                    Token::Invalid('$')
+                }
+            }
+            Some('[') => { self.chars.next(); Token::LBracket }
+            Some(']') => { self.chars.next(); Token::RBracket }
+            Some(':') => { self.chars.next(); Token::Colon }
+            Some('-') => {
+                self.chars.next();
+                match self.chars.peek() {
+                    Some('>') => { self.chars.next(); Token::Calls }
+                    Some('-') => {
+                        self.chars.next();
+                        if self.chars.peek() == Some(&'>') {
+                            self.chars.next();
+                            Token::CallsEventually
+                        } else {
+                            Token::Invalid('-')
+                        }
+                    }
+                    _ => Token::Invalid('-'),
+                }
+            }
+            Some('<') => {
+                self.chars.next();
+                match self.chars.peek() {
+                    Some('-') => {
+                        self.chars.next();
+                        if self.chars.peek() == Some(&'-') {
+                            self.chars.next();
+                            Token::CalledByEventually
+                        } else {
+                            Token::CalledBy
+                        }
+                    }
+                    Some('=') => {
+                        self.chars.next();
+                        if self.chars.peek() == Some(&'=') {
+                            self.chars.next();
+                            Token::FlowsFromEventually
+                        } else {
+                            Token::FlowsFrom
+                        }
+                    }
+                    _ => Token::Invalid('<'),
+                }
+            }
+            Some('=') => {
+                self.chars.next();
+                match self.chars.peek() {
+                    Some('>') => { self.chars.next(); Token::Flows }
+                    Some('=') => {
+                        self.chars.next();
+                        if self.chars.peek() == Some(&'>') {
+                            self.chars.next();
+                            Token::FlowsEventually
+                        } else {
+                            Token::Invalid('=')
+                        }
+                    }
+                    _ => Token::Eq,
+                }
+            }
             Some('&') => { self.chars.next(); Token::Amp }
             Some('>') => { self.chars.next(); Token::Gt }
             Some('+') => { self.chars.next(); Token::Plus }
@@ -78,7 +180,7 @@ impl<'a> Lexer<'a> {
             }
             Some(c) => {
                 self.chars.next();
-                Token::Ident(c.to_string())
+                Token::Invalid(c)
             }
         }
     }
@@ -136,7 +238,7 @@ impl Parser {
                     } else if matches!(
                         self.tokens.get(self.pos + 1),
                         Some(Token::Gt | Token::Plus | Token::Tilde)
-                    ) {
+                    ) || self.tokens.get(self.pos + 1).and_then(semantic_combinator).is_some() {
                         // `A > B` — the space belongs to the explicit combinator
                         self.advance();
                         continue;
@@ -147,7 +249,10 @@ impl Parser {
                 Token::Gt => { self.advance(); self.skip_whitespace(); Combinator::Child }
                 Token::Plus => { self.advance(); self.skip_whitespace(); Combinator::Adjacent }
                 Token::Tilde => { self.advance(); self.skip_whitespace(); Combinator::Sibling }
-                _ => break,
+                t => match semantic_combinator(t) {
+                    Some(c) => { self.advance(); self.skip_whitespace(); c }
+                    None => break,
+                },
             };
             let sel = self.parse_selector()?;
             tail.push((combinator, sel));
@@ -189,7 +294,31 @@ impl Parser {
         };
 
         let mut fields = Vec::new();
-        while self.peek() == &Token::Dot {
+        let mut not = Vec::new();
+        loop {
+            if self.peek() == &Token::Colon {
+                self.advance();
+                match self.advance() {
+                    Token::Ident(name) if name == "not" => {}
+                    Token::Ident(name) => return Err(format!("unsupported pseudo-class :{}", name)),
+                    _ => return Err("expected pseudo-class name after :".into()),
+                }
+                if self.peek() != &Token::LParen {
+                    return Err("expected ( after :not".into());
+                }
+                self.advance();
+                self.skip_whitespace();
+                not.push(self.parse_selector()?);
+                self.skip_whitespace();
+                if self.peek() != &Token::RParen {
+                    return Err("expected ) to close :not".into());
+                }
+                self.advance();
+                continue;
+            }
+            if self.peek() != &Token::Dot {
+                break;
+            }
             self.advance();
             let field = match self.advance() {
                 Token::Ident(name) => name,
@@ -213,7 +342,7 @@ impl Parser {
             fields.push(FieldAccess { field, inner });
         }
 
-        Ok(Selector { node, fields })
+        Ok(Selector { node, fields, not })
     }
 
     fn parse_atom(&mut self) -> Result<Atom, String> {
@@ -230,28 +359,97 @@ impl Parser {
             _ => None,
         };
 
+        let mut attrs = Vec::new();
         let name_match = if self.peek() == &Token::Hash {
             self.advance();
-            Some(self.parse_name_match()?)
+            let (nm, qual) = self.parse_name_match()?;
+            attrs.extend(qual);
+            Some(nm)
         } else {
             None
         };
 
-        Ok(Atom { sigil, node_type, name_match })
+        while self.peek() == &Token::LBracket {
+            attrs.push(self.parse_attr()?);
+        }
+
+        Ok(Atom { sigil, node_type, name_match, attrs })
     }
 
-    fn parse_name_match(&mut self) -> Result<NameMatch, String> {
+    /// Returns the name match, plus the `qual` attribute when the name used the
+    /// dot shorthand (`A.B` not followed by `(` is name `B` qualified by `A`).
+    fn parse_name_match(&mut self) -> Result<(NameMatch, Option<AttrMatch>), String> {
         match self.peek().clone() {
-            Token::QuotedStr(s) => { self.advance(); Ok(NameMatch::Exact(s)) }
-            Token::Regex(s) => { self.advance(); Ok(NameMatch::Regex(s)) }
-            Token::Ident(s) => { self.advance(); Ok(NameMatch::Exact(s)) }
+            Token::QuotedStr(s) => { self.advance(); Ok((NameMatch::Exact(s), None)) }
+            Token::Regex(s) => { self.advance(); Ok((NameMatch::Regex(s), None)) }
+            Token::Ident(s) => {
+                self.advance();
+                if self.peek() == &Token::Dot {
+                    if let (Some(Token::Ident(name)), after) =
+                        (self.tokens.get(self.pos + 1).cloned(), self.tokens.get(self.pos + 2))
+                    {
+                        if after != Some(&Token::LParen) {
+                            self.pos += 2;
+                            let qual = AttrMatch { key: "qual".into(), op: AttrOp::Eq, value: s };
+                            return Ok((NameMatch::Exact(name), Some(qual)));
+                        }
+                    }
+                }
+                Ok((NameMatch::Exact(s), None))
+            }
             _ => Err("expected name match after #".into()),
         }
     }
+
+    fn parse_attr(&mut self) -> Result<AttrMatch, String> {
+        self.advance(); // [
+        self.skip_whitespace();
+        let key = match self.advance() {
+            Token::Ident(k) => k,
+            _ => return Err("expected attribute name after [".into()),
+        };
+        self.skip_whitespace();
+        let op = match self.advance() {
+            Token::Eq => AttrOp::Eq,
+            Token::PrefixEq => AttrOp::Prefix,
+            Token::ContainsEq => AttrOp::Contains,
+            Token::SuffixEq => AttrOp::Suffix,
+            _ => return Err(format!("expected =, ^=, *= or $= after attribute '{}'", key)),
+        };
+        self.skip_whitespace();
+        let (op, value) = match (self.advance(), op) {
+            (Token::Ident(v) | Token::QuotedStr(v), op) => (op, v),
+            (Token::Regex(v), AttrOp::Eq) => (AttrOp::Regex, v),
+            (Token::Regex(_), _) => return Err("a /regex/ value needs plain =".into()),
+            _ => return Err(format!("expected a value for attribute '{}'", key)),
+        };
+        self.skip_whitespace();
+        if self.advance() != Token::RBracket {
+            return Err("expected ] to close attribute".into());
+        }
+        Ok(AttrMatch { key, op, value })
+    }
+}
+
+fn semantic_combinator(t: &Token) -> Option<Combinator> {
+    Some(match t {
+        Token::Calls => Combinator::Calls,
+        Token::CallsEventually => Combinator::CallsEventually,
+        Token::CalledBy => Combinator::CalledBy,
+        Token::CalledByEventually => Combinator::CalledByEventually,
+        Token::Flows => Combinator::Flows,
+        Token::FlowsEventually => Combinator::FlowsEventually,
+        Token::FlowsFrom => Combinator::FlowsFrom,
+        Token::FlowsFromEventually => Combinator::FlowsFromEventually,
+        _ => return None,
+    })
 }
 
 pub fn parse(s: &str) -> Result<Query, String> {
     let mut parser = Parser::new(s);
+    if let Some(Token::Invalid(c)) = parser.tokens.iter().find(|t| matches!(t, Token::Invalid(_))) {
+        return Err(format!("unexpected character '{}' in query", c));
+    }
     let query = parser.parse_query()?;
     parser.skip_whitespace();
     if parser.peek() != &Token::Eof {
@@ -271,6 +469,7 @@ mod tests {
             sigil: None,
             node_type: Some("function".into()),
             name_match: None,
+            attrs: vec![],
         }));
     }
 
@@ -351,5 +550,170 @@ mod tests {
             _ => panic!(),
         };
         assert_eq!(atom.name_match, Some(NameMatch::Regex("GFILE|gfile|GFile".into())));
+    }
+
+    fn atom_of(q: &Query) -> &Atom {
+        match &q.head.node {
+            SelectorNode::Bare(a) => a,
+            _ => panic!("expected bare atom"),
+        }
+    }
+
+    fn attr(key: &str, op: AttrOp, value: &str) -> AttrMatch {
+        AttrMatch { key: key.into(), op, value: value.into() }
+    }
+
+    #[test]
+    fn attribute_operators() {
+        for (src, op) in [
+            ("function[from=log]", AttrOp::Eq),
+            ("function[from^=log]", AttrOp::Prefix),
+            ("function[from*=log]", AttrOp::Contains),
+            ("function[from$=log]", AttrOp::Suffix),
+        ] {
+            let q = parse(src).unwrap();
+            assert_eq!(atom_of(&q).attrs, vec![attr("from", op, "log")], "{}", src);
+        }
+    }
+
+    #[test]
+    fn attribute_values_quoted_and_regex() {
+        let q = parse("function[from=\"log/slog\"]").unwrap();
+        assert_eq!(atom_of(&q).attrs, vec![attr("from", AttrOp::Eq, "log/slog")]);
+        let q = parse("function[from=/^log.*$/]").unwrap();
+        assert_eq!(atom_of(&q).attrs, vec![attr("from", AttrOp::Regex, "^log.*$")]);
+        assert!(parse("function[from^=/x/]").is_err());
+    }
+
+    #[test]
+    fn several_attributes_and_whitespace_inside_brackets() {
+        let q = parse("*function#x[ from = log ][in=Server]").unwrap();
+        let a = atom_of(&q);
+        assert_eq!(a.sigil, Some(Sigil::Def));
+        assert_eq!(a.attrs, vec![attr("from", AttrOp::Eq, "log"), attr("in", AttrOp::Eq, "Server")]);
+    }
+
+    #[test]
+    fn contains_eq_does_not_break_the_def_sigil() {
+        let q = parse("*function#x").unwrap();
+        assert_eq!(atom_of(&q).sigil, Some(Sigil::Def));
+        let q = parse("*function[a*=b]").unwrap();
+        let a = atom_of(&q);
+        assert_eq!(a.sigil, Some(Sigil::Def));
+        assert_eq!(a.attrs, vec![attr("a", AttrOp::Contains, "b")]);
+    }
+
+    #[test]
+    fn malformed_attributes_are_errors() {
+        for src in ["function[", "function[from]", "function[from=]", "function[from=x", "function[=x]"] {
+            assert!(parse(src).is_err(), "{}", src);
+        }
+    }
+
+    #[test]
+    fn dot_shorthand_becomes_qual_attribute() {
+        let q = parse("function#log.Printf").unwrap();
+        let a = atom_of(&q);
+        assert_eq!(a.name_match, Some(NameMatch::Exact("Printf".into())));
+        assert_eq!(a.attrs, vec![attr("qual", AttrOp::Eq, "log")]);
+        assert!(q.head.fields.is_empty());
+    }
+
+    #[test]
+    fn dot_shorthand_leaves_field_access_alone() {
+        let q = parse("function#log.body()").unwrap();
+        let a = atom_of(&q);
+        assert_eq!(a.name_match, Some(NameMatch::Exact("log".into())));
+        assert!(a.attrs.is_empty());
+        assert_eq!(q.head.fields[0].field, "body");
+    }
+
+    #[test]
+    fn dot_shorthand_then_field_access() {
+        let q = parse("function#log.Printf.body(variable#x)").unwrap();
+        assert_eq!(atom_of(&q).name_match, Some(NameMatch::Exact("Printf".into())));
+        assert_eq!(atom_of(&q).attrs, vec![attr("qual", AttrOp::Eq, "log")]);
+        assert_eq!(q.head.fields[0].field, "body");
+    }
+
+    #[test]
+    fn dot_shorthand_composes_with_brackets() {
+        let q = parse("field#User.Email[in=Account]").unwrap();
+        assert_eq!(
+            atom_of(&q).attrs,
+            vec![attr("qual", AttrOp::Eq, "User"), attr("in", AttrOp::Eq, "Account")]
+        );
+    }
+
+    #[test]
+    fn quoted_name_keeps_its_dot() {
+        let q = parse("id#\"a.b\"").unwrap();
+        assert_eq!(atom_of(&q).name_match, Some(NameMatch::Exact("a.b".into())));
+        assert!(atom_of(&q).attrs.is_empty());
+    }
+
+    #[test]
+    fn semantic_combinators_lex_and_parse() {
+        for (src, c) in [
+            ("a -> b", Combinator::Calls),
+            ("a --> b", Combinator::CallsEventually),
+            ("a <- b", Combinator::CalledBy),
+            ("a <-- b", Combinator::CalledByEventually),
+            ("a => b", Combinator::Flows),
+            ("a ==> b", Combinator::FlowsEventually),
+            ("a <= b", Combinator::FlowsFrom),
+            ("a <== b", Combinator::FlowsFromEventually),
+            ("a-->b", Combinator::CallsEventually),
+            ("a==>b", Combinator::FlowsEventually),
+        ] {
+            let q = parse(src).unwrap_or_else(|e| panic!("{}: {}", src, e));
+            assert_eq!(q.tail.len(), 1, "{}", src);
+            assert_eq!(q.tail[0].0, c, "{}", src);
+        }
+    }
+
+    #[test]
+    fn semantic_combinators_chain_and_mix_with_ast_ones() {
+        let q = parse("function#a variable#x ==> function#b --> function#c").unwrap();
+        let cs: Vec<_> = q.tail.iter().map(|(c, _)| c.clone()).collect();
+        assert_eq!(cs, vec![Combinator::Descendant, Combinator::FlowsEventually, Combinator::CallsEventually]);
+    }
+
+    #[test]
+    fn a_semantic_combinator_inside_a_group_parses() {
+        let q = parse("(function#a --> function#b)").unwrap();
+        match &q.head.node {
+            SelectorNode::Group { query, .. } => assert_eq!(query.tail[0].0, Combinator::CallsEventually),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn not_parses_onto_the_selector() {
+        let q = parse("function#a:not(function#b)").unwrap();
+        assert_eq!(q.head.not.len(), 1);
+        match &q.head.not[0].node {
+            SelectorNode::Bare(a) => assert_eq!(a.name_match, Some(NameMatch::Exact("b".into()))),
+            _ => panic!(),
+        }
+        let q = parse("function#a:not(function#b):not(function#c)").unwrap();
+        assert_eq!(q.head.not.len(), 2);
+        let q = parse("function:not(function#b) variable#x").unwrap();
+        assert_eq!(q.head.not.len(), 1);
+        assert_eq!(q.tail.len(), 1);
+    }
+
+    #[test]
+    fn unsupported_pseudo_classes_and_bad_not_are_errors() {
+        for src in ["function:has(x)", "function:", "function:not", "function:not(", "function:not(a"] {
+            assert!(parse(src).is_err(), "{}", src);
+        }
+    }
+
+    #[test]
+    fn unknown_characters_are_errors() {
+        for src in ["function ! x", "function%", "function^x", "function$x", "a - b", "a < b", "a == b", "function;"] {
+            assert!(parse(src).is_err(), "{}", src);
+        }
     }
 }

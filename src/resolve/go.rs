@@ -15,8 +15,10 @@
 //! `Var` receiver and disambiguated at resolve time — local bindings and
 //! params first (they shadow package names), then the import map.
 
-use super::{Callee, Confidence, Def, DefId, DefIndex, DefKind, Receiver, ResolvedCall, Resolver};
-use std::collections::HashMap;
+use super::{
+    CallSite, Callee, Confidence, Def, DefId, DefIndex, DefKind, Receiver, ResolvedCall, Resolver,
+};
+use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
 
 #[derive(Default)]
@@ -24,7 +26,11 @@ pub struct GoResolver;
 
 impl Resolver for GoResolver {
     fn collect_defs(&self, file: &str, source: &[u8]) -> Vec<Def> {
-        let tree = match parse(source) { Some(t) => t, None => return vec![] };
+        self.collect_defs_tree(file, source, None)
+    }
+
+    fn collect_defs_tree(&self, file: &str, source: &[u8], given: Option<&tree_sitter::Tree>) -> Vec<Def> {
+        let tree = match parse_or(given, source) { Some(t) => t, None => return vec![] };
         let pkg = file_package_path(file);
         let mut out = Vec::new();
         let mut cursor = tree.root_node().walk();
@@ -63,9 +69,55 @@ impl Resolver for GoResolver {
         out
     }
 
+    /// Types this file constructs (composite literals, `new(T)`), recorded as
+    /// `(T, CONSTRUCTED)`. Interface dispatch widens only to these.
+    fn collect_impls(&self, _file: &str, source: &[u8]) -> Vec<(String, String)> {
+        let Some(tree) = parse(source) else { return vec![] };
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(n) = stack.pop() {
+            match n.kind() {
+                "composite_literal" => {
+                    if let Some(t) = n.child_by_field_name("type").and_then(|t| type_name(t, source)) {
+                        seen.insert(t);
+                    }
+                }
+                "call_expression" => {
+                    let is_new = n.child_by_field_name("function").is_some_and(|f| text(f, source) == "new");
+                    if is_new {
+                        let arg = n.child_by_field_name("arguments").and_then(|a| a.named_child(0));
+                        if let Some(t) = arg.and_then(|a| type_name(a, source).or_else(|| {
+                            // `new(T)` can parse its argument as an identifier
+                            (a.kind() == "identifier").then(|| text(a, source).to_string())
+                        })) {
+                            seen.insert(t);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            let mut c = n.walk();
+            stack.extend(n.children(&mut c));
+        }
+        let mut out: Vec<(String, String)> = seen.into_iter().map(|t| (t, CONSTRUCTED.to_string())).collect();
+        out.sort();
+        out
+    }
+
     fn resolve_calls(&self, file: &str, source: &[u8], index: &DefIndex) -> Vec<ResolvedCall> {
-        let tree = match parse(source) { Some(t) => t, None => return vec![] };
+        self.resolve_calls_tree(file, source, None, index).0
+    }
+
+    fn resolve_calls_tree(
+        &self,
+        file: &str,
+        source: &[u8],
+        given: Option<&tree_sitter::Tree>,
+        index: &DefIndex,
+    ) -> (Vec<ResolvedCall>, Vec<CallSite>) {
+        let tree = match parse_or(given, source) { Some(t) => t, None => return (vec![], vec![]) };
         let scope = FileScope::build(tree.root_node(), source);
+        let constructed = constructed_types(index);
 
         // def line -> index, for attributing calls to their enclosing function
         let def_at: HashMap<usize, usize> = index.defs.iter().enumerate()
@@ -74,34 +126,70 @@ impl Resolver for GoResolver {
             .collect();
 
         let mut out = Vec::new();
+        let mut sites = Vec::new();
         for fun in &scope.fns {
             let Some(&caller) = def_at.get(&fun.line) else { continue };
-            let ctx = Ctx { file, scope: &scope, fun, index };
-            for (callee, line) in &fun.calls {
+            let ctx = Ctx { file, scope: &scope, fun, index, constructed: &constructed };
+            for call in &fun.calls {
+                let line = call.line;
                 // interface dispatch can yield several targets → one edge each
-                let targets = resolve_callee(callee, *line, 0, &ctx);
-                let display = callee.name().to_string();
-                if targets.is_empty() {
+                let targets: Vec<Option<(usize, Confidence)>> =
+                    match resolve_callee(&call.callee, line, 0, &ctx) {
+                        t if t.is_empty() => vec![None],
+                        t => t.into_iter().map(Some).collect(),
+                    };
+                let display = call.callee.name().to_string();
+                for target in targets {
                     out.push(ResolvedCall {
-                        caller, callee_display: display, line: *line, target: None,
+                        caller, callee_display: display.clone(), line, target,
                     });
-                } else {
-                    for t in targets {
-                        out.push(ResolvedCall {
-                            caller, callee_display: display.clone(), line: *line, target: Some(t),
-                        });
-                    }
+                    sites.push(CallSite {
+                        caller,
+                        callee_display: display.clone(),
+                        target,
+                        line,
+                        start_byte: call.start_byte,
+                        end_byte: call.end_byte,
+                        args: call.args.clone(),
+                    });
                 }
             }
         }
-        out
+        (out, sites)
     }
+}
+
+/// Marker trait name under which `collect_impls` records a constructed type.
+pub const CONSTRUCTED: &str = "#constructed";
+
+/// Types the program builds somewhere: composite literals and `new(T)`
+/// (recorded by `collect_impls`), the return types of functions, and the
+/// `NewT` naming convention. Interface calls widen only to these.
+pub fn constructed_types(index: &DefIndex) -> HashSet<String> {
+    let mut set: HashSet<String> = index.impls.iter()
+        .filter(|(_, t)| t == CONSTRUCTED)
+        .map(|(ty, _)| ty.clone())
+        .collect();
+    for d in &index.defs {
+        if !matches!(d.kind, DefKind::Function) { continue; }
+        if let Some(r) = &d.ret { set.insert(r.clone()); }
+        if let Some(t) = d.name.strip_prefix("New").filter(|t| t.chars().next().is_some_and(|c| c.is_uppercase())) {
+            set.insert(t.to_string());
+        }
+    }
+    set
 }
 
 fn parse(source: &[u8]) -> Option<tree_sitter::Tree> {
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
     parser.parse(source, None)
+}
+
+/// The tree a `TreeStore` already holds, else a fresh parse. Cloning a tree
+/// is a cheap reference count.
+fn parse_or(given: Option<&tree_sitter::Tree>, source: &[u8]) -> Option<tree_sitter::Tree> {
+    given.cloned().or_else(|| parse(source))
 }
 
 fn text<'a>(node: Node, source: &'a [u8]) -> &'a str {
@@ -201,6 +289,8 @@ enum Binding {
     /// `x := f()` / `x, err := pkg.F()` — type comes from the callee's
     /// return type at resolve time (or the `NewT` naming convention).
     Call(Callee),
+    /// A type switch variable in a `default` or multi-type case: no single type.
+    Unknown,
 }
 
 #[derive(Debug)]
@@ -211,8 +301,18 @@ struct FnScope {
     params: Vec<(String, String)>,
     /// (line, var, binding) in document order.
     bindings: Vec<(usize, String, Binding)>,
-    /// (callee, call-site line) in document order.
-    calls: Vec<(Callee, usize)>,
+    /// Call sites in document order.
+    calls: Vec<CallRec>,
+}
+
+#[derive(Debug)]
+struct CallRec {
+    callee: Callee,
+    line: usize,
+    start_byte: usize,
+    end_byte: usize,
+    /// Byte range of each argument.
+    args: Vec<(usize, usize)>,
 }
 
 #[derive(Debug)]
@@ -263,6 +363,27 @@ fn walk_scope(node: Node, source: &[u8], s: &mut FileScope, fn_stack: &mut Vec<u
             fn_stack.pop();
             return;
         }
+        // `switch t := x.(type) { case *T: ... }` narrows `t` to T in the case.
+        "type_case" | "default_case" if node.parent().is_some_and(|p| p.kind() == "type_switch_statement") => {
+            if let (Some(&f), Some(alias)) = (
+                fn_stack.last(),
+                node.parent().and_then(|p| p.child_by_field_name("alias")),
+            ) {
+                let types: Vec<Node> = if node.kind() == "type_case" {
+                    let mut c = node.walk();
+                    node.children_by_field_name("type", &mut c).filter(|t| t.is_named()).collect()
+                } else {
+                    vec![]
+                };
+                let binding = match types.as_slice() {
+                    [t] => type_name(*t, source).map(Binding::Typed).unwrap_or(Binding::Unknown),
+                    _ => Binding::Unknown,
+                };
+                if let Some(var) = alias.named_child(0).filter(|v| v.kind() == "identifier") {
+                    s.fns[f].bindings.push((node.start_position().row + 1, text(var, source).to_string(), binding));
+                }
+            }
+        }
         "short_var_declaration" => {
             if let Some(&f) = fn_stack.last() {
                 if let Some((var, b)) = classify_short_var(node, source) {
@@ -281,11 +402,41 @@ fn walk_scope(node: Node, source: &[u8], s: &mut FileScope, fn_stack: &mut Vec<u
         }
         "call_expression" => {
             if let Some(&f) = fn_stack.last() {
-                if let Some(c) = classify_call(node, source) {
-                    s.fns[f].calls.push((c, node.start_position().row + 1));
+                if let Some(callee) = classify_call(node, source) {
+                    let mut args = Vec::new();
+                    if let Some(list) = node.child_by_field_name("arguments") {
+                        let mut c = list.walk();
+                        for a in list.named_children(&mut c) {
+                            if a.kind() != "comment" {
+                                args.push((a.start_byte(), a.end_byte()));
+                            }
+                        }
+                    }
+                    s.fns[f].calls.push(CallRec {
+                        callee,
+                        line: node.start_position().row + 1,
+                        start_byte: node.start_byte(),
+                        end_byte: node.end_byte(),
+                        args,
+                    });
                 }
             }
             // fall through: arguments and receivers may contain calls
+        }
+        // `F[T](x)` parses as a conversion to a generic type: it calls `F`.
+        "type_conversion_expression" => {
+            if let (Some(&f), Some(callee)) = (fn_stack.last(), generic_conversion_callee(node, source)) {
+                let args = node.child_by_field_name("operand")
+                    .map(|a| vec![(a.start_byte(), a.end_byte())])
+                    .unwrap_or_default();
+                s.fns[f].calls.push(CallRec {
+                    callee,
+                    line: node.start_position().row + 1,
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
+                    args,
+                });
+            }
         }
         _ => {}
     }
@@ -355,7 +506,9 @@ fn classify_short_var(node: Node, source: &[u8]) -> Option<(String, Binding)> {
     let right = node.child_by_field_name("right")?;
     if right.named_child_count() != 1 { return None; }
     let value = right.named_child(0)?;
-    if left.named_child_count() > 1 && value.kind() != "call_expression" { return None; }
+    if left.named_child_count() > 1 && !matches!(value.kind(), "call_expression" | "type_assertion_expression") {
+        return None;
+    }
     let var = left.named_child(0)?;
     if var.kind() != "identifier" { return None; }
     classify_value(value, source)
@@ -396,6 +549,10 @@ fn classify_value(value: Node, source: &[u8]) -> Option<Binding> {
         "composite_literal" => {
             type_name(value.child_by_field_name("type")?, source).map(Binding::Typed)
         }
+        // `v, ok := x.(*T)` narrows v to T
+        "type_assertion_expression" => {
+            type_name(value.child_by_field_name("type")?, source).map(Binding::Typed)
+        }
         // `&Server{...}`
         "unary_expression" => {
             classify_value(value.child_by_field_name("operand")?, source)
@@ -415,6 +572,21 @@ fn new_convention_type(callee: &Callee) -> Option<String> {
     ty.chars().next()
         .filter(|c| c.is_uppercase())
         .map(|_| ty.to_string())
+}
+
+/// The function a `F[T](x)` conversion calls: `F`, or `pkg.F` for a
+/// qualified generic. None for any other conversion.
+fn generic_conversion_callee(node: Node, source: &[u8]) -> Option<Callee> {
+    let ty = node.child_by_field_name("type").filter(|t| t.kind() == "generic_type")?;
+    let base = ty.child_by_field_name("type")?;
+    match base.kind() {
+        "type_identifier" => Some(Callee::Bare(text(base, source).to_string())),
+        "qualified_type" => Some(Callee::Method {
+            receiver: Receiver::Var(text(base.child_by_field_name("package")?, source).to_string()),
+            name: text(base.child_by_field_name("name")?, source).to_string(),
+        }),
+        _ => None,
+    }
 }
 
 fn classify_call(node: Node, source: &[u8]) -> Option<Callee> {
@@ -455,6 +627,8 @@ struct Ctx<'a> {
     scope: &'a FileScope,
     fun: &'a FnScope,
     index: &'a DefIndex,
+    /// Types constructed somewhere in the scanned files.
+    constructed: &'a HashSet<String>,
 }
 
 const MAX_BINDING_DEPTH: usize = 4;
@@ -556,8 +730,9 @@ fn resolve_method(
 
 /// CHA-lite: a call through interface `iface` expands to `name` on every
 /// project type whose method set covers all of the interface's methods. A
-/// single implementor is exact; several are each a guess. With no
-/// implementors in the project the edge points at the signature itself.
+/// single implementor is exact; several are each a guess. Only types the
+/// program constructs somewhere count (rapid type analysis). With no such
+/// implementor the edge points at the signature itself.
 fn interface_impls(iface: &str, name: &str, ctx: &Ctx) -> Vec<(usize, Confidence)> {
     let sig_methods: Vec<&str> = ctx.index.defs.iter()
         .filter(|d| matches!(&d.kind, DefKind::InterfaceMethod { interface } if interface == iface))
@@ -576,7 +751,7 @@ fn interface_impls(iface: &str, name: &str, ctx: &Ctx) -> Vec<(usize, Confidence
     let mut impls: Vec<usize> = name_candidates(ctx, name)
         .filter(|&i| matches!(
             &ctx.index.defs[i].kind,
-            DefKind::Method { receiver, .. } if implements(receiver)
+            DefKind::Method { receiver, .. } if ctx.constructed.contains(receiver) && implements(receiver)
         ))
         .collect();
     impls.sort_by(|&a, &b| {
@@ -667,9 +842,322 @@ fn var_type(var: &str, line: usize, depth: usize, ctx: &Ctx) -> Option<String> {
             }
             return new_convention_type(callee);
         }
-        Some(Binding::FnValue(_)) | None => {}
+        Some(Binding::FnValue(_)) | Some(Binding::Unknown) | None => {}
     }
     ctx.fun.params.iter().find(|(v, _)| v == var).map(|(_, t)| t.clone())
+}
+
+// ── Public helpers for the attribute and flow stages ──────────────────────────
+
+/// Local package name to full import path for one Go file: `"log/slog"` is
+/// keyed `slog`, `l "log"` is keyed `l`. Dot and blank imports bind no name
+/// and are left out. `root` is the file's root node.
+pub fn go_imports(root: Node, src: &[u8]) -> HashMap<String, String> {
+    let mut s = FileScope { imports: HashMap::new(), globs: vec![], fns: vec![] };
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() == "import_declaration" {
+            collect_imports(child, src, &mut s);
+        }
+    }
+    s.imports.into_iter().map(|(k, v)| (k, v.join("/"))).collect()
+}
+
+/// Base type name of `var` as seen at 1-based `line` inside the function
+/// declared nearest above that line: its last binding (`var x T`, `x := &T{}`,
+/// `x := f()` through `f`'s indexed return type or the `NewT` convention),
+/// else the receiver or parameter type. `index` may be empty, which leaves
+/// only the call-return case unresolved. `file` is the path `index` uses.
+pub fn binding_type(
+    root: Node,
+    src: &[u8],
+    file: &str,
+    var: &str,
+    line: usize,
+    index: &DefIndex,
+) -> Option<String> {
+    let scope = FileScope::build(root, src);
+    let fun = scope.fns.iter().filter(|f| f.line <= line).max_by_key(|f| f.line)?;
+    let constructed = HashSet::new();
+    let ctx = Ctx { file, scope: &scope, fun, index, constructed: &constructed };
+    var_type(var, line, 0, &ctx)
+}
+
+/// `binding_type` with the package qualifier kept: `strings.Builder` where
+/// `binding_type` gives `Builder`. The type is read from the binding that
+/// `binding_type` used (a `var` type, a composite literal, a receiver or a
+/// parameter). When that binding names no qualified type, as for a call
+/// result, the answer is the same as `binding_type`.
+pub fn binding_type_qualified(
+    root: Node,
+    src: &[u8],
+    file: &str,
+    var: &str,
+    line: usize,
+    index: &DefIndex,
+) -> Option<String> {
+    let base = binding_type(root, src, file, var, line, index)?;
+    let mut decl = None;
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if matches!(child.kind(), "function_declaration" | "method_declaration")
+            && child.start_position().row < line
+        {
+            decl = Some(child);
+        }
+    }
+    let decl = decl?;
+    let mut types: Vec<Node> = Vec::new();
+    for list in ["receiver", "parameters"] {
+        if let Some(l) = decl.child_by_field_name(list) {
+            let mut c = l.walk();
+            for p in l.named_children(&mut c) {
+                let mut nc = p.walk();
+                if p.children_by_field_name("name", &mut nc).any(|n| text(n, src) == var) {
+                    types.extend(p.child_by_field_name("type"));
+                }
+            }
+        }
+    }
+    if let Some(body) = decl.child_by_field_name("body") {
+        let mut stack = vec![body];
+        let mut found: Vec<(usize, Node)> = Vec::new();
+        while let Some(n) = stack.pop() {
+            if n.start_position().row >= line {
+                continue;
+            }
+            match n.kind() {
+                "var_spec" => {
+                    let mut c = n.walk();
+                    if n.children_by_field_name("name", &mut c).any(|x| text(x, src) == var) {
+                        let ty = n.child_by_field_name("type").or_else(|| {
+                            n.child_by_field_name("value").and_then(|v| v.named_child(0)).and_then(literal_type)
+                        });
+                        found.extend(ty.map(|t| (n.start_byte(), t)));
+                    }
+                }
+                "short_var_declaration" => {
+                    let left = n.child_by_field_name("left");
+                    if left.and_then(|l| l.named_child(0)).is_some_and(|x| text(x, src) == var) {
+                        let ty = n.child_by_field_name("right").and_then(|v| v.named_child(0)).and_then(literal_type);
+                        found.extend(ty.map(|t| (n.start_byte(), t)));
+                    }
+                }
+                _ => {}
+            }
+            let mut c = n.walk();
+            stack.extend(n.named_children(&mut c));
+        }
+        found.sort_by_key(|(b, _)| *b);
+        if let Some((_, t)) = found.pop() {
+            types = vec![t];
+        }
+    }
+    let qualified = types.last().and_then(|t| qualified_type_name(*t, src));
+    match qualified {
+        Some(q) if q.rsplit('.').next() == Some(base.as_str()) => Some(q),
+        _ => Some(base),
+    }
+}
+
+/// The type node of a composite literal value, through `&`.
+fn literal_type(value: Node) -> Option<Node> {
+    match value.kind() {
+        "composite_literal" => value.child_by_field_name("type"),
+        "unary_expression" => literal_type(value.child_by_field_name("operand")?),
+        _ => None,
+    }
+}
+
+/// `type_name` that keeps a package qualifier: `pkg.Name`.
+fn qualified_type_name(node: Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "qualified_type" => {
+            let pkg = node.child_by_field_name("package")?;
+            let name = node.child_by_field_name("name")?;
+            Some(format!("{}.{}", text(pkg, source), text(name, source)))
+        }
+        "pointer_type" => node.named_child(0).and_then(|t| qualified_type_name(t, source)),
+        "generic_type" => node.child_by_field_name("type").and_then(|t| qualified_type_name(t, source)),
+        _ => type_name(node, source),
+    }
+}
+
+#[allow(dead_code)] // wired by the path command
+/// One parameter of a Go function or method.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoParam {
+    /// Empty for an unnamed parameter (`func f(int)`) and `_` stays `_`.
+    pub name: String,
+    /// 0-based position in the parameter list, counting every name in
+    /// `a, b int` and unnamed parameters. The receiver is not counted.
+    pub position: usize,
+    /// Type text as written, `...T` for a variadic parameter.
+    pub ty: String,
+    /// Byte range of the name, or of the type when unnamed.
+    pub start_byte: usize,
+    pub end_byte: usize,
+}
+
+#[allow(dead_code)] // wired by the path command
+/// Receiver and parameters of one Go function, method or interface method.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoSignature {
+    /// Start line of the declaration, which equals `Def.id.line`.
+    pub line: usize,
+    pub receiver: Option<GoParam>,
+    pub params: Vec<GoParam>,
+}
+
+#[allow(dead_code)] // wired by the path command
+/// Signatures of every top-level function and method and every interface
+/// method in one Go file, in document order. `root` is the file's root node.
+pub fn go_signatures(root: Node, src: &[u8]) -> Vec<GoSignature> {
+    let mut out = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        match child.kind() {
+            "function_declaration" | "method_declaration" => {
+                let receiver = child.child_by_field_name("receiver")
+                    .and_then(|r| signature_params(r, src).into_iter().next());
+                let params = child.child_by_field_name("parameters")
+                    .map(|p| signature_params(p, src))
+                    .unwrap_or_default();
+                out.push(GoSignature { line: child.start_position().row + 1, receiver, params });
+            }
+            "type_declaration" => {
+                let mut stack = vec![child];
+                while let Some(n) = stack.pop() {
+                    if n.kind() == "method_elem" {
+                        let params = n.child_by_field_name("parameters")
+                            .map(|p| signature_params(p, src))
+                            .unwrap_or_default();
+                        out.push(GoSignature { line: n.start_position().row + 1, receiver: None, params });
+                        continue;
+                    }
+                    let mut c = n.walk();
+                    let kids: Vec<Node> = n.named_children(&mut c).collect();
+                    stack.extend(kids.into_iter().rev());
+                }
+            }
+            _ => {}
+        }
+    }
+    out.sort_by_key(|s| s.line);
+    out
+}
+
+#[allow(dead_code)] // wired by the path command
+fn signature_params(list: Node, src: &[u8]) -> Vec<GoParam> {
+    let mut out = Vec::new();
+    let mut cursor = list.walk();
+    for p in list.named_children(&mut cursor) {
+        if !matches!(p.kind(), "parameter_declaration" | "variadic_parameter_declaration") {
+            continue;
+        }
+        let ty_node = p.child_by_field_name("type");
+        let ty_text = ty_node.map(|t| text(t, src).to_string()).unwrap_or_default();
+        let ty = if p.kind() == "variadic_parameter_declaration" {
+            format!("...{}", ty_text)
+        } else {
+            ty_text
+        };
+        let mut names = p.walk();
+        let named: Vec<Node> = p.children_by_field_name("name", &mut names).collect();
+        if named.is_empty() {
+            let span = ty_node.unwrap_or(p);
+            out.push(GoParam {
+                name: String::new(), position: out.len(), ty: ty.clone(),
+                start_byte: span.start_byte(), end_byte: span.end_byte(),
+            });
+        }
+        for n in named {
+            out.push(GoParam {
+                name: text(n, src).to_string(), position: out.len(), ty: ty.clone(),
+                start_byte: n.start_byte(), end_byte: n.end_byte(),
+            });
+        }
+    }
+    out
+}
+
+/// Result names of a Go function, method or literal node, one per result
+/// position. An unnamed result gives an empty name, so `(string, error)`
+/// gives two empty names and a single result type gives one.
+/// Declared result types of a function node, one per position: `error`
+/// for `(T, error)`. Empty when it has no results.
+pub fn go_result_types(func: Node, src: &[u8]) -> Vec<String> {
+    let Some(r) = func.child_by_field_name("result") else { return vec![] };
+    if r.kind() == "parameter_list" {
+        signature_params(r, src).into_iter().map(|p| p.ty).collect()
+    } else {
+        vec![text(r, src).to_string()]
+    }
+}
+
+pub fn go_result_names(func: Node, src: &[u8]) -> Vec<String> {
+    let Some(r) = func.child_by_field_name("result") else { return vec![] };
+    if r.kind() == "parameter_list" {
+        signature_params(r, src).into_iter().map(|p| p.name).collect()
+    } else {
+        vec![String::new()]
+    }
+}
+
+/// Base type name (no pointer, package or type arguments) of field `field`
+/// of struct `ty`, from the struct declarations in this file. Fields of
+/// embedded structs are promoted.
+pub fn go_field_type(root: Node, src: &[u8], ty: &str, field: &str) -> Option<String> {
+    fn base(t: &str) -> String {
+        let t = t.trim().trim_start_matches(['*', '&']);
+        let t = t.split('[').next().unwrap_or(t);
+        t.rsplit('.').next().unwrap_or(t).to_string()
+    }
+    fn struct_of<'t>(n: Node<'t>, src: &[u8], name: &str) -> Option<Node<'t>> {
+        if n.kind() == "type_spec"
+            && n.child_by_field_name("name").is_some_and(|x| text(x, src) == name)
+        {
+            return n.child_by_field_name("type").filter(|t| t.kind() == "struct_type");
+        }
+        if matches!(n.kind(), "function_declaration" | "method_declaration") {
+            return None;
+        }
+        let mut c = n.walk();
+        let kids: Vec<Node> = n.named_children(&mut c).collect();
+        kids.into_iter().find_map(|k| struct_of(k, src, name))
+    }
+    fn find(root: Node, src: &[u8], ty: &str, field: &str, depth: usize) -> Option<String> {
+        let st = struct_of(root, src, ty)?;
+        let mut stack = vec![st];
+        let mut decls = vec![];
+        while let Some(n) = stack.pop() {
+            if n.kind() == "field_declaration" {
+                decls.push(n);
+                continue;
+            }
+            let mut c = n.walk();
+            stack.extend(n.named_children(&mut c));
+        }
+        let mut embedded = vec![];
+        for d in decls {
+            let t = d.child_by_field_name("type").map(|t| base(text(t, src))).unwrap_or_default();
+            let mut c = d.walk();
+            let names: Vec<Node> = d.children_by_field_name("name", &mut c).collect();
+            if names.is_empty() {
+                if t == field {
+                    return Some(t);
+                }
+                embedded.push(t);
+            } else if names.iter().any(|n| text(*n, src) == field) {
+                return Some(t);
+            }
+        }
+        if depth > 4 {
+            return None;
+        }
+        embedded.into_iter().find_map(|e| find(root, src, &e, field, depth + 1))
+    }
+    find(root, src, &base(ty), field, 0)
 }
 
 /// Pick the best candidate. A single candidate is Exact; several rank by
@@ -725,6 +1213,7 @@ mod tests {
             for d in r.collect_defs(f, src.as_bytes()) {
                 idx.push(d);
             }
+            idx.impls.extend(r.collect_impls(f, src.as_bytes()));
         }
         idx
     }
@@ -791,6 +1280,16 @@ mod tests {
         ]);
         let (file, line, conf) = target_of(&results, "Go", "helper").unwrap();
         assert_eq!((file.as_str(), line, conf), ("a/a.go", 2, Confidence::Exact));
+    }
+
+    #[test]
+    fn generic_calls_with_type_arguments_resolve() {
+        let results = resolve_all(&[(
+            "a/a.go",
+            "package a\nfunc Extract[T any](r int) T { var v T; return v }\nfunc JSON[T any](w int, v T) {}\nfunc Go() {\n\tf := Extract[string](1)\n\tJSON[string](1, f)\n}\n",
+        )]);
+        assert_eq!(target_of(&results, "Go", "Extract").map(|t| t.1), Some(2));
+        assert_eq!(target_of(&results, "Go", "JSON").map(|t| t.1), Some(3));
     }
 
     #[test]
@@ -992,7 +1491,7 @@ mod tests {
     fn interface_dispatch_expands_to_implementations() {
         let results = resolve_all(&[(
             "a/a.go",
-            "package a\ntype Writer interface {\n  Write()\n}\ntype File struct{}\nfunc (f *File) Write() {}\ntype Buf struct{}\nfunc (b *Buf) Write() {}\ntype NotWriter struct{}\nfunc (n *NotWriter) Other() {}\nfunc Save(w Writer) {\n  w.Write()\n}\n",
+            "package a\ntype Writer interface {\n  Write()\n}\ntype File struct{}\nfunc (f *File) Write() {}\ntype Buf struct{}\nfunc (b *Buf) Write() {}\ntype NotWriter struct{}\nfunc (n *NotWriter) Other() {}\nfunc Save(w Writer) {\n  w.Write()\n}\nfunc mk() {\n  _ = &File{}\n  _ = &Buf{}\n}\n",
         )]);
         let targets: Vec<_> = results.iter()
             .filter(|(cr, ce, _)| cr == "Save" && ce == "Write")
@@ -1008,7 +1507,7 @@ mod tests {
     fn interface_dispatch_single_impl_is_exact() {
         let results = resolve_all(&[(
             "a/a.go",
-            "package a\ntype Writer interface {\n  Write()\n}\ntype File struct{}\nfunc (f *File) Write() {}\nfunc Save(w Writer) {\n  w.Write()\n}\n",
+            "package a\ntype Writer interface {\n  Write()\n}\ntype File struct{}\nfunc (f *File) Write() {}\nfunc Save(w Writer) {\n  w.Write()\n}\nfunc mk() { _ = &File{} }\n",
         )]);
         let (_, line, conf) = target_of(&results, "Save", "Write").unwrap();
         assert_eq!((line, conf), (6, Confidence::Exact));
@@ -1019,10 +1518,53 @@ mod tests {
         // Half implements only one of Writer's two methods — not an implementor.
         let results = resolve_all(&[(
             "a/a.go",
-            "package a\ntype Writer interface {\n  Write()\n  Close()\n}\ntype Full struct{}\nfunc (f *Full) Write() {}\nfunc (f *Full) Close() {}\ntype Half struct{}\nfunc (h *Half) Write() {}\nfunc Save(w Writer) {\n  w.Write()\n}\n",
+            "package a\ntype Writer interface {\n  Write()\n  Close()\n}\ntype Full struct{}\nfunc (f *Full) Write() {}\nfunc (f *Full) Close() {}\ntype Half struct{}\nfunc (h *Half) Write() {}\nfunc Save(w Writer) {\n  w.Write()\n}\nfunc mk() { _, _ = &Full{}, &Half{} }\n",
         )]);
         let (_, line, conf) = target_of(&results, "Save", "Write").unwrap();
         assert_eq!((line, conf), (7, Confidence::Exact), "only Full implements Writer");
+    }
+
+    #[test]
+    fn interface_dispatch_skips_types_never_constructed() {
+        let results = resolve_all(&[(
+            "a/a.go",
+            "package a\ntype W interface {\n  Write()\n}\ntype Made struct{}\nfunc (m *Made) Write() {}\ntype Ghost struct{}\nfunc (g *Ghost) Write() {}\nfunc Save(w W) {\n  w.Write()\n}\nfunc mk() { _ = new(Made) }\n",
+        )]);
+        let (_, line, conf) = target_of(&results, "Save", "Write").unwrap();
+        assert_eq!((line, conf), (6, Confidence::Exact), "Ghost is never built");
+    }
+
+    #[test]
+    fn implementations_that_are_never_constructed_leave_the_signature() {
+        let results = resolve_all(&[(
+            "a/a.go",
+            "package a\ntype W interface {\n  Write()\n}\ntype Ghost struct{}\nfunc (g *Ghost) Write() {}\nfunc Save(w W) {\n  w.Write()\n}\n",
+        )]);
+        let (_, line, _) = target_of(&results, "Save", "Write").unwrap();
+        assert_eq!(line, 3);
+    }
+
+    #[test]
+    fn type_assertion_narrows_to_one_type() {
+        let results = resolve_all(&[(
+            "a/a.go",
+            "package a\ntype W interface {\n  Write()\n}\ntype F struct{}\nfunc (f *F) Write() {}\ntype B struct{}\nfunc (b *B) Write() {}\nfunc mk() { _, _ = &F{}, &B{} }\nfunc Save(w W) {\n  if b, ok := w.(*B); ok {\n    b.Write()\n  }\n}\n",
+        )]);
+        let (_, line, conf) = target_of(&results, "Save", "Write").unwrap();
+        assert_eq!((line, conf), (8, Confidence::Exact));
+    }
+
+    #[test]
+    fn type_switch_case_narrows_and_default_does_not() {
+        let results = resolve_all(&[(
+            "a/a.go",
+            "package a\ntype W interface {\n  Write()\n}\ntype F struct{}\nfunc (f *F) Write() {}\ntype B struct{}\nfunc (b *B) Write() {}\nfunc mk() { _, _ = &F{}, &B{} }\nfunc Save(w W) {\n  switch t := w.(type) {\n  case *F:\n    t.Write()\n  default:\n    w.Write()\n  }\n}\n",
+        )]);
+        let lines: Vec<(usize, usize)> = results.iter()
+            .filter(|(cr, ce, _)| cr == "Save" && ce == "Write")
+            .filter_map(|(_, _, t)| t.clone().map(|(_, l, _)| l))
+            .enumerate().collect();
+        assert_eq!(lines, vec![(0, 6), (1, 6), (2, 8)], "case F calls F only, default calls both: {:?}", lines);
     }
 
     #[test]
@@ -1088,6 +1630,73 @@ mod tests {
         ]);
         let (file, _, conf) = target_of(&results, "Go", "Helper").unwrap();
         assert_eq!((file.as_str(), conf), ("a/near.go", Confidence::Guess));
+    }
+
+    #[test]
+    fn go_imports_maps_local_name_to_full_path() {
+        let src = "package main\nimport (\n  \"fmt\"\n  \"log/slog\"\n  l \"log\"\n  . \"proj/dot\"\n  _ \"side\"\n)\n";
+        let tree = parse(src.as_bytes()).unwrap();
+        let m = go_imports(tree.root_node(), src.as_bytes());
+        assert_eq!(m.get("fmt").map(String::as_str), Some("fmt"));
+        assert_eq!(m.get("slog").map(String::as_str), Some("log/slog"));
+        assert_eq!(m.get("l").map(String::as_str), Some("log"));
+        assert_eq!(m.len(), 3, "dot and blank imports bind no name: {:?}", m);
+    }
+
+    #[test]
+    fn binding_type_reads_params_literals_and_returns() {
+        let src = "package a\ntype S struct{}\nfunc makeIt() *S { return &S{} }\nfunc Go(p *S) {\n  var v S\n  x := &S{}\n  y := makeIt()\n  z := NewT()\n  _ = v\n}\n";
+        let tree = parse(src.as_bytes()).unwrap();
+        let root = tree.root_node();
+        let idx = build_index(&[("a/a.go", src)]);
+        let ty = |var: &str| binding_type(root, src.as_bytes(), "a/a.go", var, 9, &idx);
+        assert_eq!(ty("p").as_deref(), Some("S"));
+        assert_eq!(ty("v").as_deref(), Some("S"));
+        assert_eq!(ty("x").as_deref(), Some("S"));
+        assert_eq!(ty("y").as_deref(), Some("S"));
+        assert_eq!(ty("z").as_deref(), Some("T"));
+        assert_eq!(ty("nope"), None);
+        // before the binding line the variable has no type yet
+        assert_eq!(binding_type(root, src.as_bytes(), "a/a.go", "x", 5, &idx), None);
+    }
+
+    #[test]
+    fn binding_type_qualified_keeps_the_package() {
+        let src = "package a\nimport \"strings\"\nfunc Go(w *http.Writer, s S) {\n  var b strings.Builder\n  p := &bytes.Buffer{}\n  _ = b\n}\n";
+        let tree = parse(src.as_bytes()).unwrap();
+        let root = tree.root_node();
+        let idx = DefIndex::default();
+        let ty = |var: &str| binding_type_qualified(root, src.as_bytes(), "a/a.go", var, 6, &idx);
+        assert_eq!(ty("b").as_deref(), Some("strings.Builder"));
+        assert_eq!(ty("p").as_deref(), Some("bytes.Buffer"));
+        assert_eq!(ty("w").as_deref(), Some("http.Writer"));
+        assert_eq!(ty("s").as_deref(), Some("S"));
+        assert_eq!(ty("nope"), None);
+    }
+
+    #[test]
+    fn go_signatures_list_receiver_and_positioned_params() {
+        let src = "package a\ntype W interface {\n  Write(p []byte, n int) error\n}\nfunc (s *S) Run(a, b int, _ string, rest ...any) {}\nfunc F(int, *S) {}\n";
+        let tree = parse(src.as_bytes()).unwrap();
+        let sigs = go_signatures(tree.root_node(), src.as_bytes());
+        let lines: Vec<usize> = sigs.iter().map(|s| s.line).collect();
+        assert_eq!(lines, vec![3, 5, 6], "{:?}", sigs);
+        let write: Vec<(&str, usize, &str)> =
+            sigs[0].params.iter().map(|p| (p.name.as_str(), p.position, p.ty.as_str())).collect();
+        assert_eq!(write, vec![("p", 0, "[]byte"), ("n", 1, "int")]);
+        let run = &sigs[1];
+        let recv = run.receiver.as_ref().unwrap();
+        assert_eq!((recv.name.as_str(), recv.ty.as_str()), ("s", "*S"));
+        assert_eq!(&src[recv.start_byte..recv.end_byte], "s");
+        let params: Vec<(&str, usize, &str)> =
+            run.params.iter().map(|p| (p.name.as_str(), p.position, p.ty.as_str())).collect();
+        assert_eq!(
+            params,
+            vec![("a", 0, "int"), ("b", 1, "int"), ("_", 2, "string"), ("rest", 3, "...any")]
+        );
+        let unnamed: Vec<(&str, usize, &str)> =
+            sigs[2].params.iter().map(|p| (p.name.as_str(), p.position, p.ty.as_str())).collect();
+        assert_eq!(unnamed, vec![("", 0, "int"), ("", 1, "*S")]);
     }
 
     #[test]

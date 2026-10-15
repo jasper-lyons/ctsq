@@ -134,6 +134,22 @@ fn ts_resolve(abstract_type: &str, sigil: Option<&Sigil>) -> Option<Vec<TsVarian
         "while" => Some(vec![simple("while_statement")]),
         "switch" => Some(vec![simple("switch_statement")]),
         "op" => Some(vec![simple("binary_expression")]),
+        // Class fields, interface and type-literal members are declarations.
+        "field" => Some(match sigil {
+                Some(Sigil::Def) => vec![
+                field_at("public_field_definition", "name", "property_identifier", &[]),
+                field_at("property_signature", "name", "property_identifier", &[]),
+            ],
+                Some(Sigil::Ref) => vec![field_at("member_expression", "property", "property_identifier", &[])],
+                None => {
+                    let mut v = vec![
+                field_at("public_field_definition", "name", "property_identifier", &[]),
+                field_at("property_signature", "name", "property_identifier", &[]),
+            ];
+                    v.extend(vec![field_at("member_expression", "property", "property_identifier", &[])]);
+                    v
+                }
+            }),
         "call" | "module" => Some(vec![]),
         _ => None,
     }
@@ -325,6 +341,18 @@ fn type_decl_variants() -> Vec<TsVariant> {
             parent_name_wrap: None, always_callee_eq: None,
         },
     ]
+}
+
+/// A field node whose name is the `name_node` child reached through
+/// `name_field` and `path`. The match lands on the declaration or access, and
+/// attribute filters read the field name back off it.
+fn field_at(
+    node: &'static str,
+    name_field: &'static str,
+    name_node: &'static str,
+    path: &'static [(&'static str, &'static str)],
+) -> TsVariant {
+    TsVariant { name_field: Some(name_field), name_node, name_path: path, ..simple(node) }
 }
 
 fn simple(node: &'static str) -> TsVariant {

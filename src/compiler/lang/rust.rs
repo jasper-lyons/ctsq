@@ -93,6 +93,15 @@ impl Lang for RustLang {
             "for" => Some(vec![simple("for_expression")]),
             "while" => Some(vec![simple("while_expression")]),
             "switch" => Some(vec![simple("match_expression")]),
+            "field" => Some(match sigil {
+                Some(Sigil::Def) => vec![field_at("field_declaration", "name", "field_identifier", &[])],
+                Some(Sigil::Ref) => vec![field_at("field_expression", "field", "field_identifier", &[])],
+                None => {
+                    let mut v = vec![field_at("field_declaration", "name", "field_identifier", &[])];
+                    v.extend(vec![field_at("field_expression", "field", "field_identifier", &[])]);
+                    v
+                }
+            }),
             "call" | "op" => Some(vec![]),
             _ => None,
         }
@@ -241,6 +250,18 @@ fn call_variant() -> TsVariant {
         always_constraint: None,
         parent_name_wrap: None, always_callee_eq: None,
     }
+}
+
+/// A field node whose name is the `name_node` child reached through
+/// `name_field` and `path`. The match lands on the declaration or access, and
+/// attribute filters read the field name back off it.
+fn field_at(
+    node: &'static str,
+    name_field: &'static str,
+    name_node: &'static str,
+    path: &'static [(&'static str, &'static str)],
+) -> TsVariant {
+    TsVariant { name_field: Some(name_field), name_node, name_path: path, ..simple(node) }
 }
 
 fn simple(node: &'static str) -> TsVariant {

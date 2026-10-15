@@ -56,6 +56,9 @@ struct Fragment {
     params_needs_bridge: bool,
     body_field: Option<&'static str>,
     body_container: Option<&'static str>,
+    /// Also capture the emitted node as `@_root`, so a scoped runner can find the
+    /// head node even when the user's own captures sit elsewhere in the pattern.
+    extra_root: bool,
 }
 
 impl Fragment {
@@ -85,6 +88,7 @@ impl Fragment {
             let name_cap = format!("@_n{}", id);
             let pred = name_predicate(&name_cap, &nm);
             let cap = self.outer_capture.get_or_insert_with(|| format!("_root{}", fresh_id()));
+            let cap = if self.extra_root { format!("{} @_root", cap) } else { cap.clone() };
             let inner_name = format!("({}) {}", wrap.name_node, name_cap);
             let wrapped = format!(
                 "({} {}: {} {}: {} @{})",
@@ -95,7 +99,11 @@ impl Fragment {
         }
 
         let cap = self.outer_capture.get_or_insert_with(|| format!("_root{}", fresh_id()));
-        let with_cap = format!("{} @{}", node, cap);
+        let with_cap = if self.extra_root {
+            format!("{} @{} @_root", node, cap)
+        } else {
+            format!("{} @{}", node, cap)
+        };
         if self.predicates.is_empty() {
             with_cap
         } else {
@@ -134,8 +142,40 @@ pub fn compile(query: &Query, lang: &dyn Lang) -> CompiledQuery {
     if let Some((outer, scope_field, inner)) = try_compile_scoped(query, lang) {
         return CompiledQuery::Scoped { outer, scope_field, inner };
     }
+    if let Some((outer, scope_field, inner)) = try_compile_descendant(query, lang) {
+        return CompiledQuery::Scoped { outer, scope_field, inner };
+    }
     let frags = compile_query(query, lang);
     CompiledQuery::Simple(emit_alternation(frags))
+}
+
+/// Compile a top-level `head tail...` descendant as a two-phase scoped query so
+/// the tail may sit at any depth under the head, not just one grammar node down.
+/// Only the first top-level descendant gets this treatment. The rest of the query
+/// becomes the inner query, where later descendants keep the one-level `(_ ...)`
+/// bridge. The scope field is empty, which the runner reads as "the whole node".
+fn try_compile_descendant(query: &Query, lang: &dyn Lang) -> Option<(String, String, String)> {
+    let (first, rest) = query.tail.split_first()?;
+    if first.0 != Combinator::Descendant {
+        return None;
+    }
+    let outer_frags: Vec<Fragment> = compile_selector(&query.head, lang)
+        .into_iter()
+        .map(|mut f| {
+            f.extra_root = true;
+            f
+        })
+        .collect();
+    let outer = emit_alternation(outer_frags);
+    if outer.is_empty() {
+        return None;
+    }
+    let inner_query = Query { head: first.1.clone(), tail: rest.to_vec() };
+    let inner = emit_alternation(compile_query(&inner_query, lang));
+    if inner.is_empty() {
+        return None;
+    }
+    Some((outer, String::new(), inner))
 }
 
 /// The abstract kinds this language resolves, in vocabulary order. Used for the
@@ -153,6 +193,12 @@ pub fn known_kinds(lang: &dyn Lang) -> Vec<&'static str> {
 /// nonsense pattern and tree-sitter reports "Invalid node type" from deep inside
 /// the runner, which says nothing about what would have worked.
 pub fn validate(query: &Query, lang: &dyn Lang, lang_name: &str) -> Result<(), String> {
+    if has_semantic(query) {
+        return Err(format!(
+            "{}call and data-flow combinators and :not() are not available here, use: ctsq path '<query>'",
+            SEMANTIC_QUERY_PREFIX
+        ));
+    }
     let mut kinds = Vec::new();
     collect_node_types(query, &mut kinds);
 
@@ -174,6 +220,40 @@ pub fn validate(query: &Query, lang: &dyn Lang, lang_name: &str) -> Result<(), S
         ));
     }
     Ok(())
+}
+
+/// Prefix of the error `validate` returns for a semantic query. Callers that
+/// need to treat it differently (exit 2 plus a hint) test with
+/// `is_semantic_query_error`.
+pub const SEMANTIC_QUERY_PREFIX: &str = "semantic query: ";
+
+#[allow(dead_code)]
+pub fn is_semantic_query_error(err: &str) -> bool {
+    err.starts_with(SEMANTIC_QUERY_PREFIX)
+}
+
+/// True when a semantic combinator or `:not(...)` appears anywhere in the query,
+/// including inside groups and field inner queries.
+pub fn has_semantic(query: &Query) -> bool {
+    selector_has_semantic(&query.head)
+        || query
+            .tail
+            .iter()
+            .any(|(c, sel)| c.is_semantic() || selector_has_semantic(sel))
+}
+
+fn selector_has_semantic(sel: &Selector) -> bool {
+    if !sel.not.is_empty() {
+        return true;
+    }
+    if let SelectorNode::Group { query, .. } = &sel.node {
+        if has_semantic(query) {
+            return true;
+        }
+    }
+    sel.fields
+        .iter()
+        .any(|fa| fa.inner.as_ref().is_some_and(|q| has_semantic(q)))
 }
 
 fn collect_node_types(query: &Query, out: &mut Vec<String>) {
@@ -229,6 +309,7 @@ fn try_compile_scoped(query: &Query, lang: &dyn Lang) -> Option<(String, String,
             .filter(|fa| fa.inner.is_none())
             .cloned()
             .collect(),
+        not: query.head.not.clone(),
     };
     let outer_str = emit_alternation(compile_selector(&outer_sel, lang));
     if outer_str.is_empty() {
@@ -322,6 +403,11 @@ fn compile_query(query: &Query, lang: &dyn Lang) -> Vec<Fragment> {
                 // Sibling combinators have no direct TS query equivalent — emit independently.
                 frags.extend(compile_selector(sel, lang));
             }
+            // Semantic combinators never reach here: `validate` rejects them. A caller
+            // that skips validation gets each side emitted independently.
+            _ => {
+                frags.extend(compile_selector(sel, lang));
+            }
         }
     }
     frags
@@ -391,6 +477,7 @@ fn compile_wildcard(atom: &Atom) -> Fragment {
         params_needs_bridge: false,
         body_field: None,
         body_container: None,
+        extra_root: false,
     }
 }
 
@@ -407,6 +494,7 @@ fn compile_passthrough(node_type: &str, atom: &Atom) -> Fragment {
         params_needs_bridge: false,
         body_field: None,
         body_container: None,
+        extra_root: false,
     }
 }
 
@@ -474,6 +562,7 @@ fn compile_variant(variant: &TsVariant, atom: &Atom) -> Fragment {
         params_needs_bridge: variant.params_needs_bridge,
         body_field: variant.body_field,
         body_container: variant.body_container,
+        extra_root: false,
     }
 }
 
@@ -490,6 +579,7 @@ fn apply_field_access(frags: Vec<Fragment>, fa: &FieldAccess, lang: &dyn Lang) -
             params_needs_bridge: false,
             body_field: None,
             body_container: None,
+            extra_root: false,
         }],
         Some(inner_query) => compile_query(inner_query, lang),
     };
@@ -871,5 +961,73 @@ mod tests {
         // call is now a known-absent no-op in all languages
         assert!(compile_str("call", "c").is_empty());
         assert!(compile_str("call", "javascript").is_empty());
+    }
+
+    #[test]
+    fn a_top_level_descendant_compiles_to_an_empty_field_scope() {
+        let q = parse("(*function#handle @f) variable#name").unwrap();
+        let lang = for_name("go").unwrap();
+        match compile(&q, lang.as_ref()) {
+            CompiledQuery::Scoped { outer, scope_field, inner } => {
+                assert_eq!(scope_field, "");
+                assert!(outer.contains("@f @_root"), "explicit @_root beside the user capture: {}", outer);
+                assert!(inner.contains("\"name\""), "{}", inner);
+            }
+            other => panic!("expected Scoped, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn nested_and_later_descendants_keep_the_one_level_bridge() {
+        let lang = for_name("go").unwrap();
+        // Inside a group: stays Simple with the (_ ...) bridge.
+        let q = parse("(function#a variable#b)").unwrap();
+        match compile(&q, lang.as_ref()) {
+            CompiledQuery::Simple(s) => assert!(s.contains("(_ "), "{}", s),
+            other => panic!("expected Simple, got {:?}", other),
+        }
+        // A second descendant stays in the inner query as a bridge.
+        let q = parse("function#a block variable#b").unwrap();
+        match compile(&q, lang.as_ref()) {
+            CompiledQuery::Scoped { inner, .. } => assert!(inner.contains("(_ "), "{}", inner),
+            other => panic!("expected Scoped, got {:?}", other),
+        }
+        // Child combinator is untouched.
+        let q = parse("function#a > variable#b").unwrap();
+        assert!(matches!(compile(&q, lang.as_ref()), CompiledQuery::Simple(_)));
+    }
+
+    #[test]
+    fn validate_rejects_semantic_queries_anywhere() {
+        let lang = for_name("go").unwrap();
+        for q in [
+            "function#a --> function#b",
+            "(function#a --> function#b)",
+            "function#a -> function#b",
+            "variable#a ==> function#b",
+            "(*function @f).body(function#a <- function#b)",
+            "function:not(function#a)",
+            "(function:not(variable#a) @f)",
+        ] {
+            let parsed = parse(q).unwrap_or_else(|e| panic!("{}: {}", q, e));
+            let err = validate(&parsed, lang.as_ref(), "go").unwrap_err();
+            assert!(is_semantic_query_error(&err), "{}: {}", q, err);
+        }
+    }
+
+    #[test]
+    fn validate_accepts_attributes_and_dot_shorthand() {
+        let lang = for_name("go").unwrap();
+        for q in ["function#log.Printf", "function[from=\"log/slog\"]", "*function#x[in=Server]"] {
+            let parsed = parse(q).unwrap();
+            assert!(validate(&parsed, lang.as_ref(), "go").is_ok(), "{}", q);
+        }
+    }
+
+    #[test]
+    fn attrs_do_not_change_compiled_output() {
+        let with = compile_str("&function#Printf[from=fmt]", "go");
+        let without = compile_str("&function#Printf", "go");
+        assert_eq!(shape(&with), shape(&without));
     }
 }
