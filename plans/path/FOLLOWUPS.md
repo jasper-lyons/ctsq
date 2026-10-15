@@ -15,3 +15,4 @@ Minor findings from the mid-build adversarial review (2026-10-15) that were not 
 - [ ] The flow effect memo key has no call depth, so an effect computed at a cut depth can be reused at a shallower one (fixer B, pre-existing)
 - [ ] The upward walk (`src/flow/upward.rs`) names tree-sitter-go node kinds in a const list instead of reading Mechanics (decision 20). Field reads only go back to stores in the same function or the composite literal, not into callers (flow-up)
 - [ ] Constructed types are recorded through `Resolver::collect_impls` with a sentinel trait name, which re-parses every Go file once more. Give `DefIndex` a real field or cache it on `TreeStore` (widening)
+- [ ] A template file entry repeats its first line as two rows (`{{template "layout.html.tmpl" .}}  moved` then the same line `exact, via layout.html.tmpl`). Open-end mode does not tag the `Execute` call itself as `outside` (templates-flow)
