@@ -18,3 +18,8 @@ Minor findings from the mid-build adversarial review (2026-10-15) that were not 
 - [ ] A template file entry repeats its first line as two rows (`{{template "layout.html.tmpl" .}}  moved` then the same line `exact, via layout.html.tmpl`). Open-end mode does not tag the `Execute` call itself as `outside` (templates-flow)
 - [ ] Open-end mode stops the SES route at the `ses.SendEmailInput{...}` composite literal (tagged outside) rather than the `sesClient.SendEmail` call. `aws.String` has no model and shows as an unmodelled end in the template query (fixer D)
 - [ ] `res, err := ...` with `_ = res` keeps the `unmodelled` tag on the hop but is no longer counted as an unmodelled end (Walker::read_after, fixer D). Check the tag reads sensibly
+- [ ] Tree-sitter-go node names are hard-coded outside the mechanics file in `src/flow/values.rs`, `widen.rs`, `objects.rs`, `template.rs` and `src/semantic/flows.rs` as well as `upward.rs` (decision 20, final review)
+- [ ] Multi-part dot shorthand `function#os.path.join` is a parse error. `[qual="os.path"]` works (decision 05, final review)
+- [ ] `:not()` is rejected in data-flow queries ("not available in data-flow queries yet") (decision 02, final review)
+- [ ] `ctsq --help` does not mention the `field` kind, attributes or dot shorthand, and the `-l` list omits gotmpl (final review)
+- [ ] 41 clippy style warnings in src/flow, src/semantic and src/config (final review)
