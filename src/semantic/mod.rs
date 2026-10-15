@@ -7,6 +7,7 @@
 
 pub mod attrs;
 pub mod calls;
+pub mod print;
 
 use crate::compiler;
 use crate::query::ast::{Combinator, Query, Selector};
