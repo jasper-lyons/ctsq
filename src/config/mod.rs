@@ -117,7 +117,10 @@ const BUILTIN_MODELS: &[BuiltinModel] = &[BuiltinModel {
     text: include_str!("../../config/models/go/stdlib@1.23.toml"),
 }];
 
-const BUILTIN_LANGUAGES: &[(&str, &str)] = &[("go", include_str!("../../config/languages/go.toml"))];
+const BUILTIN_LANGUAGES: &[(&str, &str)] = &[
+    ("go", include_str!("../../config/languages/go.toml")),
+    ("gotmpl", include_str!("../../config/languages/gotmpl.toml")),
+];
 
 /// Models for qualified names, first definition wins.
 #[derive(Debug, Default)]

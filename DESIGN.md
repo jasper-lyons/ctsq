@@ -607,4 +607,18 @@ One local change: upstream hides the printing action as `_pipeline_action`, so `
 - `function` is `define_action` and `block_action` under `*` and `function_call` under `&`. A define name is a string literal, so `*function#body` does not match `{{define "body"}}`, `*function#/body/` does.
 - `call` is `function_call`, `method_call` and `template_action`. `if` is `if_action` and `for` is `range_action`.
 
-Flow mechanics for templates live in `config/languages/gotmpl.toml`. That file is not yet compiled in as a built-in language, so `ctsq config dump gotmpl` finds it only from a config root.
+Flow mechanics for templates live in `config/languages/gotmpl.toml`, compiled in as a built-in language, so `ctsq config dump gotmpl` shows them. The keys `dot`, `rebind`, `template_call`, `define`, `pipeline` and `print` under `[nodes]`, and `argument`, `range`, `key` and `value` under `[fields]`, are read by the template walk only.
+
+## Template flow
+
+Code in `src/flow/template.rs`, called from the downward walk in `src/semantic/flows.rs`.
+
+Linking. A call whose model has `template = { data_arg }` (`Execute`, `ExecuteTemplate`) and whose data argument is tracked is linked to templates. The receiver is walked back through reaching assignments, `Must`, and method chains to every call with a `template_load` model, in run order, plus load calls made on the receiver variable earlier in the same scope (`t.ParseFS(...)` as a statement). Each name argument (from `names_from` on) becomes a value set (decision 25). With an `fs_arg`, the `//go:embed` comment lines above that `embed.FS` variable give patterns, matched against the files below the Go file's directory, and each name or glob is matched against those files with `path.Match` rules. Without one (`ParseFiles`, `ParseGlob`) names resolve against the Go file's directory, then its module root, then the working directory. A `text_arg` (`Parse`) value is an inline template whose rows print the Go file and the literal's line plus the line inside the string.
+
+Template sets. The first name argument of the first load picks the entry: one set per value, holding the files that value matches, the files every other name matches, and the inline texts. `ExecuteTemplate` enters at the template its name argument names instead. When nothing links, the call falls back to its model.
+
+Walking. `.` starts as the tracked data with its field paths. `.F` and `.F.G` follow the paths: a path through F is exact, any other field is untracked, and a whole value makes every read derived. `range` binds `.` and its element variable to the collection's value, `with` binds `.` to its condition, the else part keeps `.` as it was. `$x := ...` and `$x = ...` assign, `$` is the data the template was called with. Calls, pipelines and functions are derived from any tracked part. `{{template "x" arg}}` and `{{block "x" arg}}` run every `{{define "x"}}` of the set, else a file named `x`, else the block's own body, with `arg` as `.`, guarded against recursion.
+
+Rows. A printing action that reads tracked data is a hop tagged `exact` or `derived`, then `rendered`. It is also a sink when the end selector matches inside it (`template_action`, `template_action#Phone`, or a `call` inside the action), and with no end selector it is a leaf tagged `outside`. A template call prints `via x` with the called define (tagged `moved`) under it, `range` and `with` print a row holding their body. Each linked set hangs under the Go call as a tree whose root is the entry template's first line, tagged `moved`. Template rows count as routes like any other sink.
+
+Ends. An end selector only templates have, such as `template_action`, is accepted when the scan holds no template files: the walk matches it against the templates it links.

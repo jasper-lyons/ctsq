@@ -22,14 +22,17 @@ function  = ["define_action", "block_action"]
 block     = ["template"]
 composite = ["parenthesized_pipeline"]
 
-# Node kinds with no Mechanics key yet, listed for templates-flow:
-#   dot           = ["dot"]
-#   rebind        = ["range_action", "with_action"]
-#   template_call = ["template_action", "block_action"]
-#   define        = ["define_action", "block_action"]
-#   pipeline      = ["chained_pipeline"]
-#   print         = ["pipeline_action"]
-#   argument (field) = ["argument"] on template_action and block_action
+# `.` is the data of the template being run.
+dot       = ["dot"]
+# `range` and `with` run their body with `.` rebound.
+rebind    = ["range_action", "with_action"]
+# `{{template "x" .}}` and `{{block "x" .}}` run a named template on an argument.
+template_call = ["template_action", "block_action"]
+# `{{define "x"}}` and `{{block "x"}}` name a template body.
+define    = ["define_action", "block_action"]
+pipeline  = ["chained_pipeline"]
+# An action that prints its pipeline, unless the pipeline only assigns.
+print     = ["pipeline_action"]
 
 [fields]
 left        = ["variable"]
@@ -43,7 +46,10 @@ arguments   = ["arguments"]
 operand     = ["operand"]
 field       = ["field", "name"]
 name        = ["name"]
-value       = ["value"]
+value       = ["value", "element"]
+key         = ["index"]
+argument    = ["argument"]
+range       = ["range"]
 
 [tokens]
 plain_assign = ["=", ":="]

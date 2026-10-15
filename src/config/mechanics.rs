@@ -83,6 +83,18 @@ pub struct Nodes {
     /// Assignments that declare their names in the enclosing block, shadowing
     /// an outer name until the block ends.
     pub declare: Vec<String>,
+    /// The current data value of a template, `.` in Go templates.
+    pub dot: Vec<String>,
+    /// Actions that run their body with the data rebound to another value.
+    pub rebind: Vec<String>,
+    /// Actions that run a named template with an argument as its data.
+    pub template_call: Vec<String>,
+    /// Actions that define a named template body.
+    pub define: Vec<String>,
+    /// A chain of commands where each result is the last argument of the next.
+    pub pipeline: Vec<String>,
+    /// Actions that print the value of their pipeline.
+    pub print: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -133,6 +145,10 @@ pub struct Fields {
     pub channel: Vec<String>,
     /// Parameter list of a function literal.
     pub params: Vec<String>,
+    /// Data argument of a template call.
+    pub argument: Vec<String>,
+    /// Collection a loop header ranges over.
+    pub range: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
