@@ -156,6 +156,7 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 name = "ctsq"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "clap",
  "ignore",
  "libc",
@@ -168,6 +169,7 @@ dependencies = [
  "tree-sitter-cpp",
  "tree-sitter-go",
  "tree-sitter-javascript",
+ "tree-sitter-language",
  "tree-sitter-python",
  "tree-sitter-ruby",
  "tree-sitter-rust",

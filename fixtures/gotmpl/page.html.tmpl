@@ -1,0 +1,7 @@
+{{template "layout.html.tmpl" .}}
+{{define "body"}}
+{{range .Items}}<p>{{.Phone}}</p>{{end}}
+{{if .X}}<b>{{.X.Label}}</b>{{end}}
+{{$n := .Name}}{{$n}}
+{{printf "%s" .Title | html}}
+{{end}}

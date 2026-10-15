@@ -1,0 +1,22 @@
+diff --git i/make_grammar.js w/make_grammar.js
+index c464476..e63bdc1 100644
+--- i/make_grammar.js
++++ w/make_grammar.js
+@@ -111,7 +111,7 @@ module.exports = function make_grammar(dialect) {
+                     2,
+                     choice(
+                         $._comment_action,
+-                        $._pipeline_action,
++                        $.pipeline_action,
+                         $.if_action,
+                         $.range_action,
+                         $.break_action,
+@@ -136,7 +136,7 @@ module.exports = function make_grammar(dialect) {
+                     )
+                 ),
+ 
+-            _pipeline_action: ($) =>
++            pipeline_action: ($) =>
+                 seq($._left_delimiter, $._pipeline, $._right_delimiter),
+ 
+             if_action: ($) =>
