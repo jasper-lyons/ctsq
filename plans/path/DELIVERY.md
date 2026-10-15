@@ -39,4 +39,4 @@ From `~/workspace/projects/jasperlyons/ctsq-worktrees/path-build`:
 - Values read back from the database are a separate query (decision 17). So the `%v` log line in `admin-bookings-update-view.go:26` and the admin page templates are not reached from a field start. `field#Booking.CustomerPhone ==> function#log.Printf` correctly says 0 routes.
 - On the booking app the SES route stops at building `ses.SendEmailInput` (line 218) rather than the `sesClient.SendEmail` call, because `aws.String` has no model.
 - Data flow is Go only. Call routes work for any language with a resolver (Go, Rust, others by name).
-- Everything else is listed in `plans/path/FOLLOWUPS.md` (20 items).
+- Everything else is listed in `plans/path/FOLLOWUPS.md` (21 items).
