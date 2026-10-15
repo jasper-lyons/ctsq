@@ -365,6 +365,9 @@ Exit codes: 0 routes found, 1 none, 2 usage or query error.")]
         /// Print each hop's definition body under its row
         #[arg(long)]
         body: bool,
+        /// List the outside implementations a widened interface call groups (data-flow queries)
+        #[arg(long)]
+        expand: bool,
     },
     /// Show where config and model files are read from, or the merged result for a language
     #[command(after_help = "Language mechanics and outside-call models are TOML files, looked up in order:
@@ -457,8 +460,8 @@ fn main() {
             types::run(&langs, cli.lang.as_deref());
             return;
         }
-        Some(Commands::Path { query, paths, max, all, only, body }) => {
-            std::process::exit(run_path(&query, &paths, cli.lang.as_deref(), cli.no_ignore, max, all, &only, body));
+        Some(Commands::Path { query, paths, max, all, only, body, expand }) => {
+            std::process::exit(run_path(&query, &paths, cli.lang.as_deref(), cli.no_ignore, max, all, &only, body, expand));
         }
         Some(Commands::Config { args }) => {
             std::process::exit(config::run(&args));
@@ -887,6 +890,7 @@ fn run_path(
     all: bool,
     only: &[String],
     body: bool,
+    expand: bool,
 ) -> i32 {
     // A query ending in `=>` or `==>` has no end selector.
     let open = semantic::flows::open_end(query_str);
@@ -924,7 +928,7 @@ fn run_path(
     if flows {
         let scan = std::path::Path::new(&paths[0]);
         let root = config::find_repo_root(scan);
-        let opts = semantic::flows::FlowOptions { max, only: only.to_vec() };
+        let opts = semantic::flows::FlowOptions { max, only: only.to_vec(), expand };
         return match semantic::flows::evaluate_flows(&ast, open.map(|(_, c)| c), &store, &graph, &root, scan, &opts) {
             Ok(r) => {
                 print!("{}", r.text);
