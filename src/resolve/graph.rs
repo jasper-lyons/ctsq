@@ -1,7 +1,7 @@
 //! Project-wide call graph: every definition indexed, every call site
 //! resolved, with forward/reverse adjacency for in-memory traversal.
 
-use super::{resolver_for, DefId, DefIndex, ResolvedCall};
+use super::{resolver_for, CallSite, DefId, DefIndex, ResolvedCall, TreeStore};
 use std::collections::{HashMap, HashSet};
 
 /// Graph node identity: a known definition (file:line) or an external name.
@@ -18,31 +18,53 @@ pub struct CallGraph {
     pub fwd: HashMap<NodeKey, Vec<usize>>,
     /// callee NodeKey -> indices into `calls`
     pub rev: HashMap<NodeKey, Vec<usize>>,
+    /// Every call site, not deduplicated, in file then document order. Only
+    /// resolvers that fill `Resolver::resolve_calls_tree` sites add to it (Go).
+    #[allow(dead_code)] // read by the flow engine
+    pub sites: Vec<CallSite>,
 }
 
+/// Build from files on disk. Each resolver parses its own files.
 pub fn build(jobs: &[(String, &'static str)]) -> CallGraph {
+    let sources: Vec<Option<Vec<u8>>> = jobs.iter().map(|(f, _)| std::fs::read(f).ok()).collect();
+    let files: Vec<(&str, &'static str, &[u8], Option<&tree_sitter::Tree>)> = jobs
+        .iter()
+        .zip(&sources)
+        .filter_map(|((f, l), s)| s.as_ref().map(|s| (f.as_str(), *l, s.as_slice(), None)))
+        .collect();
+    assemble(&files)
+}
+
+#[allow(dead_code)] // wired by the path command
+/// Build from a `TreeStore`, so resolvers that take a tree (Go) do not parse
+/// again. Same graph as `build` on the same files.
+pub fn build_from_store(store: &TreeStore) -> CallGraph {
+    let files: Vec<(&str, &'static str, &[u8], Option<&tree_sitter::Tree>)> = store
+        .iter()
+        .map(|(f, p)| (f, p.lang, p.source.as_slice(), p.tree.as_ref()))
+        .collect();
+    assemble(&files)
+}
+
+fn assemble(files: &[(&str, &'static str, &[u8], Option<&tree_sitter::Tree>)]) -> CallGraph {
     // Pass 1: index every definition.
     let mut index = DefIndex::default();
-    let mut sources: Vec<Option<Vec<u8>>> = Vec::with_capacity(jobs.len());
-    for (file, lang_name) in jobs {
-        let Ok(source) = std::fs::read(file) else {
-            sources.push(None);
-            continue;
-        };
+    for &(file, lang_name, source, tree) in files {
         let resolver = resolver_for(lang_name);
-        for def in resolver.collect_defs(file, &source) {
+        for def in resolver.collect_defs_tree(file, source, tree) {
             index.push(def);
         }
-        index.impls.extend(resolver.collect_impls(file, &source));
-        sources.push(Some(source));
+        index.impls.extend(resolver.collect_impls(file, source));
     }
 
     // Pass 2: resolve call sites against the full index.
     let mut calls: Vec<ResolvedCall> = Vec::new();
+    let mut sites: Vec<CallSite> = Vec::new();
     let mut seen: HashSet<(usize, String, Option<usize>)> = HashSet::new();
-    for ((file, lang_name), source) in jobs.iter().zip(&sources) {
-        let Some(source) = source else { continue };
-        for rc in resolver_for(lang_name).resolve_calls(file, source, &index) {
+    for &(file, lang_name, source, tree) in files {
+        let (resolved, file_sites) = resolver_for(lang_name).resolve_calls_tree(file, source, tree, &index);
+        sites.extend(file_sites);
+        for rc in resolved {
             // one edge per (caller, callee) pair; first call site wins
             if seen.insert((rc.caller, rc.callee_display.clone(), rc.target.map(|(t, _)| t))) {
                 calls.push(rc);
@@ -66,7 +88,7 @@ pub fn build(jobs: &[(String, &'static str)]) -> CallGraph {
         list.sort_by_key(|&i| (calls[i].line, calls[i].callee_display.clone()));
     }
 
-    CallGraph { index, calls, fwd, rev }
+    CallGraph { index, calls, fwd, rev, sites }
 }
 
 #[cfg(test)]
@@ -156,6 +178,40 @@ mod tests {
             resolved.iter().any(|(t, c)| g.index.defs[*t].name == "m" && *c == Confidence::Exact),
             "method call x.m() should resolve to Foo::m"
         );
+    }
+
+    #[test]
+    fn graph_from_a_store_matches_graph_from_disk() {
+        let path = format!("{}/fixtures", env!("CARGO_MANIFEST_DIR"));
+        let jobs = crate::files::resolve_jobs(&path, None, false);
+        let store = TreeStore::build(&jobs);
+        assert_eq!(dump(&build_from_store(&store)), GRAPH_PIN);
+    }
+
+    #[test]
+    fn go_call_sites_keep_every_site_with_argument_ranges() {
+        let src = "package a\nfunc h(x int, y int) {}\nfunc Go() {\n  h(1, 2)\n  h(3, 4)\n  println()\n}\n";
+        let mut store = TreeStore::default();
+        store.insert("a/a.go", "go", src.as_bytes().to_vec());
+        let g = build_from_store(&store);
+        assert_eq!(g.calls.len(), 2, "one edge per pair: {:?}", g.calls);
+        let to_h: Vec<_> = g.sites.iter().filter(|s| s.callee_display == "h").collect();
+        assert_eq!(to_h.len(), 2, "every site is kept: {:?}", g.sites);
+        assert_eq!(to_h[1].line, 5);
+        assert_eq!(&src[to_h[1].start_byte..to_h[1].end_byte], "h(3, 4)");
+        let args: Vec<&str> = to_h[1].args.iter().map(|&(a, b)| &src[a..b]).collect();
+        assert_eq!(args, vec!["3", "4"]);
+        let h = to_h[1].target.unwrap().0;
+        assert_eq!(g.index.defs[h].name, "h");
+        assert!(g.sites.iter().any(|s| s.callee_display == "println" && s.target.is_none()));
+    }
+
+    #[test]
+    fn non_go_resolvers_add_no_sites() {
+        let path = tmp("ctsq_graph_sites.rs", "fn a() { b(); }\nfn b() {}\n");
+        let g = build(&[(path, "rust")]);
+        assert_eq!(g.calls.len(), 1);
+        assert!(g.sites.is_empty());
     }
 
     /// Recorded from `build` before the call-walk side tables were added.
