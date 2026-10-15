@@ -193,6 +193,12 @@ pub fn known_kinds(lang: &dyn Lang) -> Vec<&'static str> {
 /// nonsense pattern and tree-sitter reports "Invalid node type" from deep inside
 /// the runner, which says nothing about what would have worked.
 pub fn validate(query: &Query, lang: &dyn Lang, lang_name: &str) -> Result<(), String> {
+    if has_semantic(query) {
+        return Err(format!(
+            "{}call and data-flow combinators and :not() are not available here, use: ctsq path '<query>'",
+            SEMANTIC_QUERY_PREFIX
+        ));
+    }
     let mut kinds = Vec::new();
     collect_node_types(query, &mut kinds);
 
@@ -214,6 +220,40 @@ pub fn validate(query: &Query, lang: &dyn Lang, lang_name: &str) -> Result<(), S
         ));
     }
     Ok(())
+}
+
+/// Prefix of the error `validate` returns for a semantic query. Callers that
+/// need to treat it differently (exit 2 plus a hint) test with
+/// `is_semantic_query_error`.
+pub const SEMANTIC_QUERY_PREFIX: &str = "semantic query: ";
+
+#[allow(dead_code)]
+pub fn is_semantic_query_error(err: &str) -> bool {
+    err.starts_with(SEMANTIC_QUERY_PREFIX)
+}
+
+/// True when a semantic combinator or `:not(...)` appears anywhere in the query,
+/// including inside groups and field inner queries.
+pub fn has_semantic(query: &Query) -> bool {
+    selector_has_semantic(&query.head)
+        || query
+            .tail
+            .iter()
+            .any(|(c, sel)| c.is_semantic() || selector_has_semantic(sel))
+}
+
+fn selector_has_semantic(sel: &Selector) -> bool {
+    if !sel.not.is_empty() {
+        return true;
+    }
+    if let SelectorNode::Group { query, .. } = &sel.node {
+        if has_semantic(query) {
+            return true;
+        }
+    }
+    sel.fields
+        .iter()
+        .any(|fa| fa.inner.as_ref().is_some_and(|q| has_semantic(q)))
 }
 
 fn collect_node_types(query: &Query, out: &mut Vec<String>) {
@@ -269,6 +309,7 @@ fn try_compile_scoped(query: &Query, lang: &dyn Lang) -> Option<(String, String,
             .filter(|fa| fa.inner.is_none())
             .cloned()
             .collect(),
+        not: query.head.not.clone(),
     };
     let outer_str = emit_alternation(compile_selector(&outer_sel, lang));
     if outer_str.is_empty() {
@@ -360,6 +401,11 @@ fn compile_query(query: &Query, lang: &dyn Lang) -> Vec<Fragment> {
             }
             Combinator::Adjacent | Combinator::Sibling => {
                 // Sibling combinators have no direct TS query equivalent — emit independently.
+                frags.extend(compile_selector(sel, lang));
+            }
+            // Semantic combinators never reach here: `validate` rejects them. A caller
+            // that skips validation gets each side emitted independently.
+            _ => {
                 frags.extend(compile_selector(sel, lang));
             }
         }
@@ -949,5 +995,39 @@ mod tests {
         // Child combinator is untouched.
         let q = parse("function#a > variable#b").unwrap();
         assert!(matches!(compile(&q, lang.as_ref()), CompiledQuery::Simple(_)));
+    }
+
+    #[test]
+    fn validate_rejects_semantic_queries_anywhere() {
+        let lang = for_name("go").unwrap();
+        for q in [
+            "function#a --> function#b",
+            "(function#a --> function#b)",
+            "function#a -> function#b",
+            "variable#a ==> function#b",
+            "(*function @f).body(function#a <- function#b)",
+            "function:not(function#a)",
+            "(function:not(variable#a) @f)",
+        ] {
+            let parsed = parse(q).unwrap_or_else(|e| panic!("{}: {}", q, e));
+            let err = validate(&parsed, lang.as_ref(), "go").unwrap_err();
+            assert!(is_semantic_query_error(&err), "{}: {}", q, err);
+        }
+    }
+
+    #[test]
+    fn validate_accepts_attributes_and_dot_shorthand() {
+        let lang = for_name("go").unwrap();
+        for q in ["function#log.Printf", "function[from=\"log/slog\"]", "*function#x[in=Server]"] {
+            let parsed = parse(q).unwrap();
+            assert!(validate(&parsed, lang.as_ref(), "go").is_ok(), "{}", q);
+        }
+    }
+
+    #[test]
+    fn attrs_do_not_change_compiled_output() {
+        let with = compile_str("&function#Printf[from=fmt]", "go");
+        let without = compile_str("&function#Printf", "go");
+        assert_eq!(shape(&with), shape(&without));
     }
 }
