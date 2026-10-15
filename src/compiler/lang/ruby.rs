@@ -58,6 +58,12 @@ impl Lang for RubyLang {
             "while" => Some(vec![simple("while"), simple("until")]),
             "for" => Some(vec![simple("for")]),
             "switch" => Some(vec![simple("case")]),
+            // A Ruby field is an instance variable. `@x = …` declares it and every
+            // `@x` is an access. Receiver calls like `u.x` are method calls, not fields.
+            "field" => Some(match sigil {
+                Some(Sigil::Def) => vec![field_at("assignment", "left", "instance_variable", &[])],
+                _ => vec![simple("instance_variable")],
+            }),
             "op" => Some(vec![]),
             _ => None,
         }
@@ -166,6 +172,18 @@ fn import_variants() -> Vec<TsVariant> {
 
 fn identifier() -> TsVariant {
     simple("identifier")
+}
+
+/// A field node whose name is the `name_node` child reached through
+/// `name_field` and `path`. The match lands on the declaration or access, and
+/// attribute filters read the field name back off it.
+fn field_at(
+    node: &'static str,
+    name_field: &'static str,
+    name_node: &'static str,
+    path: &'static [(&'static str, &'static str)],
+) -> TsVariant {
+    TsVariant { name_field: Some(name_field), name_node, name_path: path, ..simple(node) }
 }
 
 fn simple(node: &'static str) -> TsVariant {

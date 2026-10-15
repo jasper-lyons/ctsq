@@ -107,6 +107,8 @@ The compiler checks each `node_type` against the fixed abstract vocabulary:
 
 This means users can always escape to raw TS node names without any special syntax.
 
+The `field` kind names a struct, class or interface field. `*field` is the declaration, `&field` is an access (`x.name`), and bare `field` is both. The match lands on the declaration or the access expression, and the field name is read off it, so attribute filters such as `field#User.Email` resolve the owner the same way they do for `field_identifier`. Per language: Go `field_declaration` and `selector_expression`, JS and TS class fields (plus TS `property_signature`) and `member_expression`, Python `self.x = ...` assignments and `attribute`, Rust `field_declaration` and `field_expression`, C and C++ `field_declaration` and `field_expression`, Ruby instance variables (`@x`, quote the name in a query). Method calls are selectors and member expressions too, so `&field` also lists them.
+
 ### Mapping layer
 
 The mapping is **not** a simple name substitution table. Each abstract type maps to **structural patterns** per language — because some variants require different tree shapes.

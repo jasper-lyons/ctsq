@@ -11,7 +11,7 @@ use std::collections::HashSet;
 pub const ABSTRACT_TYPES: &[&str] = &[
     "id", "function", "call", "class", "module", "type", "var", "variable",
     "const", "param", "import", "literal", "block", "if", "for", "while",
-    "switch", "op",
+    "switch", "op", "field",
 ];
 
 /// Every language, in canonical form (tsx included — it adds JSX call forms).

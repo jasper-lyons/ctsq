@@ -56,6 +56,16 @@ impl Lang for JsLang {
             "while" => Some(vec![simple("while_statement")]),
             "switch" => Some(vec![simple("switch_statement")]),
             "op" => Some(vec![simple("binary_expression")]),
+            // Class fields are declarations, `a.b` property reads and writes are accesses.
+            "field" => Some(match sigil {
+                Some(Sigil::Def) => vec![field_at("field_definition", "property", "property_identifier", &[])],
+                Some(Sigil::Ref) => vec![field_at("member_expression", "property", "property_identifier", &[])],
+                None => {
+                    let mut v = vec![field_at("field_definition", "property", "property_identifier", &[])];
+                    v.extend(vec![field_at("member_expression", "property", "property_identifier", &[])]);
+                    v
+                }
+            }),
             "call" | "module" => Some(vec![]),
             _ => None,
         }
@@ -234,6 +244,18 @@ fn identifier() -> TsVariant {
         always_constraint: None,
         parent_name_wrap: None, always_callee_eq: None,
     }
+}
+
+/// A field node whose name is the `name_node` child reached through
+/// `name_field` and `path`. The match lands on the declaration or access, and
+/// attribute filters read the field name back off it.
+fn field_at(
+    node: &'static str,
+    name_field: &'static str,
+    name_node: &'static str,
+    path: &'static [(&'static str, &'static str)],
+) -> TsVariant {
+    TsVariant { name_field: Some(name_field), name_node, name_path: path, ..simple(node) }
 }
 
 fn simple(node: &'static str) -> TsVariant {
