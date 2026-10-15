@@ -1,0 +1,15 @@
+# Go flow mechanics. Each key lists tree-sitter node kinds.
+[outside]
+module_file = "go.mod"
+
+[nodes]
+assign    = ["short_var_declaration", "assignment_statement", "var_spec"]
+call      = ["call_expression"]
+return    = ["return_statement"]
+field     = ["selector_expression"]
+param     = ["parameter_declaration"]
+import    = ["import_spec"]
+branch    = ["if_statement", "expression_switch_statement", "type_switch_statement", "select_statement"]
+loop      = ["for_statement"]
+assert    = ["type_assertion_expression"]
+composite = ["composite_literal"]

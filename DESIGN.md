@@ -290,3 +290,48 @@ Proof-of-concept compiler targeting JavaScript and C:
 3. `(&function#malloc @f).params(var#ARRAY_SIZE @v)` over C → matches the specific call pattern
 4. Same query over Python → empty result, no error
 5. `arrow_function` over JS → passes through, matches `arrow_function` nodes directly
+
+# Config and models
+
+Flow mechanics and outside-call models are data, not Rust. Both are TOML (decision 21).
+
+## Lookup order
+
+Highest priority first, and the first match wins:
+
+1. repo `.ctsq/`
+2. `$XDG_CONFIG_HOME/ctsq`, else `~/.config/ctsq`
+3. `$XDG_CACHE_HOME/ctsq`, else `~/.cache/ctsq` (generated, safe to delete, nothing writes it in v1)
+4. built-in defaults compiled in with `include_str!` from `config/`
+
+Under each root: `languages/<lang>.toml` (mechanics) and `models/<lang>/*.toml` (models).
+
+## Mechanics
+
+`languages/<lang>.toml` has `[outside]` (`module_file`) and `[nodes]` (`assign`, `call`, `return`, `field`, `param`, `import`, `branch`, `loop`, `assert`, `composite`), each a list of tree-sitter node kinds. Layers merge per key, so a repo file that sets only `nodes.loop` leaves the rest as built in. The flow engine reads these keys and hard-codes no node names.
+
+## Models
+
+Each table name is a qualified name: `importpath.Name`, or `(*importpath.Type).Method` for methods. Fields:
+
+- `pass`: list of `"from -> to"`. From is an argument index, `*` (every argument) or `receiver`. To is an argument index, `receiver` or `return`.
+- `clear`: the value stops being tracked.
+- `whole`: the call uses every field of its arguments.
+- `source`: the named slot receives a fresh tracked value (`"return"`).
+- `template = { data_arg = N }`: the call renders a template with that data.
+- `template_load = { fs_arg, names_from, text_arg }`: the call loads templates.
+
+A malformed file reports file, line and key and exits 2. Unknown fields are errors.
+
+## Versions
+
+A file named `name@1.23.toml` is versioned. The `go` line of the nearest `go.mod` picks the highest version not above it (`go 1.23.4` reads as 1.23), falls back to the lowest shipped when the module is older than all of them, and to the highest when there is no go.mod. This applies in every root, not only the built-in set.
+
+## Outside the codebase
+
+For Go, a call is outside when the import path is neither the module path from `go.mod` nor under it (`config::gomod::is_outside`). A call with no model is assumed to derive its return value from its arguments and is tagged `unmodelled`.
+
+## Commands
+
+- `ctsq config path` prints the four locations in lookup order.
+- `ctsq config dump <lang>` prints the merged mechanics, the selected Go version and the model count per source.
