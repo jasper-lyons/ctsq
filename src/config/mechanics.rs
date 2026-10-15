@@ -66,6 +66,20 @@ pub struct Nodes {
     pub loop_clause: Vec<String>,
     /// Element store such as `m[k]`, assigning through it follows the collection.
     pub index: Vec<String>,
+    /// Channel send statement. Data sent stops the walk (decision 12).
+    pub send: Vec<String>,
+    /// Declaration that, at the top of a file, makes package-level variables.
+    pub global: Vec<String>,
+    /// Map type node, so an element store through it is a shared stop.
+    pub map_type: Vec<String>,
+    /// `key: value` element of a composite literal.
+    pub keyed: Vec<String>,
+    /// Wrapper around one element, key or value of a composite literal.
+    pub element: Vec<String>,
+    /// Conversion `T(x)`, which is a call when `T` is a generic instantiation.
+    pub conversion: Vec<String>,
+    /// Generic instantiation such as `F[T]` in type position.
+    pub generic: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -103,6 +117,17 @@ pub struct Fields {
     pub field: Vec<String>,
     /// Name of a function or type declaration.
     pub name: Vec<String>,
+    /// Type of a field declaration, composite literal, conversion or generic.
+    #[serde(rename = "type")]
+    pub ty: Vec<String>,
+    /// Struct tag of a field declaration.
+    pub tag: Vec<String>,
+    /// Key of a keyed composite element.
+    pub key: Vec<String>,
+    /// Value of a keyed composite element or a channel send.
+    pub value: Vec<String>,
+    /// Channel of a send statement.
+    pub channel: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

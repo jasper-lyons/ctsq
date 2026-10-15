@@ -17,7 +17,7 @@ use super::{segment_rows, split_query};
 use crate::config::{self, gomod, LangConfig};
 use crate::flow::{
     self, analyse_function, analyse_function_with, enclosing_function, start_at, start_in, CallEffect, CallSite,
-    EndFn, FlowCtx, FlowResult, Hop, ModelOutside, Outside, StartKind,
+    EndFn, FlowCtx, FlowResult, Hop, ModelOutside, Module, Outside, Paths, StartKind,
 };
 use crate::query::ast::{Combinator, Query};
 use crate::resolve::go::{binding_type_qualified, go_imports, go_signatures, GoSignature};
@@ -126,7 +126,13 @@ pub fn evaluate_flows(
         is_outside_call(n, f, src, file, module.as_deref(), &imports_cache)
     };
 
-    let walk = Walk::new(store, graph, &cfg, &is_end, eventually, opts.max);
+    let files: Vec<(&str, Node, &[u8])> = store
+        .iter()
+        .filter(|(_, pf)| pf.lang == "go")
+        .filter_map(|(f, pf)| pf.tree.as_ref().map(|t| (f, t.root_node(), pf.source.as_slice())))
+        .collect();
+    let module = Module::build(&files, &cfg.mechanics);
+    let walk = Walk::new(store, graph, &cfg, &module, &is_end, eventually, opts.max);
     let mut groups: Vec<FlowResult> = vec![];
     let mut raw: Vec<FlowResult> = vec![];
 
@@ -139,7 +145,7 @@ pub fn evaluate_flows(
         if pf.lang != "go" {
             continue;
         }
-        let cx = FlowCtx { file: &file, src: &pf.source, root: tree.root_node(), mech: &cfg.mechanics };
+        let cx = FlowCtx { file: &file, src: &pf.source, root: tree.root_node(), mech: &cfg.mechanics, module: &module };
         for r in &rows {
             let Some(start) = start_in(&cx, r.start_byte, r.end_byte) else { continue };
             match &start.kind {
@@ -168,7 +174,13 @@ pub fn evaluate_flows(
                     for (ffile, func_byte) in field_users(store, &cfg, name) {
                         let Some(fpf) = store.get(&ffile) else { continue };
                         let Some(ftree) = &fpf.tree else { continue };
-                        let fcx = FlowCtx { file: &ffile, src: &fpf.source, root: ftree.root_node(), mech: &cfg.mechanics };
+                        let fcx = FlowCtx {
+                            file: &ffile,
+                            src: &fpf.source,
+                            root: ftree.root_node(),
+                            mech: &cfg.mechanics,
+                            module: &module,
+                        };
                         let Some(func) = enclosing_function(fcx.root, fcx.mech, func_byte) else { continue };
                         let res = walk.run(&ffile, || analyse_function(&fcx, func, &decl, walk.end, &walk));
                         match &mut root {
@@ -223,7 +235,8 @@ fn is_decl_row(cx: &FlowCtx, byte: usize) -> bool {
 }
 
 /// (file, byte inside the function) for every function that reads or writes
-/// a field called `name`, once per function, in file order.
+/// a field called `name`, by a selector or a keyed composite element, once
+/// per function, in file order.
 fn field_users(store: &TreeStore, cfg: &LangConfig, name: &str) -> Vec<(String, usize)> {
     let m = &cfg.mechanics;
     let mut out = vec![];
@@ -236,13 +249,17 @@ fn field_users(store: &TreeStore, cfg: &LangConfig, name: &str) -> Vec<(String, 
         let mut stack = vec![tree.root_node()];
         let mut hits: Vec<(usize, usize)> = vec![];
         while let Some(n) = stack.pop() {
-            if config::Mechanics::is(&m.nodes.field, n.kind()) {
-                let field = m.fields.field.iter().find_map(|f| n.child_by_field_name(f));
-                if field.is_some_and(|f| f.utf8_text(&pf.source).unwrap_or("") == name) {
-                    if let Some(func) = enclosing_function(tree.root_node(), m, n.start_byte()) {
-                        if seen.insert(func.start_byte()) {
-                            hits.push((func.start_byte(), n.start_byte()));
-                        }
+            let field = if config::Mechanics::is(&m.nodes.field, n.kind()) {
+                m.fields.field.iter().find_map(|f| n.child_by_field_name(f))
+            } else if config::Mechanics::is(&m.nodes.keyed, n.kind()) {
+                m.fields.key.iter().find_map(|f| n.child_by_field_name(f))
+            } else {
+                None
+            };
+            if field.is_some_and(|f| f.utf8_text(&pf.source).unwrap_or("") == name) {
+                if let Some(func) = enclosing_function(tree.root_node(), m, n.start_byte()) {
+                    if seen.insert(func.start_byte()) {
+                        hits.push((func.start_byte(), n.start_byte()));
                     }
                 }
             }
@@ -266,9 +283,18 @@ fn is_outside_call(
     module: Option<&str>,
     cache: &RefCell<HashMap<String, HashMap<String, String>>>,
 ) -> bool {
-    let Some(operand) = f.child_by_field_name("operand") else { return false };
-    if operand.kind() != "identifier" {
-        return false;
+    let Some(mut operand) = f.child_by_field_name("operand") else { return false };
+    // `json.NewEncoder(w).Encode` is outside when `json` is.
+    while operand.kind() != "identifier" {
+        let next = match operand.kind() {
+            "call_expression" => operand.child_by_field_name("function"),
+            "selector_expression" => operand.child_by_field_name("operand"),
+            _ => None,
+        };
+        match next {
+            Some(n) => operand = n,
+            None => return false,
+        }
     }
     let mut root = n;
     while let Some(p) = root.parent() {
@@ -308,6 +334,10 @@ fn retag(h: &mut Hop) {
 /// and also along its returns when the caller's hop is kept, so a route
 /// through a function that hands the value back shows that function.
 fn prune(h: &Hop, end: &str, eventually: bool, depth: usize, need_return: bool) -> Option<Hop> {
+    // A stop at shared state is kept with its reader rows (decision 12).
+    if h.tags.iter().any(|t| t.starts_with("stopped:")) {
+        return Some(h.clone());
+    }
     let is_end = h.has(end) && (eventually || depth == 1);
     let mut kept: Vec<Option<Hop>> = h
         .children
@@ -362,6 +392,7 @@ struct Walk<'a> {
     store: &'a TreeStore,
     graph: &'a CallGraph,
     cfg: &'a LangConfig,
+    module: &'a Module,
     models: ModelOutside<'a>,
     /// Whether calls are followed into callees (`==>`).
     follow: bool,
@@ -373,8 +404,9 @@ struct Walk<'a> {
     files: RefCell<Vec<String>>,
     /// (def, tracked parameter positions) being walked, to stop recursion.
     active: RefCell<Vec<(usize, Vec<usize>)>>,
-    /// Effects already worked out, by file, call start and tracked arguments.
-    memo: RefCell<HashMap<(String, usize, Vec<usize>, bool), CallEffect>>,
+    /// Effects already worked out, by file, call start, tracked arguments and
+    /// their field paths.
+    memo: RefCell<HashMap<(String, usize, Vec<usize>, bool, String), CallEffect>>,
     /// The end predicate, used inside callees too.
     end: &'a EndFn<'a>,
 }
@@ -384,6 +416,7 @@ impl<'a> Walk<'a> {
         store: &'a TreeStore,
         graph: &'a CallGraph,
         cfg: &'a LangConfig,
+        module: &'a Module,
         end: &'a EndFn<'a>,
         follow: bool,
         max: usize,
@@ -398,6 +431,7 @@ impl<'a> Walk<'a> {
             store,
             graph,
             cfg,
+            module,
             models: ModelOutside::new(cfg),
             follow,
             max,
@@ -430,31 +464,41 @@ impl<'a> Walk<'a> {
         list.iter().find(|s| s.line == line).cloned()
     }
 
-    /// Walk callee `def` from the parameters at `positions` (and the
-    /// receiver when `recv`). None when no parameter can be named.
-    fn into_callee(&self, def: usize, positions: &[usize], recv: bool) -> Option<FlowResult> {
+    /// Walk callee `def` from the parameters that receive the tracked
+    /// arguments of `site` (and its receiver when tracked), each holding the
+    /// data where its argument held it. None when no parameter can be named.
+    fn into_callee(&self, def: usize, site: &CallSite) -> Option<FlowResult> {
         let d = &self.graph.index.defs[def];
         let sig = self.signature(&d.id.file, d.id.line)?;
-        let mut params: Vec<&crate::resolve::go::GoParam> = vec![];
-        for &i in positions {
+        let mut params: Vec<(&crate::resolve::go::GoParam, Paths)> = vec![];
+        for (k, &i) in site.tracked_args.iter().enumerate() {
             let p = sig.params.get(i).or_else(|| sig.params.last().filter(|p| p.ty.starts_with("...")));
+            let paths = site.arg_paths.get(k).cloned().flatten();
             if let Some(p) = p {
-                if !params.iter().any(|q| q.position == p.position) {
-                    params.push(p);
+                match params.iter_mut().find(|(q, _)| q.position == p.position) {
+                    Some(e) => e.1 = flow::join_paths(&e.1, &paths),
+                    None => params.push((p, paths)),
                 }
             }
         }
-        if recv {
-            params.extend(sig.receiver.as_ref());
+        if site.recv_tracked {
+            params.extend(sig.receiver.as_ref().map(|r| (r, site.recv_paths.clone())));
         }
-        params.retain(|p| !p.name.is_empty() && p.name != "_");
-        let first = params.first()?;
+        params.retain(|(p, _)| !p.name.is_empty() && p.name != "_");
+        let (first, first_paths) = params.first()?;
         let pf = self.store.get(&d.id.file)?;
         let tree = pf.tree.as_ref()?;
-        let cx = FlowCtx { file: &d.id.file, src: &pf.source, root: tree.root_node(), mech: &self.cfg.mechanics };
-        let start = start_at(&cx, first.start_byte, first.end_byte)?;
+        let cx = FlowCtx {
+            file: &d.id.file,
+            src: &pf.source,
+            root: tree.root_node(),
+            mech: &self.cfg.mechanics,
+            module: self.module,
+        };
+        let mut start = start_at(&cx, first.start_byte, first.end_byte)?;
+        start.paths = first_paths.clone();
         let func = enclosing_function(cx.root, cx.mech, first.start_byte)?;
-        let also: Vec<String> = params[1..].iter().map(|p| p.name.clone()).collect();
+        let also: Vec<(String, Paths)> = params[1..].iter().map(|(p, ps)| (p.name.clone(), ps.clone())).collect();
         self.files.borrow_mut().push(d.id.file.clone());
         let r = analyse_function_with(&cx, func, &start, &also, self.end, self);
         self.files.borrow_mut().pop();
@@ -475,7 +519,13 @@ impl<'a> Walk<'a> {
         if !self.follow || depth >= self.max {
             return Some(CallEffect::Via(name));
         }
-        let key = (file.to_string(), site.node.start_byte(), site.tracked_args.clone(), site.recv_tracked);
+        let key = (
+            file.to_string(),
+            site.node.start_byte(),
+            site.tracked_args.clone(),
+            site.recv_tracked,
+            format!("{:?} {:?}", site.arg_paths, site.recv_paths),
+        );
         if let Some(e) = self.memo.borrow().get(&key) {
             return Some(e.clone());
         }
@@ -488,7 +538,7 @@ impl<'a> Walk<'a> {
                 continue;
             }
             self.active.borrow_mut().push(mark);
-            let r = self.into_callee(t, &site.tracked_args, site.recv_tracked);
+            let r = self.into_callee(t, site);
             self.active.borrow_mut().pop();
             if let Some(mut r) = r {
                 walked = true;
@@ -607,6 +657,29 @@ mod tests {
         let b = "package t\nfunc drop(s string) string {\n\treturn \"\"\n}\n";
         let r = eval(&[("t/a.go", a), ("t/b.go", b)], "function#F param#x ==> function#log.Println");
         assert_eq!(r.found, 0, "{}", r.text);
+    }
+
+    #[test]
+    fn an_object_carries_its_field_path_into_and_out_of_callees() {
+        let a = "package t\nimport \"log\"\ntype B struct {\n\tP string\n\tQ string\n}\nfunc F(x string) {\n\tb := B{P: x}\n\tc := keep(b)\n\tlog.Println(c.Q)\n\tlog.Println(c.P)\n}\n";
+        let b = "package t\nimport \"log\"\nfunc keep(o B) B {\n\tlog.Print(o.Q)\n\tlog.Print(o.P)\n\treturn o\n}\n";
+        let r = eval(&[("t/a.go", a), ("t/b.go", b)], "function#F param#x ==> function#/^Print/");
+        // in the callee only the stored field is a route
+        assert!(r.text.contains("log.Print(o.P)  sink"), "{}", r.text);
+        assert!(!r.text.contains("log.Print(o.Q)"), "{}", r.text);
+        // the returned object still holds P, not Q
+        assert!(r.text.contains("log.Println(c.P)  sink"), "{}", r.text);
+        assert!(!r.text.contains("log.Println(c.Q)"), "{}", r.text);
+        assert_eq!(r.found, 2, "{}", r.text);
+    }
+
+    #[test]
+    fn a_generic_conversion_call_is_walked() {
+        let a = "package t\nimport \"log\"\nfunc F(x string) {\n\tv := Id[string](x)\n\tlog.Println(v)\n}\nfunc Id[T any](v T) T {\n\treturn v\n}\n";
+        let r = eval(&[("t/a.go", a)], "function#F param#x ==> function#log.Println");
+        assert!(r.text.contains("v := Id[string](x)  derived, via Id"), "{}", r.text);
+        assert!(r.text.contains("func Id[T any](v T) T {  moved"), "{}", r.text);
+        assert_eq!(r.found, 1, "{}", r.text);
     }
 
     #[test]

@@ -126,7 +126,8 @@ mod tests {
     /// Run from `ident` after `anchor` through `F` with models from `cfg`.
     fn run_cfg(cfg: &LangConfig, src: &str, anchor: &str, ident: &str, end: &EndFn) -> FlowResult {
         let tree = parse(src);
-        let cx = FlowCtx { file: "a.go", src: src.as_bytes(), root: tree.root_node(), mech: &cfg.mechanics };
+        let md = Module::default();
+        let cx = FlowCtx { file: "a.go", src: src.as_bytes(), root: tree.root_node(), mech: &cfg.mechanics, module: &md };
         let a = src.find(anchor).expect("anchor");
         let sb = a + src[a..].find(ident).expect("ident");
         let start = start_at(&cx, sb, sb + ident.len()).expect("start");
@@ -224,7 +225,8 @@ mod tests {
         let tree = parse(src);
         let d = tmp("method");
         let cfg = cfg_in(&d);
-        let cx = FlowCtx { file: "a.go", src: src.as_bytes(), root: tree.root_node(), mech: &cfg.mechanics };
+        let md = Module::default();
+        let cx = FlowCtx { file: "a.go", src: src.as_bytes(), root: tree.root_node(), mech: &cfg.mechanics, module: &md };
         let sb = src.find("F(t").unwrap() + 2;
         let start = start_at(&cx, sb, sb + 1).unwrap();
         let f = enclosing_function(cx.root, &cfg.mechanics, sb).unwrap();
@@ -260,7 +262,9 @@ mod tests {
             recv_type: None,
             recv_path: recv_path.map(Into::into),
             tracked_args: vec![0],
+            arg_paths: vec![None],
             recv_tracked: false,
+            recv_paths: None,
             whole_args: vec![],
             local: false,
         };

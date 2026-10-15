@@ -474,3 +474,40 @@ The language config is loaded from the repo root of the first scanned path. The 
 2. `--only` keeps hops whose tags include one of the given tags, matched whole or by first word (`via` keeps `via normalise`, `conditional` keeps `conditional@4`), with their ancestors.
 3. Rows use `print::row`, two spaces per level. The trailer is `N routes to sink` (or `N routes to outside` with no end), then the unmodelled-ends line counted before pruning.
 4. Exit 0 when at least one end is found, 1 when none, 2 on errors.
+
+# Object tracking
+
+Decision 12 (follow the object) and 13 (reflection moves whole objects). Code in `src/flow/objects.rs` and the field, composite and store handling of `src/flow/engine.rs`.
+
+## Field paths
+
+1. Every tracked variable carries `Paths`: `None` when the variable holds the data itself, or a list of field paths such as `[["CustomerPhone"]]` when it is an object holding the data in those fields.
+2. A store `o.A.B = x` tracks `o` with `[A, B]` put in front of `x`'s paths, joined with what `o` already held. A composite literal `T{F: x}`, `&T{F: x}` or positional `T{x}` gives an object with `[F]` in front of `x`'s paths. A map or slice literal keeps the element's paths.
+3. A read `o.F` keeps the paths that begin with `F`, minus `F`. An empty remainder means the read is the data, `exact` when `o` was. A read of another field is not tracked. A read of a value tracked as itself stays tracked, as before.
+4. The receiver of a method call is its operand, so `rv.Field(i)` is not a read of a field called `Field`.
+5. Paths travel with calls: `CallSite.arg_paths` and `recv_paths` give each tracked argument's paths, the callee parameter starts with them (`Start.paths`, the `also` pairs of `analyse_function_with`), and a call whose callee returns tracked data gives its result the arguments' paths. Effects are memoised per paths too.
+6. Any call that receives an object holding tracked data counts it as tracked, so an end call or a `whole` model (`fmt.Printf`, `(*encoding/json.Encoder).Encode`) fires on the object.
+7. In a field start, a write of the start field (`T{F: x}` or `o.F = x` on the owner type) makes the object hold the field, and `field_users` also walks functions with a keyed element of that name.
+
+## Embedded structs
+
+`flow::Module` indexes every struct declaration of the scanned files from `type_decl` and `field_decl`: field names, base types, struct tags, and embedded fields (a field declaration with no name, named by its type). A path step that is an embedded struct name is skipped when the next read is a promoted field, so `ab.CustomerPhone` reads `ab.Booking.CustomerPhone`. A field start whose owner is `Booking` reads `ab.CustomerPhone` when `ab`'s type embeds `Booking` at any depth.
+
+## Shared stops
+
+1. Storing tracked data into a map element, a package-level variable (or its field), or sending it on a channel stops that branch. The row is tagged `stopped: shared map`, `stopped: shared global` or `stopped: shared channel` and nothing is tracked past it.
+2. A map is a package-level variable whose type or value is a map, or a local declared with a map type, a map literal or `make(map...)`. A package-level variable is one declared at the top of a scanned file and not declared again in the function.
+3. For a package-level variable, every other function that names it is listed as a child row (`path:line` and function name), and the stop row adds `N readers`. Pruning keeps stop rows with their readers.
+4. Mechanics keys: `send`, `global`, `map_type`, `keyed`, `element`, `conversion`, `generic` nodes, and `type`, `tag`, `key`, `value`, `channel` fields.
+
+## Generics
+
+`F[T](a, b)` parses as a call of an index expression and `F[T](x)` as a conversion to a generic type. The engine drops the type arguments in both and calls `F`, and the Go resolver records the conversion form as a call site, so both resolve to the generic definition. The callee is walked by parameter name whatever `T` is.
+
+## Struct tags
+
+When a hop reads or writes a field with a struct tag, the row gets `tag <tag>`, as `tag json:"phone"`. The owner type comes from the operand's binding type, else from the one struct that declares the field name (or the tag every declaring struct agrees on).
+
+## Constructor receivers
+
+A method called on `pkg.NewT(...)` gets the receiver type `path.T`, so `json.NewDecoder(r.Body).Decode(&v)` finds the `Decoder` model and moves the body into `v`. With no end selector, a call on such a chain is outside when `pkg` is.

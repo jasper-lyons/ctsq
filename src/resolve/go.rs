@@ -343,6 +343,21 @@ fn walk_scope(node: Node, source: &[u8], s: &mut FileScope, fn_stack: &mut Vec<u
             }
             // fall through: arguments and receivers may contain calls
         }
+        // `F[T](x)` parses as a conversion to a generic type: it calls `F`.
+        "type_conversion_expression" => {
+            if let (Some(&f), Some(callee)) = (fn_stack.last(), generic_conversion_callee(node, source)) {
+                let args = node.child_by_field_name("operand")
+                    .map(|a| vec![(a.start_byte(), a.end_byte())])
+                    .unwrap_or_default();
+                s.fns[f].calls.push(CallRec {
+                    callee,
+                    line: node.start_position().row + 1,
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
+                    args,
+                });
+            }
+        }
         _ => {}
     }
     walk_children(node, source, s, fn_stack);
@@ -471,6 +486,21 @@ fn new_convention_type(callee: &Callee) -> Option<String> {
     ty.chars().next()
         .filter(|c| c.is_uppercase())
         .map(|_| ty.to_string())
+}
+
+/// The function a `F[T](x)` conversion calls: `F`, or `pkg.F` for a
+/// qualified generic. None for any other conversion.
+fn generic_conversion_callee(node: Node, source: &[u8]) -> Option<Callee> {
+    let ty = node.child_by_field_name("type").filter(|t| t.kind() == "generic_type")?;
+    let base = ty.child_by_field_name("type")?;
+    match base.kind() {
+        "type_identifier" => Some(Callee::Bare(text(base, source).to_string())),
+        "qualified_type" => Some(Callee::Method {
+            receiver: Receiver::Var(text(base.child_by_field_name("package")?, source).to_string()),
+            name: text(base.child_by_field_name("name")?, source).to_string(),
+        }),
+        _ => None,
+    }
 }
 
 fn classify_call(node: Node, source: &[u8]) -> Option<Callee> {
@@ -1080,6 +1110,16 @@ mod tests {
         ]);
         let (file, line, conf) = target_of(&results, "Go", "helper").unwrap();
         assert_eq!((file.as_str(), line, conf), ("a/a.go", 2, Confidence::Exact));
+    }
+
+    #[test]
+    fn generic_calls_with_type_arguments_resolve() {
+        let results = resolve_all(&[(
+            "a/a.go",
+            "package a\nfunc Extract[T any](r int) T { var v T; return v }\nfunc JSON[T any](w int, v T) {}\nfunc Go() {\n\tf := Extract[string](1)\n\tJSON[string](1, f)\n}\n",
+        )]);
+        assert_eq!(target_of(&results, "Go", "Extract").map(|t| t.1), Some(2));
+        assert_eq!(target_of(&results, "Go", "JSON").map(|t| t.1), Some(3));
     }
 
     #[test]
