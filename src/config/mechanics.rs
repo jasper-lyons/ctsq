@@ -128,6 +128,8 @@ pub struct Fields {
     pub value: Vec<String>,
     /// Channel of a send statement.
     pub channel: Vec<String>,
+    /// Parameter list of a function literal.
+    pub params: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

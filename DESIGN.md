@@ -511,3 +511,25 @@ When a hop reads or writes a field with a struct tag, the row gets `tag <tag>`, 
 ## Constructor receivers
 
 A method called on `pkg.NewT(...)` gets the receiver type `path.T`, so `json.NewDecoder(r.Body).Decode(&v)` finds the `Decoder` model and moves the body into `v`. With no end selector, a call on such a chain is outside when `pkg` is.
+
+# Function values and closures
+
+The cross-function walk follows calls whose callee is not a declared function name. `semantic::flows` resolves function-valued variables, `flow::engine` walks function literals.
+
+## Function-valued variables
+
+1. A call `send(x)` whose callee is a plain name that the enclosing top-level function declares (`f := helper`, `var f = helper`) counts the assignments to that name before the call, literals included. A parameter of function type has none and falls back to the call graph.
+2. A name the function does not declare, and that is a package-level variable, counts every assignment in the scanned module: its `var` spec and each `name = value` inside functions that do not declare the name themselves. Files ending in `_test.go` are skipped, so a test that swaps the function does not count.
+3. Exactly one assignment whose value names a function in the repo (`sendEmail`, or `pkg.SendEmail` when the name is unique) is walked like a direct call. The call's hop is tagged `moved, via <function>` and the callee's signature row hangs under it.
+4. Otherwise the call's hop is tagged `stopped: function value` and the assignments are listed under it as rows, in file order. The result does not carry the data. A single local assignment that names no function (a method value, say) falls back to the call graph instead.
+
+## Closures
+
+1. A function literal is walked from the statement holding it when it is called in place (`func() { ... }()`, also under `go` and `defer`), passed as an argument of a call, or returned. A literal assigned to a variable is not walked.
+2. The walk enters a literal only when its body reads a tracked variable of the enclosing scope, or when, called in place, it receives a tracked argument. Its own parameters shadow outer names.
+3. The literal's line is a hop tagged `moved, closure`. Inside the body the captured variables and the bound parameters are tracked from that hop, so the body's hops hang under it. Changes the body makes to the state stay inside it.
+4. A returned literal makes the function return its captured data, so `Template(name, data)` returning a handler that passes `data` to `fmt.Fprintf` carries the caller's value into the handler body, and the caller's result carries it too.
+
+## Interfaces
+
+A method call whose call graph targets are all interface method signatures (no implementation in the scanned files) is tagged `stopped: interface`. A call with several implementations keeps one walk per target, tagged `widened`.

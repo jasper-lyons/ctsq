@@ -481,7 +481,7 @@ impl<'a, 't> Walker<'a, 't> {
         } else if self.is(&m.nodes.loop_, n) {
             self.lp(n, st);
         } else if self.is(&m.nodes.function, n) {
-            // Closures are not walked.
+            // A literal is walked by `closures` from the statement holding it.
         } else {
             self.leaf(n, st);
         }
@@ -491,6 +491,16 @@ impl<'a, 't> Walker<'a, 't> {
         let p = self.pending_in(n);
         if p == Some(false) {
             self.begin(st);
+        }
+        // A declaration list is walked spec by spec, each spec finds its own literals.
+        let wrapper = !self.is(&self.m.nodes.assign, n) && self.holds_assign(n);
+        let returned = if wrapper { vec![] } else { self.closures(n, st) };
+        if !returned.is_empty() {
+            // A returned closure hands its captured data to the caller.
+            self.returns = true;
+            for id in returned {
+                self.hops[id].returns = true;
+            }
         }
         if self.is(&self.m.nodes.assign, n) {
             self.assign(n, st, false);
@@ -533,6 +543,115 @@ impl<'a, 't> Walker<'a, 't> {
             self.is(&self.m.nodes.assign, c)
                 || (!self.is(&self.m.nodes.function, c) && !self.is(&self.m.nodes.call, c) && self.holds_assign(c))
         })
+    }
+
+    /// Function literals in statement `n` that the walk enters: the callee of
+    /// a call (Some(call)), an argument of a call, or a returned value (true).
+    /// Literals inside other literals are found when their parent is walked.
+    fn literals(&self, n: Node<'t>) -> Vec<(Node<'t>, Option<Node<'t>>, bool)> {
+        let m = self.m;
+        let mut out = vec![];
+        let mut stack = named(n);
+        stack.reverse();
+        while let Some(x) = stack.pop() {
+            if !self.is(&m.nodes.function, x) {
+                let mut c = named(x);
+                c.reverse();
+                stack.extend(c);
+                continue;
+            }
+            let Some(p) = x.parent() else { continue };
+            let is_call = |c: Node| self.is(&m.nodes.call, c);
+            if is_call(p) && kids(p, &m.fields.function).iter().any(|f| f.id() == x.id()) {
+                out.push((x, Some(p), false));
+            } else if p.parent().is_some_and(|c| is_call(c) && kids(c, &m.fields.arguments).iter().any(|a| a.id() == p.id()))
+            {
+                out.push((x, None, false));
+            } else if self.is(&m.nodes.return_, p)
+                || (self.is(&m.nodes.list, p) && p.parent().is_some_and(|r| self.is(&m.nodes.return_, r)))
+            {
+                out.push((x, None, true));
+            }
+        }
+        out
+    }
+
+    /// Parameter names of a function literal, one per position.
+    fn literal_params(&self, lit: Node<'t>) -> Vec<String> {
+        let mut out = vec![];
+        for list in kids(lit, &self.m.fields.params) {
+            for d in named(list) {
+                let names = kids(d, &self.m.fields.name);
+                if names.is_empty() {
+                    out.push(String::new());
+                }
+                for nm in names {
+                    out.push(self.t(nm).to_string());
+                }
+            }
+        }
+        out
+    }
+
+    /// Walk the body of each literal `literals` finds in `n` that captures a
+    /// tracked variable or, called in place, receives a tracked argument. The
+    /// literal's line becomes a hop tagged `moved, closure` and the captured
+    /// variables are tracked from it inside the body. Returns the hops of
+    /// literals in return position.
+    fn closures(&mut self, n: Node<'t>, st: &State) -> Vec<usize> {
+        let m = self.m;
+        let mut returned = vec![];
+        for (lit, call, ret) in self.literals(n) {
+            let Some(body) = kids(lit, &m.fields.body).first().copied() else { continue };
+            let params = self.literal_params(lit);
+            let mut inner = st.clone();
+            for p in &params {
+                inner.remove(p);
+            }
+            let mut captured: Vec<String> = vec![];
+            let mut stack = vec![body];
+            while let Some(x) = stack.pop() {
+                if self.is(&m.nodes.name, x) {
+                    let t = self.t(x);
+                    if inner.contains_key(t) && !captured.iter().any(|c| c == t) {
+                        captured.push(t.to_string());
+                    }
+                }
+                stack.extend(named(x));
+            }
+            let mut bound: Vec<(String, Val)> = vec![];
+            if let Some(c) = call {
+                let (_, args) = self.call_parts(c);
+                for (i, a) in args.iter().enumerate() {
+                    let v = self.eval(*a, st);
+                    match params.get(i) {
+                        Some(p) if v.carry.is_some() && !p.is_empty() && p != "_" => bound.push((p.clone(), v)),
+                        _ => {}
+                    }
+                }
+            }
+            let from = captured
+                .iter()
+                .filter_map(|c| inner.get(c))
+                .map(|v| Val { carry: Some(v.origin), used: Some(v.origin), cond: v.cond, ..Val::default() })
+                .chain(bound.iter().map(|(_, v)| Val { carry: v.carry, used: v.used, cond: v.cond, ..Val::default() }))
+                .next();
+            let Some(from) = from else { continue };
+            let id = self.hop(body, &from, &["moved".into(), "closure".into()]);
+            for c in &captured {
+                if let Some(v) = inner.get_mut(c) {
+                    v.origin = id;
+                }
+            }
+            for (p, v) in bound {
+                inner.insert(p, Var { origin: id, cond: v.cond, paths: v.paths });
+            }
+            self.walk_stmt(body, &mut inner);
+            if ret {
+                returned.push(id);
+            }
+        }
+        returned
     }
 
     fn flat(&self, ns: Vec<Node<'t>>) -> Vec<Node<'t>> {
@@ -1262,6 +1381,10 @@ impl<'a, 't> Walker<'a, 't> {
         if tracked_args.is_empty() && !recv_tracked && whole_args.is_empty() {
             return out;
         }
+        if func.is_some_and(|f| self.is(&m.nodes.function, f)) {
+            // A literal called in place: its body was walked by `closures`.
+            return out;
+        }
         let is_end = (self.is_end)(n, self.cx.src);
         if !tracked_args.is_empty() && is_end {
             out.calls += 1;
@@ -1355,6 +1478,12 @@ impl<'a, 't> Walker<'a, 't> {
                 }
                 out.via.get_or_insert(name);
                 out.trees.extend(trees);
+            }
+            CallEffect::Stop { tag, rows } => {
+                if !out.extra.contains(&tag) {
+                    out.extra.push(tag);
+                }
+                out.trees.extend(rows);
             }
             CallEffect::Model { pass, .. } => {
                 let all: Vec<usize> = (0..args.len()).collect();

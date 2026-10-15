@@ -22,7 +22,7 @@ use crate::flow::{
 use crate::query::ast::{Combinator, Query};
 use crate::resolve::go::{binding_type_qualified, go_imports, go_signatures, GoSignature};
 use crate::resolve::graph::CallGraph;
-use crate::resolve::{DefIndex, TreeStore};
+use crate::resolve::{DefIndex, DefKind, TreeStore};
 
 #[derive(Debug, Clone)]
 pub struct FlowOptions {
@@ -511,13 +511,25 @@ impl<'a> Walk<'a> {
         if targets.is_empty() {
             return None;
         }
+        if site.method.is_some()
+            && targets.iter().all(|&t| matches!(self.graph.index.defs[t].kind, DefKind::InterfaceMethod { .. }))
+        {
+            // An interface with no implementation in the scanned files.
+            return Some(CallEffect::Stop { tag: "stopped: interface".into(), rows: vec![] });
+        }
         let name = match (&site.recv_type, &site.method) {
             (Some(t), Some(m)) => format!("{}.{}", t, m),
             _ => site.callee.clone(),
         };
+        Some(self.walk_targets(site, file, &targets, name))
+    }
+
+    /// Walk each of `targets` from the tracked arguments of `site`, or give
+    /// `Via(name)` when calls are not followed here.
+    fn walk_targets(&self, site: &CallSite, file: &str, targets: &[usize], name: String) -> CallEffect {
         let depth = self.active.borrow().len();
         if !self.follow || depth >= self.max {
-            return Some(CallEffect::Via(name));
+            return CallEffect::Via(name);
         }
         let key = (
             file.to_string(),
@@ -527,12 +539,12 @@ impl<'a> Walk<'a> {
             format!("{:?} {:?}", site.arg_paths, site.recv_paths),
         );
         if let Some(e) = self.memo.borrow().get(&key) {
-            return Some(e.clone());
+            return e.clone();
         }
         let mut trees = vec![];
         let mut returns = false;
         let mut walked = false;
-        for &t in &targets {
+        for &t in targets {
             let mark = (t, site.tracked_args.clone());
             if self.active.borrow().contains(&mark) {
                 continue;
@@ -553,7 +565,204 @@ impl<'a> Walk<'a> {
         }
         let effect = if walked { CallEffect::Into { name, returns, trees } } else { CallEffect::Via(name) };
         self.memo.borrow_mut().insert(key, effect.clone());
-        Some(effect)
+        effect
+    }
+
+    /// A call through a variable holding a function (`send(x)` after
+    /// `var send = sendEmail` or `f := helper`). None when the callee is not
+    /// such a variable. One assignment that names a function in the repo is
+    /// walked like a direct call. Several assignments, or one whose value is
+    /// not a named function, stop with the assignments as rows.
+    fn fn_value_effect(&self, site: &CallSite, file: &str) -> Option<CallEffect> {
+        if site.method.is_some() || !site.callee.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return None;
+        }
+        let m = &self.cfg.mechanics;
+        let name = site.callee.as_str();
+        let outer = enclosing_function_outermost(site.node, m)?;
+        let mut assigns = vec![];
+        let pf = self.store.get(file)?;
+        let local = declares(outer, &pf.source, m, name);
+        if local {
+            fn_assignments(outer, &pf.source, m, name, Some(site.node.start_byte()), file, &mut assigns);
+        } else if self.module.globals.contains_key(name) {
+            for (f, fpf) in self.store.iter() {
+                if fpf.lang != "go" || f.ends_with("_test.go") {
+                    continue;
+                }
+                let Some(tree) = &fpf.tree else { continue };
+                let root = tree.root_node();
+                for top in named(root) {
+                    if config::Mechanics::is(&m.nodes.function, top.kind()) {
+                        if declares(top, &fpf.source, m, name) {
+                            continue;
+                        }
+                    } else if !config::Mechanics::is(&m.nodes.global, top.kind()) {
+                        continue;
+                    }
+                    fn_assignments(top, &fpf.source, m, name, None, f, &mut assigns);
+                }
+            }
+        }
+        if assigns.is_empty() {
+            return None;
+        }
+        if let [a] = assigns.as_slice() {
+            if let Some(def) = self.function_def(&a.value, &a.file) {
+                let target = self.graph.index.defs[def].name.clone();
+                return Some(self.walk_targets(site, file, &[def], target));
+            }
+            if local {
+                // A method value or other binding: the call graph may know it.
+                return None;
+            }
+        }
+        let rows = assigns
+            .iter()
+            .map(|a| Hop {
+                file: a.file.clone(),
+                line: a.line,
+                func: a.func.clone(),
+                text: a.text.clone(),
+                tags: vec![],
+                unmodelled: None,
+                returns: false,
+                into: false,
+                children: vec![],
+            })
+            .collect();
+        Some(CallEffect::Stop { tag: "stopped: function value".into(), rows })
+    }
+
+    /// The function a value names (`sendEmail` or `pkg.SendEmail`), the one in
+    /// the directory of `file` when several share the name.
+    fn function_def(&self, value: &str, file: &str) -> Option<usize> {
+        let name = value.rsplit('.').next()?;
+        let cands: Vec<usize> = self
+            .graph
+            .index
+            .by_name
+            .get(name)?
+            .iter()
+            .copied()
+            .filter(|&i| matches!(self.graph.index.defs[i].kind, DefKind::Function))
+            .filter(|&i| self.graph.index.defs[i].id.file.ends_with(".go"))
+            .collect();
+        let dir = |f: &str| Path::new(f).parent().map(|p| p.to_path_buf());
+        if !value.contains('.') {
+            return cands.iter().copied().find(|&i| dir(&self.graph.index.defs[i].id.file) == dir(file));
+        }
+        match cands.as_slice() {
+            [one] => Some(*one),
+            _ => None,
+        }
+    }
+}
+
+/// One assignment to a function-valued variable.
+struct FnAssign {
+    file: String,
+    line: usize,
+    func: String,
+    /// Source text of the assigned value.
+    value: String,
+    /// Trimmed source line.
+    text: String,
+}
+
+fn named(n: Node) -> Vec<Node> {
+    let mut c = n.walk();
+    n.named_children(&mut c).collect()
+}
+
+fn field_kids<'t>(n: Node<'t>, names: &[String]) -> Vec<Node<'t>> {
+    let mut out = vec![];
+    for f in names {
+        let mut c = n.walk();
+        out.extend(n.children_by_field_name(f, &mut c));
+    }
+    out
+}
+
+/// The top-level function holding `n`, through any literals.
+fn enclosing_function_outermost<'t>(n: Node<'t>, m: &config::Mechanics) -> Option<Node<'t>> {
+    let mut found = None;
+    let mut x = n;
+    while let Some(p) = x.parent() {
+        if config::Mechanics::is(&m.nodes.function, p.kind()) {
+            found = Some(p);
+        }
+        x = p;
+    }
+    found
+}
+
+/// Names bound on the left of assignment node `a`, with the value assigned
+/// to each when the sides pair up.
+fn bound<'t>(a: Node<'t>, m: &config::Mechanics) -> Vec<(Node<'t>, Option<Node<'t>>)> {
+    let flat = |ns: Vec<Node<'t>>| -> Vec<Node<'t>> {
+        ns.into_iter()
+            .flat_map(|x| if config::Mechanics::is(&m.nodes.list, x.kind()) { named(x) } else { vec![x] })
+            .collect()
+    };
+    let lefts = flat(field_kids(a, &m.fields.left));
+    let rights = flat(field_kids(a, &m.fields.right));
+    let pair = lefts.len() == rights.len();
+    lefts.into_iter().enumerate().map(|(i, l)| (l, if pair { Some(rights[i]) } else { None })).collect()
+}
+
+/// Whether function `func` declares `name` itself: a parameter, `:=` or `var`.
+fn declares(func: Node, src: &[u8], m: &config::Mechanics, name: &str) -> bool {
+    let mut stack = vec![func];
+    while let Some(n) = stack.pop() {
+        let is_decl = config::Mechanics::is(&m.nodes.param, n.kind())
+            || (config::Mechanics::is(&m.nodes.assign, n.kind()) && field_kids(n, &m.fields.operator).is_empty());
+        if is_decl && bound(n, m).iter().any(|(l, _)| l.utf8_text(src).unwrap_or("") == name) {
+            return true;
+        }
+        stack.extend(named(n));
+    }
+    false
+}
+
+/// Every assignment to `name` inside `scope`, before byte `before` when given.
+fn fn_assignments(
+    scope: Node,
+    src: &[u8],
+    m: &config::Mechanics,
+    name: &str,
+    before: Option<usize>,
+    file: &str,
+    out: &mut Vec<FnAssign>,
+) {
+    let mut stack = vec![scope];
+    let mut found = vec![];
+    while let Some(n) = stack.pop() {
+        if config::Mechanics::is(&m.nodes.assign, n.kind()) && before.is_none_or(|b| n.start_byte() < b) {
+            for (l, r) in bound(n, m) {
+                if config::Mechanics::is(&m.nodes.name, l.kind()) && l.utf8_text(src).unwrap_or("") == name {
+                    found.push((n, r));
+                }
+            }
+        }
+        stack.extend(named(n));
+    }
+    found.sort_by_key(|(n, _)| n.start_byte());
+    let text = String::from_utf8_lossy(src);
+    for (n, r) in found {
+        let line = n.start_position().row + 1;
+        let func = if config::Mechanics::is(&m.nodes.function, scope.kind()) {
+            flow::function_name(scope, src, m)
+        } else {
+            "var".to_string()
+        };
+        out.push(FnAssign {
+            file: file.to_string(),
+            line,
+            func,
+            value: r.map(|r| r.utf8_text(src).unwrap_or("").to_string()).unwrap_or_default(),
+            text: text.lines().nth(line - 1).unwrap_or("").trim().to_string(),
+        });
     }
 }
 
@@ -569,6 +778,9 @@ impl Outside for Walk<'_> {
             return CallEffect::Pass;
         }
         let file = self.files.borrow().last().cloned().unwrap_or_default();
+        if let Some(e) = self.fn_value_effect(site, &file) {
+            return e;
+        }
         if let Some(e) = self.callee_effect(site, &file) {
             return e;
         }
@@ -679,6 +891,24 @@ mod tests {
         let r = eval(&[("t/a.go", a)], "function#F param#x ==> function#log.Println");
         assert!(r.text.contains("v := Id[string](x)  derived, via Id"), "{}", r.text);
         assert!(r.text.contains("func Id[T any](v T) T {  moved"), "{}", r.text);
+        assert_eq!(r.found, 1, "{}", r.text);
+    }
+
+    #[test]
+    fn literals_called_with_an_argument_or_passed_to_a_call_are_walked() {
+        let a = "package t\nimport \"log\"\nfunc F(x string) {\n\tfunc(s string) {\n\t\tlog.Println(s)\n\t}(x)\n\trun(func() {\n\t\tlog.Println(x)\n\t})\n}\nfunc run(f func()) {}\n";
+        let r = eval(&[("t/a.go", a)], "function#F param#x ==> function#log.Println");
+        assert_eq!(r.found, 2, "{}", r.text);
+        assert!(r.text.contains("func(s string) {  moved, closure"), "{}", r.text);
+        assert!(r.text.contains("run(func() {  moved, closure"), "{}", r.text);
+        assert!(!r.text.contains("unmodelled"), "{}", r.text);
+    }
+
+    #[test]
+    fn a_parameter_of_function_type_is_not_a_function_value_stop() {
+        let a = "package t\nimport \"log\"\nfunc F(x string, f func(string)) {\n\tf(x)\n\tlog.Println(x)\n}\n";
+        let r = eval(&[("t/a.go", a)], "function#F param#x ==> function#log.Println");
+        assert!(!r.text.contains("stopped"), "{}", r.text);
         assert_eq!(r.found, 1, "{}", r.text);
     }
 
