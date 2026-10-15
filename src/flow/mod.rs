@@ -11,6 +11,8 @@ mod objects;
 mod report;
 #[cfg(test)]
 mod tests;
+pub mod upward;
+pub mod values;
 
 // Used by the path and models packages.
 #[allow(unused_imports)]

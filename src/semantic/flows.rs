@@ -16,7 +16,7 @@ use super::print::{plural, row};
 use super::{segment_rows, split_query};
 use crate::config::{self, gomod, LangConfig, Slot};
 use crate::flow::{
-    self, analyse_function, analyse_function_with, enclosing_function, start_at, start_in, CallEffect, CallSite,
+    self, upward, analyse_function, analyse_function_with, enclosing_function, start_at, start_in, CallEffect, CallSite,
     EndFn, FlowCtx, FlowResult, Hop, ModelOutside, Module, Outside, Paths, StartKind,
 };
 use crate::query::ast::{Combinator, Query};
@@ -47,10 +47,17 @@ pub struct FlowReport {
     pub found: usize,
 }
 
-/// A query string that ends in `=>` or `==>` has no end selector. Returns the
-/// query without it and the combinator, or None when it ends otherwise.
+/// A query string that ends in `=>`, `==>`, `<=` or `<==` has no end
+/// selector. Returns the query without it and the combinator, or None when it
+/// ends otherwise.
 pub fn open_end(query: &str) -> Option<(String, Combinator)> {
     let t = query.trim_end();
+    if let Some(head) = t.strip_suffix("<==") {
+        return Some((head.to_string(), Combinator::FlowsFromEventually));
+    }
+    if let Some(head) = t.strip_suffix("<=") {
+        return Some((head.to_string(), Combinator::FlowsFrom));
+    }
     if let Some(head) = t.strip_suffix("==>") {
         return Some((head.to_string(), Combinator::FlowsEventually));
     }
@@ -87,7 +94,10 @@ pub fn evaluate_flows(
     match comb {
         Combinator::Flows | Combinator::FlowsEventually => {}
         Combinator::FlowsFrom | Combinator::FlowsFromEventually => {
-            return Err("reading a flow backwards (<= and <==) is not available yet".into())
+            if split.nots.iter().any(|n| !n.is_empty()) {
+                return Err(":not() is not available in data-flow queries yet".into());
+            }
+            return evaluate_upward(&split.segments[0], tail, comb == Combinator::FlowsFromEventually, store, graph, root, scan, opts);
         }
         _ => return Err("data-flow combinators cannot be mixed with call combinators".into()),
     }
@@ -246,6 +256,111 @@ pub fn evaluate_flows(
             .collect();
         let verb = if ends.len() == 1 { "route ends" } else { "routes end" };
         out.push_str(&format!("{} {} at an unmodelled call: {}\n", ends.len(), verb, list.join(", ")));
+    }
+    Ok(FlowReport { text: out, found })
+}
+
+/// Evaluate `<=` (one step) and `<==` (eventually): the head segment's rows
+/// are the values, the tail segment's rows (if any) are the calls an origin
+/// must be. Each tree prints the value first and its origins nested under
+/// it. Found counts the origins: hops tagged `source...`, or with an end,
+/// the calls the end matched.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_upward(
+    head: &Query,
+    tail: Option<&Query>,
+    eventually: bool,
+    store: &TreeStore,
+    graph: &CallGraph,
+    root: &Path,
+    scan: &Path,
+    opts: &FlowOptions,
+) -> Result<FlowReport, String> {
+    let mut cfg = config::load(root, "go").map_err(|e| e.to_string())?;
+    if let Some(m) = gomod::module_path(scan) {
+        cfg.module_path = Some(m);
+    }
+    let mut ends: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    if let Some(t) = tail {
+        for (file, rows) in segment_rows(t, store)? {
+            ends.insert(file, rows.iter().map(|r| (r.start_byte, r.end_byte)).collect());
+        }
+    }
+    let is_end = |file: &str, call: Node| -> bool {
+        let Some(f) = call.child_by_field_name("function") else { return false };
+        let name = f.child_by_field_name("field").unwrap_or(f);
+        ends.get(file).is_some_and(|rs| rs.iter().any(|&(s, e)| s <= name.start_byte() && name.end_byte() <= e))
+    };
+    let mut up = upward::Up::new(store, graph, Some(&cfg), opts.max);
+    if tail.is_some() {
+        up.end = Some(&is_end);
+    }
+    let mut out = String::new();
+    let (mut found, mut cut, mut groups) = (0, 0, 0);
+    let mut seen: HashSet<(String, usize, String)> = HashSet::new();
+    for (file, rows) in segment_rows(head, store)? {
+        let Some(pf) = store.get(&file) else { continue };
+        let Some(tree) = &pf.tree else { continue };
+        if pf.lang != "go" {
+            continue;
+        }
+        let cx_root = tree.root_node();
+        let mut starts: Vec<Node> = vec![];
+        for r in &rows {
+            let Some(n) = cx_root.descendant_for_byte_range(r.start_byte, r.end_byte) else { continue };
+            // A parameter row names its parameter, a field access its field.
+            let n = match n.kind() {
+                "parameter_declaration" | "variadic_parameter_declaration" => n.child_by_field_name("name").unwrap_or(n),
+                _ => n,
+            };
+            if n.kind() != "identifier" {
+                continue;
+            }
+            let func = upward::function_at(cx_root, n.start_byte()).map(|f| f.start_byte()).unwrap_or(0);
+            if seen.insert((file.clone(), func, upward::text(n, &pf.source).to_string())) {
+                starts.push(n);
+            }
+        }
+        for n in starts {
+            let Some(mut h) = up.start(&file, n) else { continue };
+            if !eventually {
+                h = upward::truncate(&h, 1);
+            }
+            if tail.is_some() {
+                match upward::prune_to_end(&h) {
+                    Some(p) => h = p,
+                    None => continue,
+                }
+            }
+            if !opts.only.is_empty() {
+                match only(&h, &opts.only, true) {
+                    Some(o) if !o.children.is_empty() || o.tags.iter().any(|t| tag_matches(t, &opts.only)) => h = o,
+                    _ => continue,
+                }
+            }
+            groups += 1;
+            let hops = h.walk();
+            found += if tail.is_some() {
+                hops.iter().filter(|x| x.has(upward::END)).count()
+            } else {
+                hops.iter().filter(|x| x.tags.iter().any(|t| t.starts_with("source"))).count()
+            };
+            cut += hops.iter().filter(|x| x.has(MAX_DEPTH)).count();
+            print_tree_with(&h, 0, true, &mut out);
+        }
+    }
+    if groups == 0 && opts.only.is_empty() && tail.is_none() {
+        out.push_str("note: the start selector matched no variable or parameter\n");
+    }
+    if !opts.only.is_empty() && found == 0 {
+        out.push_str(&format!("0 routes match --only {}\n", opts.only.join(",")));
+    } else if tail.is_some() {
+        out.push_str(&format!("{} from source\n", plural(found, "route")));
+    } else {
+        out.push_str(&format!("{} from {}\n", plural(found, "route"), if found == 1 { "an origin" } else { "origins" }));
+    }
+    if cut > 0 {
+        out.push_str(&format!("{} cut at --max {}\n", plural(cut, "route"), opts.max));
     }
     Ok(FlowReport { text: out, found })
 }
@@ -441,13 +556,24 @@ fn only(h: &Hop, wanted: &[String], root: bool) -> Option<Hop> {
     Some(Hop { children, ..h.clone() })
 }
 
+/// Print `h` and its children. A downward root drops its `source` tag (it
+/// is the start), an upward root keeps it (`upward`).
 fn print_tree(h: &Hop, depth: usize, out: &mut String) {
-    let tags: Vec<String> = h.tags.iter().filter(|t| !(depth == 0 && *t == "source")).cloned().collect();
+    print_tree_with(h, depth, false, out)
+}
+
+fn print_tree_with(h: &Hop, depth: usize, upward: bool, out: &mut String) {
+    let tags: Vec<String> = h
+        .tags
+        .iter()
+        .filter(|t| !(depth == 0 && !upward && *t == "source") && *t != upward::END)
+        .cloned()
+        .collect();
     out.push_str(&"  ".repeat(depth));
     out.push_str(&row(&h.file, h.line, &h.func, &h.text, &tags));
     out.push('\n');
     for c in &h.children {
-        print_tree(c, depth + 1, out);
+        print_tree_with(c, depth + 1, upward, out);
     }
 }
 
@@ -921,7 +1047,9 @@ mod tests {
         assert_eq!(open_end("a ==> "), Some(("a ".to_string(), Combinator::FlowsEventually)));
         assert_eq!(open_end("a =>"), Some(("a ".to_string(), Combinator::Flows)));
         assert_eq!(open_end("a ==> b"), None);
-        assert_eq!(open_end("a <=="), None);
+        assert_eq!(open_end("a <=="), Some(("a ".to_string(), Combinator::FlowsFromEventually)));
+        assert_eq!(open_end("a <= "), Some(("a ".to_string(), Combinator::FlowsFrom)));
+        assert_eq!(open_end("a <== b"), None);
     }
 
     #[test]

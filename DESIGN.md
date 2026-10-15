@@ -535,3 +535,40 @@ The cross-function walk follows calls whose callee is not a declared function na
 ## Interfaces
 
 A method call whose call graph targets are all interface method signatures (no implementation in the scanned files) is tagged `stopped: interface`. A call with several implementations keeps one walk per target, tagged `widened`.
+
+# Upward flow
+
+`<=` (one step) and `<==` (eventually) walk from a value back to where it was created. `src/flow/upward.rs` holds the walk, `semantic::flows::evaluate_upward` runs it for `ctsq path`. Go only. The node kinds are tree-sitter-go names written once at the top of `upward.rs`, so the `from` attribute and value sets can use the same helpers without loading a config.
+
+## Starts and ends
+
+The head segment's rows are the values, one start per variable name per function, the first row in the function. A start that is where the name is assigned or declared prints that definition as the root row. A start at a use prints the use row with the reaching definitions under it. A query ending in `<=` or `<==` has no end and lists every origin. With an end selector (`variable#q <== function#os.Getenv`) only branches that reach a call the end matches are kept, and that call's row is tagged `source`.
+
+## Rules (in order)
+
+1. Reaching definitions: the nearest declaration of the name visible at the use (block scopes respected, closures see the functions around them, then package-level `var` and `const` in the file, then in the other files of the package), plus every plain assignment after it and before the use. An operator assignment (`+=`) also keeps the earlier value.
+2. A literal, composite literal or function literal stops with `source literal`. So does a `var` with no value.
+3. A parameter walks to the argument at its position in every in-repo caller (`CallGraph.sites`), each caller row tagged `moved`. A function with no in-repo callers stops with `source param`.
+4. An in-repo call result walks into the callee's return expressions at the result position, tagged `derived, via <callee>` on the call row and `moved` on each return row. `return f()` for several results passes the position through.
+5. An outside call reads its model in reverse. A `source` model stops with `source`. A `pass` from a slot to `return` continues from that argument or the receiver. A model with no pass to `return` stops with `source`. No model stops with `source unmodelled`.
+6. A field read `o.F` goes back to the stores `o.F = x` before it in the same function, tagged `field F`, or to the keyed element `F` of the composite literal `o` was built from. Nothing found stops with `stopped: field F`. A package variable of an import (`os.Args`) is `source unmodelled`.
+7. Conversions, `+`, index, slice and type assertions continue into their operands. Literal parts of a `+` add nothing.
+8. Guards: a (def, parameter or result position) already being walked is not entered again, `--max` bounds the function crossings (`stopped: max depth` and the trailer `N routes cut at --max n`), and one walk builds at most 5000 hops.
+
+## Printing
+
+Rows print in reading order, the queried value first and its origins nested under it, with the shared row layout. The root keeps its tags. The trailer counts origins: `N routes from origins`, or with an end `N routes from source`. `<=` keeps one level under the root.
+
+# Value sets
+
+`flow::values::value_set(store, graph, file, node) -> ValueSet{values, globs, open, reasons}` answers which strings a Go expression can hold (plan decision 25). Each value and glob carries the file and line it was written at.
+
+- A string literal adds one value, quotes removed.
+- A name adds the value set of each reaching definition (the upward rule 1), so a constant adds its value and a local variable the union of its assignments.
+- A parameter adds the union over every in-repo caller's argument, recursively. A parameter with no callers is open with the reason `parameter p of F has no callers`.
+- A `+` concatenation multiplies out the pieces of its parts, an unknown part (open, or more than 16 alternatives) as `*`. A result with a `*` is a glob (`admin-*.html.tmpl`), one with none a value, and one that is only `*` makes the set open.
+- Anything else makes the set open with the reason `<node kind> at file:line`.
+
+# Receiver origins
+
+`[from=...]` on a method called through a variable (`logger.info`, `l.Info`) uses the import of the call that created the variable when no import binds the name. Go walks the variable back through its reaching definitions in the file (`flow::upward::creating_import`), through chains such as `zap.NewExample().Sugar()`. JS and TS follow a declaration in the same file whose value is a call or `new` of an import (`const logger = pino()`), `require('pino')()` or a member call on such a value.
