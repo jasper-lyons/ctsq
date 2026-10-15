@@ -23,3 +23,4 @@ Minor findings from the mid-build adversarial review (2026-10-15) that were not 
 - [ ] `:not()` is rejected in data-flow queries ("not available in data-flow queries yet") (decision 02, final review)
 - [ ] `ctsq --help` does not mention the `field` kind, attributes or dot shorthand, and the `-l` list omits gotmpl (final review)
 - [ ] 41 clippy style warnings in src/flow, src/semantic and src/config (final review)
+- [ ] A data-flow query on a non-Go file says "the start selector matched no variable, parameter or field" instead of "data flow supports Go only" (found 2026-10-15)
