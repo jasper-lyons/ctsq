@@ -9,3 +9,5 @@ Minor findings from the mid-build adversarial review (2026-10-15) that were not 
 - [ ] A result with 0 routes still prints the root row. Multi-line calls show only their first line, hiding the tracked argument
 - [ ] Nested `if` depth 100/200/300 takes 0.4/2.4/7.4 s on a debug build (roughly O(n^2.7)). A 5000-line file takes 0.3 s
 - [ ] Call route rows drift out of column alignment at deeper indents (`print.rs` pads before indenting)
+- [ ] `c := b` copies have no resolved type, so `field#Contact.Phone` still matches `c.Phone` when the owner is unknown (fixer A gap b)
+- [ ] Pointer detection reads source text (`*` prefix, `&`, `new(`) instead of mechanics keys for unary and result nodes (fixer A gap c)
