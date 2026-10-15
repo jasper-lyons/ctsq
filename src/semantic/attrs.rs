@@ -163,19 +163,18 @@ impl Facts {
             Some(q) => (imports.get(q).cloned(), imports.contains_key(q)),
             None => (imports.get(text(name, source)).cloned(), false),
         };
-        // `u.Email` in Go belongs to u's type, not to the code around it.
-        let typed_qualifier = match (&qual_root, lang_name) {
-            (Some(q), "go") if !qual_is_import => crate::resolve::go::binding_type(
-                root,
-                source,
-                "",
-                q,
-                name.start_position().row + 1,
-                &crate::resolve::DefIndex::default(),
-            ),
+        // `u.Email` in Go belongs to u's type, not to the code around it, and
+        // `u.Contact.Email` to the type of `u.Contact`.
+        let typed_qualifier = match (qualifier, lang_name) {
+            (Some(q), "go") if !qual_is_import => Some(go_operand_type(q, root, source, name.start_position().row + 1)),
             _ => None,
         };
-        let within = typed_qualifier.or_else(|| enclosing_decl(name, source));
+        let within = match typed_qualifier {
+            Some(Some(t)) => Some(t),
+            // A chain whose type is unknown belongs to no declaration.
+            Some(None) if qualifier.is_some_and(|q| q.kind() == "selector_expression") => None,
+            _ => enclosing_decl(name, source),
+        };
         Facts { qual_root, qual_text, from, qual_is_import, within }
     }
 
@@ -266,6 +265,26 @@ fn qualifier_of(name: Node) -> Option<Node> {
         return None;
     }
     parent.child_by_field_name(qual_field)
+}
+
+/// Type of a Go operand: the variable's type for `u`, and for a chain
+/// `u.Contact` the declared type of the field `Contact` on u's type, from the
+/// struct declarations in this file. None when any step is unknown.
+fn go_operand_type(op: Node, root: Node, source: &[u8], line: usize) -> Option<String> {
+    match op.kind() {
+        "identifier" => {
+            crate::resolve::go::binding_type(root, source, "", text(op, source), line, &crate::resolve::DefIndex::default())
+        }
+        "selector_expression" => {
+            let inner = go_operand_type(op.child_by_field_name("operand")?, root, source, line)?;
+            let f = op.child_by_field_name("field")?;
+            crate::resolve::go::go_field_type(root, source, &inner, text(f, source))
+        }
+        "parenthesized_expression" | "unary_expression" => {
+            go_operand_type(op.named_child(0)?, root, source, line)
+        }
+        _ => None,
+    }
 }
 
 /// Leftmost identifier of a qualifier chain: `a` in `a.b.c` or `a::b`.

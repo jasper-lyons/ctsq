@@ -14,7 +14,9 @@ mod tests;
 
 // Used by the path and models packages.
 #[allow(unused_imports)]
-pub use engine::{analyse_function, analyse_function_with, enclosing_function, function_name, start_at, start_in};
+pub use engine::{
+    analyse_function, analyse_function_with, enclosing_function, function_name, operand_type, start_at, start_in,
+};
 #[allow(unused_imports)]
 pub use models::{candidate_keys, model_key, qualify_type, ModelOutside};
 #[allow(unused_imports)]
@@ -113,9 +115,13 @@ pub enum CallEffect {
     Via(String),
     /// A call into a function in the repo whose body was walked. `trees` are
     /// the walks from the parameters that received tracked arguments, hung
-    /// under the call's hop. The result carries the data only when the
-    /// callee `returns` it. The hop is tagged `via <name>`.
-    Into { name: String, returns: bool, trees: Vec<Hop> },
+    /// under the call's hop. `returns` has one entry per result position,
+    /// true where a return of the callee carries the data, and the matching
+    /// results carry it. `writes` are the pointer arguments and the pointer
+    /// receiver the callee stored the data through, each with the field paths
+    /// that now hold it: the caller tracks the object they are rooted at. The
+    /// hop is tagged `via <name>`.
+    Into { name: String, returns: Vec<bool>, writes: Vec<(crate::config::Slot, Paths)>, trees: Vec<Hop> },
     /// The walk cannot tell where the call goes, as with a function-valued
     /// variable assigned more than once. The call's hop is tagged `tag`
     /// (`stopped: function value`), `rows` (the candidates) hang under it and
@@ -183,11 +189,22 @@ impl Hop {
 pub struct FlowResult {
     /// The start point, tagged `source`.
     pub root: Hop,
-    /// Whether a return statement of the walked function carries tracked data.
-    pub returns: bool,
+    /// One entry per result position of the walked function, true where a
+    /// return statement carries tracked data there. A bare `return` reads the
+    /// named results.
+    pub returns: Vec<bool>,
+    /// Variables that hold tracked data when the function returns and were
+    /// set inside it (not just received at the start), with their field
+    /// paths. The caller keeps the pointer parameters and receiver among them.
+    pub exits: Vec<(String, Paths)>,
 }
 
 impl FlowResult {
+    /// Whether any return position carries tracked data.
+    pub fn returns_any(&self) -> bool {
+        self.returns.iter().any(|r| *r)
+    }
+
     /// Number of hops tagged `sink`.
     pub fn sinks(&self) -> usize {
         self.root.walk().iter().filter(|h| h.has("sink")).count()

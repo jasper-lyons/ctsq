@@ -991,6 +991,74 @@ fn signature_params(list: Node, src: &[u8]) -> Vec<GoParam> {
     out
 }
 
+/// Result names of a Go function, method or literal node, one per result
+/// position. An unnamed result gives an empty name, so `(string, error)`
+/// gives two empty names and a single result type gives one.
+pub fn go_result_names(func: Node, src: &[u8]) -> Vec<String> {
+    let Some(r) = func.child_by_field_name("result") else { return vec![] };
+    if r.kind() == "parameter_list" {
+        signature_params(r, src).into_iter().map(|p| p.name).collect()
+    } else {
+        vec![String::new()]
+    }
+}
+
+/// Base type name (no pointer, package or type arguments) of field `field`
+/// of struct `ty`, from the struct declarations in this file. Fields of
+/// embedded structs are promoted.
+pub fn go_field_type(root: Node, src: &[u8], ty: &str, field: &str) -> Option<String> {
+    fn base(t: &str) -> String {
+        let t = t.trim().trim_start_matches(['*', '&']);
+        let t = t.split('[').next().unwrap_or(t);
+        t.rsplit('.').next().unwrap_or(t).to_string()
+    }
+    fn struct_of<'t>(n: Node<'t>, src: &[u8], name: &str) -> Option<Node<'t>> {
+        if n.kind() == "type_spec"
+            && n.child_by_field_name("name").is_some_and(|x| text(x, src) == name)
+        {
+            return n.child_by_field_name("type").filter(|t| t.kind() == "struct_type");
+        }
+        if matches!(n.kind(), "function_declaration" | "method_declaration") {
+            return None;
+        }
+        let mut c = n.walk();
+        let kids: Vec<Node> = n.named_children(&mut c).collect();
+        kids.into_iter().find_map(|k| struct_of(k, src, name))
+    }
+    fn find(root: Node, src: &[u8], ty: &str, field: &str, depth: usize) -> Option<String> {
+        let st = struct_of(root, src, ty)?;
+        let mut stack = vec![st];
+        let mut decls = vec![];
+        while let Some(n) = stack.pop() {
+            if n.kind() == "field_declaration" {
+                decls.push(n);
+                continue;
+            }
+            let mut c = n.walk();
+            stack.extend(n.named_children(&mut c));
+        }
+        let mut embedded = vec![];
+        for d in decls {
+            let t = d.child_by_field_name("type").map(|t| base(text(t, src))).unwrap_or_default();
+            let mut c = d.walk();
+            let names: Vec<Node> = d.children_by_field_name("name", &mut c).collect();
+            if names.is_empty() {
+                if t == field {
+                    return Some(t);
+                }
+                embedded.push(t);
+            } else if names.iter().any(|n| text(*n, src) == field) {
+                return Some(t);
+            }
+        }
+        if depth > 4 {
+            return None;
+        }
+        embedded.into_iter().find_map(|e| find(root, src, &e, field, depth + 1))
+    }
+    find(root, src, &base(ty), field, 0)
+}
+
 /// Pick the best candidate. A single candidate is Exact; several rank by
 /// locality (same file > same dir > imported > anywhere) and yield a Guess.
 fn rank(mut cands: Vec<usize>, prefer_methods: bool, ctx: &Ctx) -> Option<(usize, Confidence)> {
