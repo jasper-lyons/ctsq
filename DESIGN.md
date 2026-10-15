@@ -439,7 +439,7 @@ For Go, a call is outside when the import path is neither the module path from `
 `flow::ModelOutside::new(&LangConfig)` is the `Outside` that answers from model files. `flow::model_key(&LangConfig, &CallSite)` returns the first key with a model among `flow::candidate_keys`:
 
 1. A package call gives `importpath.Func`, the import path taken from the file's imports.
-2. A method on a typed receiver gives `(*importpath.Type).Method`, then `(importpath.Type).Method`. `binding_type` drops the package part of a type, so the engine finds it again as `pkg.Type` text in the enclosing function, then in the file, for each import name, and puts the result in `CallSite::recv_path`.
+2. A method on a typed receiver gives `(*importpath.Type).Method`, then `(importpath.Type).Method`. The engine reads the receiver's type with `resolve::go::binding_type_qualified`, which keeps the package part (`strings.Builder`), swaps the package name for its import path and puts the result in `CallSite::recv_path`.
 3. A plain name gives `builtin.name`.
 
 A model maps to an effect. `clear` gives `Clear`. Anything else gives `CallEffect::Model { pass, whole }`, which the engine applies entry by entry: an entry whose `from` slot holds tracked data moves it to the result, or to the variable an argument or the receiver is rooted at, so `json.Unmarshal(body, &form)` tracks `form`. An assignment whose only effect is such a move records a `moved` hop. A model with no `pass` and no `clear`, such as a source or a template model, moves nothing.
@@ -447,3 +447,30 @@ A model maps to an effect. `clear` gives `Clear`. Anything else gives `CallEffec
 `whole` (decision 13): for a field start with a known owner type, an argument whose type is the owner counts as tracked when the call's model is `whole`, so `fmt.Printf("%v", u)` reaches an end predicate on `Printf` from `User.Email`. The engine lists such arguments in `CallSite::whole_args` and asks `Outside` about the call even when nothing else is tracked.
 
 With no model, a call into the repo gives `CallEffect::Via(name)`: the result carries the data and the hop is tagged `via <name>`, placed after `field` and before `conditional@`. A call is in the repo when its callee is a plain name declared as a function in the same file (`CallSite::local`), its package lies inside the go.mod module, or its receiver type has no package part. Every other call gives `Unknown` and is tagged `unmodelled` (decision 18).
+
+# Cross-function flow
+
+`semantic::flows::evaluate_flows` runs the data-flow combinators of `ctsq path`. `=>` reads "flows in one step to", `==>` reads "eventually flows to". The backward forms `<=` and `<==`, a chain of more than one flow step, `:not()` and a mix with call combinators exit 2.
+
+## Starts and ends
+
+1. The query is cut with `split_query`. The head segment's rows are start points: each row is narrowed to the name inside it (a field declaration, field access or parameter declaration gives its name) and classified by `flow::start_in`. A variable start is walked in its enclosing function, once per function and name, from its first row.
+2. A field start (`field#Booking.CustomerPhone`) is one group per field and owner type. The group's root row is the field declaration. Every function in the scanned files that reads or writes a field of that name is walked from the field, and their trees hang side by side under the declaration row.
+3. With a tail segment, a call is a sink when one of the tail's rows covers the call's function name (`Printf` in `log.Printf`), so attribute filters such as `function#log.Printf` apply.
+4. With no tail (the query ends in `=>` or `==>`), a call is an end when it goes outside the module (decision 16): a `pkg.F` call on an import outside the go.mod module path, or a method on a variable whose type comes from such a package. Those hops are tagged `outside` in place of `sink`. With no go.mod every import counts as outside.
+
+The language config is loaded from the repo root of the first scanned path. The module path and Go version come from the go.mod nearest that path when there is one.
+
+## Following calls
+
+1. When a call receives tracked data, its byte range is looked up in `CallGraph.sites` for the current file. A site with an in-repo target is walked in the callee: the argument positions map to parameters through `go_signatures` (a variadic parameter takes every later argument, the receiver joins when it is tracked). The walk starts at the first such parameter and tracks the rest from the top of the body (`flow::analyse_function_with`). The callee's root row is its signature line, tagged `moved`, and `widened` too when an interface call has several targets.
+2. The engine gets `CallEffect::Into { name, returns, trees }`. The call's hop is tagged `via <name>`, the callee trees hang under it before the caller's later hops, and the call's result carries the data only when a return statement in the callee carries it (`FlowResult::returns`). So a helper that drops the value ends the route.
+3. Recursion is guarded by a stack of (definition, tracked argument positions). A call already on the stack, a call deeper than `--max` functions, and every call under `=>` fall back to `CallEffect::Via`, which carries the data without walking. Effects are memoised per call node and tracked arguments, so loop passes reuse them.
+4. Calls with no in-repo target go to the models (`ModelOutside`). Conversions to predeclared types (`string(b)`, `[]byte(s)`) keep the data.
+
+## Printing
+
+1. Branches that never reach an end are pruned. A callee tree is kept where it reaches an end itself, and along the hops that lead to its returns when the call's hop is kept, so a route through a function that hands the value back shows that function. Under `=>` only ends one step below the start count.
+2. `--only` keeps hops whose tags include one of the given tags, matched whole or by first word (`via` keeps `via normalise`, `conditional` keeps `conditional@4`), with their ancestors.
+3. Rows use `print::row`, two spaces per level. The trailer is `N routes to sink` (or `N routes to outside` with no end), then the unmodelled-ends line counted before pruning.
+4. Exit 0 when at least one end is found, 1 when none, 2 on errors.
