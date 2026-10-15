@@ -32,6 +32,8 @@ keyed     = ["keyed_element"]
 element   = ["literal_element"]
 conversion = ["type_conversion_expression"]
 generic   = ["generic_type"]
+# Assignments that declare their names in the enclosing block.
+declare   = ["short_var_declaration", "var_spec"]
 
 # Child field names the flow engine reads.
 [fields]
@@ -61,3 +63,5 @@ params      = ["parameters"]
 [tokens]
 plain_assign = ["=", ":="]
 blank        = ["_"]
+# Token that makes a range header declare its names.
+declare      = [":="]

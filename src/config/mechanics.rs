@@ -80,6 +80,9 @@ pub struct Nodes {
     pub conversion: Vec<String>,
     /// Generic instantiation such as `F[T]` in type position.
     pub generic: Vec<String>,
+    /// Assignments that declare their names in the enclosing block, shadowing
+    /// an outer name until the block ends.
+    pub declare: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -140,4 +143,6 @@ pub struct Tokens {
     pub plain_assign: Vec<String>,
     /// Names that discard a value.
     pub blank: Vec<String>,
+    /// Token that makes a loop header declare its names, as `:=` in a range.
+    pub declare: Vec<String>,
 }
