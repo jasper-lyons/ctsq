@@ -333,6 +333,17 @@ Constructs with no abstract mapping fall back to raw tree-sitter node kinds.")]
         #[arg(num_args(0..))]
         langs: Vec<String>,
     },
+    /// Show where config and model files are read from, or the merged result for a language
+    #[command(after_help = "Language mechanics and outside-call models are TOML files, looked up in order:
+repo .ctsq/, then ~/.config/ctsq, then ~/.cache/ctsq, then built-in defaults.
+
+  ctsq config path
+  ctsq config dump go")]
+    Config {
+        /// `path` or `dump <lang>`
+        #[arg(num_args(1..=2), required = true)]
+        args: Vec<String>,
+    },
 }
 
 /// Restore the kernel default for SIGPIPE. The Rust runtime sets it to SIG_IGN before
@@ -412,6 +423,9 @@ fn main() {
         Some(Commands::Types { langs }) => {
             types::run(&langs, cli.lang.as_deref());
             return;
+        }
+        Some(Commands::Config { args }) => {
+            std::process::exit(config::run(&args));
         }
         None => {}
     }

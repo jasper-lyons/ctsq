@@ -1,0 +1,373 @@
+# Go standard library models, Go 1.23.
+# Keys are qualified names: importpath.Name or (*importpath.Type).Method.
+# pass entries read "from -> to" where each side is an argument index, *, receiver or return.
+
+["builtin.len"]
+clear = true
+
+["os.Getenv"]
+source = "return"
+
+["errors.New"]
+pass = ["0 -> return"]
+
+["fmt.Errorf"]
+pass = ["* -> return"]
+whole = true
+
+["strings.ToUpper"]
+pass = ["0 -> return"]
+
+["strings.ToLower"]
+pass = ["0 -> return"]
+
+["strings.TrimSpace"]
+pass = ["0 -> return"]
+
+["strings.Title"]
+pass = ["0 -> return"]
+
+["strings.ToTitle"]
+pass = ["0 -> return"]
+
+["strings.Trim"]
+pass = ["0 -> return"]
+
+["strings.TrimLeft"]
+pass = ["0 -> return"]
+
+["strings.TrimRight"]
+pass = ["0 -> return"]
+
+["strings.TrimPrefix"]
+pass = ["0 -> return"]
+
+["strings.TrimSuffix"]
+pass = ["0 -> return"]
+
+["strings.Replace"]
+pass = ["0 -> return", "2 -> return"]
+
+["strings.ReplaceAll"]
+pass = ["0 -> return", "2 -> return"]
+
+["strings.Join"]
+pass = ["0 -> return"]
+
+["strings.Split"]
+pass = ["0 -> return"]
+
+["strings.Fields"]
+pass = ["0 -> return"]
+
+["strings.Repeat"]
+pass = ["0 -> return"]
+
+["strings.NewReader"]
+pass = ["0 -> return"]
+
+["(*strings.Builder).WriteString"]
+pass = ["0 -> receiver"]
+
+["(*strings.Builder).Write"]
+pass = ["0 -> receiver"]
+
+["(*strings.Builder).String"]
+pass = ["receiver -> return"]
+
+["strconv.Itoa"]
+clear = true
+
+["strconv.Atoi"]
+clear = true
+
+["strconv.FormatInt"]
+clear = true
+
+["strconv.Quote"]
+pass = ["0 -> return"]
+
+["strconv.Unquote"]
+pass = ["0 -> return"]
+
+["encoding/json.Marshal"]
+pass = ["0 -> return"]
+
+["encoding/json.MarshalIndent"]
+pass = ["0 -> return"]
+
+["encoding/json.Unmarshal"]
+pass = ["0 -> 1"]
+
+["encoding/json.NewEncoder"]
+pass = ["0 -> return"]
+
+["encoding/json.NewDecoder"]
+pass = ["0 -> return"]
+
+["(*encoding/json.Encoder).Encode"]
+whole = true
+
+["(*encoding/json.Decoder).Decode"]
+pass = ["receiver -> 0"]
+
+["fmt.Sprintf"]
+pass = ["* -> return"]
+whole = true
+
+["fmt.Sprint"]
+pass = ["* -> return"]
+whole = true
+
+["fmt.Sprintln"]
+pass = ["* -> return"]
+whole = true
+
+["fmt.Printf"]
+whole = true
+
+["fmt.Print"]
+whole = true
+
+["fmt.Println"]
+whole = true
+
+["fmt.Fprintf"]
+whole = true
+
+["fmt.Fprint"]
+whole = true
+
+["fmt.Fprintln"]
+whole = true
+
+["log.Printf"]
+whole = true
+
+["log.Print"]
+whole = true
+
+["log.Println"]
+whole = true
+
+["log.Fatal"]
+whole = true
+
+["log.Fatalf"]
+whole = true
+
+["log.Fatalln"]
+whole = true
+
+["log.Panic"]
+whole = true
+
+["log.Panicf"]
+whole = true
+
+["log.Panicln"]
+whole = true
+
+["(*log.Logger).Printf"]
+whole = true
+
+["(*log.Logger).Print"]
+whole = true
+
+["(*log.Logger).Println"]
+whole = true
+
+["(*log.Logger).Fatal"]
+whole = true
+
+["(*log.Logger).Fatalf"]
+whole = true
+
+["(*log.Logger).Fatalln"]
+whole = true
+
+["(*log.Logger).Panic"]
+whole = true
+
+["(*log.Logger).Panicf"]
+whole = true
+
+["(*log.Logger).Panicln"]
+whole = true
+
+["log/slog.Debug"]
+whole = true
+
+["log/slog.Info"]
+whole = true
+
+["log/slog.Warn"]
+whole = true
+
+["log/slog.Error"]
+whole = true
+
+["log/slog.Log"]
+whole = true
+
+["(*log/slog.Logger).Debug"]
+whole = true
+
+["(*log/slog.Logger).Info"]
+whole = true
+
+["(*log/slog.Logger).Warn"]
+whole = true
+
+["(*log/slog.Logger).Error"]
+whole = true
+
+["(*log/slog.Logger).Log"]
+whole = true
+
+["(*bytes.Buffer).WriteString"]
+pass = ["0 -> receiver"]
+
+["(*bytes.Buffer).Write"]
+pass = ["0 -> receiver"]
+
+["(*bytes.Buffer).String"]
+pass = ["receiver -> return"]
+
+["(*bytes.Buffer).Bytes"]
+pass = ["receiver -> return"]
+
+["bytes.NewBufferString"]
+pass = ["0 -> return"]
+
+["bytes.NewBuffer"]
+pass = ["0 -> return"]
+
+["bufio.NewReader"]
+pass = ["0 -> return"]
+
+["bufio.NewWriter"]
+pass = ["0 -> return"]
+
+["bufio.NewScanner"]
+pass = ["0 -> return"]
+
+["(*bufio.Writer).WriteString"]
+pass = ["0 -> receiver"]
+
+["(*bufio.Writer).Write"]
+pass = ["0 -> receiver"]
+
+["(*bufio.Reader).ReadString"]
+pass = ["receiver -> return"]
+
+["(*bufio.Scanner).Text"]
+pass = ["receiver -> return"]
+
+["(*bufio.Scanner).Bytes"]
+pass = ["receiver -> return"]
+
+["(*regexp.Regexp).ReplaceAllString"]
+pass = ["0 -> return", "1 -> return", "receiver -> return"]
+
+["html/template.Must"]
+pass = ["0 -> return"]
+
+["html/template.New"]
+pass = ["0 -> return"]
+
+["(*html/template.Template).Execute"]
+template = { data_arg = 1 }
+
+["(*html/template.Template).ExecuteTemplate"]
+template = { data_arg = 2 }
+
+["(*html/template.Template).Parse"]
+template_load = { text_arg = 0 }
+
+["(*html/template.Template).ParseFS"]
+template_load = { fs_arg = 0, names_from = 1 }
+
+["(*html/template.Template).ParseFiles"]
+template_load = { names_from = 0 }
+
+["(*html/template.Template).ParseGlob"]
+template_load = { names_from = 0 }
+
+["html/template.ParseFS"]
+template_load = { fs_arg = 0, names_from = 1 }
+
+["html/template.ParseFiles"]
+template_load = { names_from = 0 }
+
+["html/template.ParseGlob"]
+template_load = { names_from = 0 }
+
+["text/template.Must"]
+pass = ["0 -> return"]
+
+["text/template.New"]
+pass = ["0 -> return"]
+
+["(*text/template.Template).Execute"]
+template = { data_arg = 1 }
+
+["(*text/template.Template).ExecuteTemplate"]
+template = { data_arg = 2 }
+
+["(*text/template.Template).Parse"]
+template_load = { text_arg = 0 }
+
+["(*text/template.Template).ParseFS"]
+template_load = { fs_arg = 0, names_from = 1 }
+
+["(*text/template.Template).ParseFiles"]
+template_load = { names_from = 0 }
+
+["(*text/template.Template).ParseGlob"]
+template_load = { names_from = 0 }
+
+["text/template.ParseFS"]
+template_load = { fs_arg = 0, names_from = 1 }
+
+["text/template.ParseFiles"]
+template_load = { names_from = 0 }
+
+["text/template.ParseGlob"]
+template_load = { names_from = 0 }
+
+["(*database/sql.DB).Exec"]
+pass = ["* -> return"]
+
+["(*database/sql.DB).ExecContext"]
+pass = ["* -> return"]
+
+["(*database/sql.DB).Query"]
+pass = ["* -> return"]
+
+["(*database/sql.DB).QueryContext"]
+pass = ["* -> return"]
+
+["(*database/sql.DB).QueryRow"]
+pass = ["* -> return"]
+
+["(*database/sql.DB).QueryRowContext"]
+pass = ["* -> return"]
+
+["(*database/sql.Tx).Exec"]
+pass = ["* -> return"]
+
+["(*database/sql.Tx).ExecContext"]
+pass = ["* -> return"]
+
+["(*database/sql.Tx).Query"]
+pass = ["* -> return"]
+
+["(*database/sql.Tx).QueryContext"]
+pass = ["* -> return"]
+
+["(*database/sql.Tx).QueryRow"]
+pass = ["* -> return"]
+
+["(*database/sql.Tx).QueryRowContext"]
+pass = ["* -> return"]
