@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 mod engine;
+mod models;
 mod report;
 #[cfg(test)]
 mod tests;
@@ -13,6 +14,8 @@ mod tests;
 // Used by the path and models packages.
 #[allow(unused_imports)]
 pub use engine::{analyse_function, enclosing_function, function_name, start_at};
+#[allow(unused_imports)]
+pub use models::{candidate_keys, model_key, qualify_type, ModelOutside};
 #[allow(unused_imports)]
 pub use report::report;
 
@@ -64,14 +67,22 @@ pub struct CallSite<'t> {
     pub method: Option<String>,
     /// Type of the receiver variable, from `resolve::go::binding_type`.
     pub recv_type: Option<String>,
+    /// `recv_type` with its package name replaced by the import path, as
+    /// `html/template.Template`. None when the type has no package part.
+    pub recv_path: Option<String>,
     /// Zero based positions of the arguments that carry tracked data.
     pub tracked_args: Vec<usize>,
     /// Whether the receiver object carries tracked data.
     pub recv_tracked: bool,
+    /// Untracked arguments that are objects of the start field's owner type.
+    /// A `whole` model carries the field through them (decision 13).
+    pub whole_args: Vec<usize>,
+    /// The callee is a plain name declared as a function in this file.
+    pub local: bool,
 }
 
 /// What a call does with tracked data, answered by models.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallEffect {
     /// No model. The result carries the data and the hop is tagged `unmodelled`.
     Unknown,
@@ -81,6 +92,14 @@ pub enum CallEffect {
     Clear,
     /// The receiver object and the result both carry the data, as in a buffer write.
     Whole,
+    /// A model's `pass` entries and `whole` flag. Each entry whose `from` slot
+    /// holds tracked data moves it to its `to` slot: the result, or the object
+    /// an argument or the receiver is rooted at (`&form` tracks `form`).
+    /// `whole` also counts `CallSite::whole_args` as tracked.
+    Model { pass: Vec<crate::config::Pass>, whole: bool },
+    /// A call into a function in the repo. The result carries the data and the
+    /// hop is tagged `via <name>` instead of `unmodelled`.
+    Via(String),
 }
 
 /// The hook for calls whose effect the engine cannot see.
