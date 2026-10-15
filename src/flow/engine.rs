@@ -8,7 +8,7 @@ use super::models::qualify_type;
 use super::objects::{is_map_expr, join_paths, under, Paths};
 use super::{CallEffect, CallSite, EndFn, FlowCtx, FlowResult, Hop, Outside, Start, StartKind};
 use crate::config::{Mechanics, Slot};
-use crate::resolve::go::{binding_type, binding_type_qualified, go_imports, go_result_names};
+use crate::resolve::go::{binding_type, binding_type_qualified, go_imports, go_result_names, go_result_types};
 use crate::resolve::DefIndex;
 
 /// Loop passes always allowed. A loop runs to its fixed point, the set of
@@ -250,7 +250,14 @@ pub fn start_in(cx: &FlowCtx, start_byte: usize, end_byte: usize) -> Option<Star
 /// Names a function declares (parameters, `:=` and `var`), and those of
 /// them declared as maps.
 fn declared(func: Node, src: &[u8], m: &Mechanics) -> (HashSet<String>, HashSet<String>) {
-    let (mut locals, mut maps) = (HashSet::new(), HashSet::new());
+    let (locals, maps, _) = declared_kinds(func, src, m);
+    (locals, maps)
+}
+
+/// `declared`, plus the names declared as slices, arrays or strings, whose
+/// range key is a position.
+fn declared_kinds(func: Node, src: &[u8], m: &Mechanics) -> (HashSet<String>, HashSet<String>, HashSet<String>) {
+    let (mut locals, mut maps, mut seqs) = (HashSet::new(), HashSet::new(), HashSet::new());
     let mut stack = vec![func];
     while let Some(n) = stack.pop() {
         let decl = Mechanics::is(&m.nodes.param, n.kind())
@@ -262,6 +269,12 @@ fn declared(func: Node, src: &[u8], m: &Mechanics) -> (HashSet<String>, HashSet<
                     .first()
                     .map(|r| named(*r).into_iter().next().unwrap_or(*r))
                     .is_some_and(|v| is_map_expr(v, m));
+            let seq_text = |t: &str| t.starts_with('[') || t.starts_with("...") || t == "string" || t.starts_with("make([");
+            let is_seq = kids(n, &m.fields.ty).first().is_some_and(|t| seq_text(text(*t, src)))
+                || kids(n, &m.fields.right)
+                    .first()
+                    .map(|r| named(*r).into_iter().next().unwrap_or(*r))
+                    .is_some_and(|v| seq_text(text(v, src)));
             let mut names = vec![];
             for l in kids(n, &m.fields.left) {
                 if Mechanics::is(&m.nodes.list, l.kind()) {
@@ -275,12 +288,15 @@ fn declared(func: Node, src: &[u8], m: &Mechanics) -> (HashSet<String>, HashSet<
                 if is_map {
                     maps.insert(t.clone());
                 }
+                if is_seq && !Mechanics::is(&m.nodes.range, n.kind()) {
+                    seqs.insert(t.clone());
+                }
                 locals.insert(t);
             }
         }
         stack.extend(named(n));
     }
-    (locals, maps)
+    (locals, maps, seqs)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -326,6 +342,9 @@ struct Val {
     /// Variables a called function stored the data in through a pointer,
     /// with the field paths that now hold it.
     writes: Vec<(String, Paths)>,
+    /// For the value of an outside call: Some(true) unmodelled, Some(false)
+    /// modelled. Its error results take no tracked data (see `error_left`).
+    outside: Option<bool>,
 }
 
 impl Val {
@@ -394,6 +413,8 @@ struct Walker<'a, 't> {
     ret: Vec<bool>,
     /// Result names, one per position, empty when unnamed.
     results: Vec<String>,
+    /// Result positions declared `error`: they never carry tracked data.
+    errors: Vec<bool>,
     /// The union of the states at each return and at the end of the body.
     exit: Option<State>,
     /// Depth of function literal bodies being walked: their returns are not
@@ -407,6 +428,8 @@ struct Walker<'a, 't> {
     locals: HashSet<String>,
     /// Local names declared as maps.
     local_maps: HashSet<String>,
+    /// Local names declared as slices, arrays or strings.
+    local_seqs: HashSet<String>,
     /// One frame per open block: each name the block declared, with the outer
     /// binding it shadows (None when the outer name was not tracked).
     scopes: Vec<HashMap<String, Option<Var>>>,
@@ -435,7 +458,7 @@ pub fn analyse_function_with(
     outside: &dyn Outside,
 ) -> FlowResult {
     let m = cx.mech;
-    let (locals, local_maps) = declared(func, cx.src, m);
+    let (locals, local_maps, local_seqs) = declared_kinds(func, cx.src, m);
     let (pointers, aliases) = pointer_aliases(func, cx.src, m);
     let results = go_result_names(func, cx.src);
     let mut w = Walker {
@@ -456,6 +479,7 @@ pub fn analyse_function_with(
         pending: None,
         start_is_decl: false,
         ret: vec![false; results.len()],
+        errors: go_result_types(func, cx.src).iter().map(|t| t == "error").collect(),
         results,
         exit: None,
         in_closure: 0,
@@ -463,6 +487,7 @@ pub fn analyse_function_with(
         aliases,
         locals,
         local_maps,
+        local_seqs,
         scopes: vec![],
     };
     let mut st = State::new();
@@ -562,6 +587,9 @@ impl<'a, 't> Walker<'a, 't> {
     }
 
     fn mark_ret(&mut self, i: usize) {
+        if self.errors.get(i).copied().unwrap_or(false) {
+            return;
+        }
         if self.ret.len() <= i {
             self.ret.resize(i + 1, false);
         }
@@ -813,7 +841,15 @@ impl<'a, 't> Walker<'a, 't> {
                 let prim: Vec<String> =
                     if v.carry.is_some() || !v.trees.is_empty() { vec!["moved".into()] } else { vec![] };
                 let id = self.hop(n, &v, &prim);
-                self.hops[id].returns |= v.carry.is_some();
+                // A value handed back only in `error` positions does not
+                // reach the caller.
+                let errs = &self.errors;
+                let reaches = if self.in_closure == 0 && !pos.is_empty() {
+                    pos.iter().enumerate().any(|(i, p)| *p && !errs.get(i).copied().unwrap_or(false))
+                } else {
+                    v.carry.is_some()
+                };
+                self.hops[id].returns |= reaches;
             }
         } else if self.holds_assign(n) {
             for c in named(n) {
@@ -1044,6 +1080,13 @@ impl<'a, 't> Walker<'a, 't> {
             if positions.as_ref().is_some_and(|p| !p.get(i).copied().unwrap_or(false)) {
                 v.carry = None;
             }
+            if rvals.len() == 1 && self.error_left(*l, n, &rvals[0], lefts.len()) {
+                v.carry = None;
+            }
+            if element && i == 0 && rights.len() == 1 && self.indexed(rights[0]) {
+                // The key of a range over a slice, array or string is a position.
+                v.carry = None;
+            }
             if self.is(&m.nodes.field, *l) && self.field_read(*l) {
                 // A write of the start field: the object now holds it.
                 v = Val { carry: Some(0), used: Some(0), exact: true, ..Val::default() };
@@ -1187,6 +1230,34 @@ impl<'a, 't> Walker<'a, 't> {
             for (name, paths) in &summary.writes {
                 self.store_through(st, name, paths, id, summary.cond);
             }
+        }
+    }
+
+    /// Whether left side `l` of assignment `n` takes an error result of an
+    /// outside call: a name `err` or a variable declared `error`, bound from
+    /// an unmodelled call, or from a modelled one with several results. A
+    /// model cannot name result positions, so its `return` is the value.
+    fn error_left(&self, l: Node<'t>, n: Node<'t>, v: &Val, lefts: usize) -> bool {
+        let applies = match v.outside {
+            Some(true) => true,
+            Some(false) => lefts > 1,
+            None => false,
+        };
+        if !applies || !self.is(&self.m.nodes.name, l) {
+            return false;
+        }
+        let name = self.t(l);
+        name == "err"
+            || binding_type(self.cx.root, self.cx.src, self.cx.file, name, line_of(n), &DefIndex::default())
+                .is_some_and(|t| t == "error")
+    }
+
+    /// Whether range operand `r` is a name declared as a slice, array or
+    /// string, so the first range variable is an index, not data.
+    fn indexed(&self, r: Node<'t>) -> bool {
+        self.is(&self.m.nodes.name, r) && {
+            let name = self.t(r);
+            !self.local_maps.contains(name) && self.local_seqs.contains(name)
         }
     }
 
@@ -1775,6 +1846,8 @@ impl<'a, 't> Walker<'a, 't> {
                 whole: inner.whole.clone(),
                 extra: inner.extra.clone(),
                 writes: inner.writes.clone(),
+                // Walks of calls nested in the arguments, innermost first.
+                trees: inner.trees.clone(),
                 ..Val::default()
             };
             inner
@@ -1856,6 +1929,11 @@ impl<'a, 't> Walker<'a, 't> {
         let keep = |out: &mut Val| {
             out.carry = inner.carry;
             out.paths = inner.paths.clone();
+        };
+        out.outside = match &effect {
+            CallEffect::Unknown => Some(true),
+            CallEffect::Pass | CallEffect::Clear | CallEffect::Whole | CallEffect::Model { .. } => Some(false),
+            _ => None,
         };
         match effect {
             CallEffect::Unknown => {

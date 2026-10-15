@@ -548,10 +548,17 @@ fn prune(h: &Hop, end: &str, eventually: bool, depth: usize, need_return: bool) 
         .iter()
         .map(|c| if c.into { None } else { prune(c, end, eventually, depth + 1, need_return) })
         .collect();
-    let needed = is_end || (need_return && h.returns) || kept.iter().any(|k| k.is_some());
+    // A callee walk that reaches an end on its own makes this hop needed, so
+    // the walks of calls nested in its arguments keep their return paths.
     for (i, c) in h.children.iter().enumerate() {
         if c.into {
-            kept[i] = prune(c, end, eventually, depth + 1, needed);
+            kept[i] = prune(c, end, eventually, depth + 1, false);
+        }
+    }
+    let needed = is_end || (need_return && h.returns) || kept.iter().any(|k| k.is_some());
+    for (i, c) in h.children.iter().enumerate() {
+        if c.into && needed {
+            kept[i] = prune(c, end, eventually, depth + 1, true);
         }
     }
     let children: Vec<Hop> = kept.into_iter().flatten().collect();
