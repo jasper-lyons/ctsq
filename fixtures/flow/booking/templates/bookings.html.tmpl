@@ -1,0 +1,6 @@
+{{template "layout.html.tmpl" .}}
+{{define "body"}}
+{{range .Bookings}}
+<p>{{.CustomerPhone}}</p>
+{{end}}
+{{end}}

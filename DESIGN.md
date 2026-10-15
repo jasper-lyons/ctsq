@@ -295,6 +295,8 @@ time.
   interface, the call expands to one edge per project type whose method set
   covers all of the interface's methods — a single implementor is exact,
   several are each a guess, none points the edge at the signature line.
+  The flow walk narrows this to constructed implementations (see
+  "Interface widening").
 - Calls inside `go` / `defer` statements and func literals attribute to the
   enclosing named function; generic instantiations (`f[int]()`) unwrap.
 
@@ -336,15 +338,15 @@ Each hop carries its definition, the line where it calls the next hop, and the c
 
 ## `ctsq path` output
 
-`src/semantic/print.rs` prints call routes. `main.rs` runs `ctsq path '<query>' [paths...]` with `--max N` (default 12), `--all`, `--only <tag,...>` (stored, applied by the data-flow walk) and `--body`.
+`src/semantic/print.rs` prints call routes. `main.rs` runs `ctsq path '<query>' [paths...]` with `--max N` (default 12), `--all`, `--only <tag,...>` (applied by the data-flow walk, see "Printing" under Cross-function flow) and `--body`.
 
 - Every row is `path:line`, padded, the definition name (`Owner.name` for methods), then `calls <next> at :<line>`. A guessed edge prints `?` after the callee. Two spaces per level, no box characters.
 - Routes with the same start merge into one tree, so a shared prefix prints once and a row lists each callee it reaches. Upward queries print in the order written, the first selector first, and each row says `called by <caller> at :<line>`.
 - `--body` prints each definition body under its row, one level deeper.
 - The trailer is `N route(s)`, then notes for selectors that matched nothing, definitions removed by `:not` and a search stopped at its cap.
 - `print::row(path, line, func, text, tags)` lays out one row, and data-flow trees reuse it.
-- Exit codes: 0 routes found, 1 none, 2 usage or query error. A query with a data-flow combinator prints `data-flow walking is not available yet` and exits 2 until the flow walk lands.
-- `fixtures/.ignore` hides `fixtures/path/` from directory scans of `fixtures/`, so the pinned call graph test keeps its output. Naming `fixtures/path` directly still works.
+- Exit codes: 0 routes found, 1 none, 2 usage or query error. Data-flow and upward queries print through `semantic::flows`, see Cross-function flow and Upward flow.
+- `fixtures/.ignore` hides `fixtures/path/` and `fixtures/flow/` from directory scans of `fixtures/`, so the pinned call graph test keeps its output. Naming a fixture directory such as `fixtures/flow/booking` directly still works.
 
 ## Verification
 
@@ -394,7 +396,7 @@ A file named `name@1.23.toml` is versioned. The `go` line of the nearest `go.mod
 
 ## Outside the codebase
 
-For Go, a call is outside when the import path is neither the module path from `go.mod` nor under it (`config::gomod::is_outside`). A call with no model is assumed to derive its return value from its arguments and is tagged `unmodelled`.
+For Go, a call is outside when the import path is neither the module path from `go.mod` nor under it (`config::gomod::is_outside`). A call outside with no model is assumed to derive its return value from its arguments and is tagged `unmodelled`. A call into the repo with no model is followed or tagged `via`, see "Models in the flow".
 
 ## Commands
 
@@ -407,15 +409,15 @@ For Go, a call is outside when the import path is neither the module path from `
 
 ## Mechanics keys it adds
 
-- `[nodes]`: `function`, `block`, `case`, `default_case`, `name`, `field_name`, `field_decl`, `type_decl`, `range`, `list`, `loop_clause`, `index`, `declare` (assignments that declare their names in the enclosing block).
-- `[fields]`: `left`, `right`, `operator`, `condition`, `initializer`, `update`, `consequence`, `alternative`, `body`, `alias`, `case_label`, `function`, `arguments`, `operand`, `field`, `name`.
+- `[nodes]`: `function`, `block`, `case`, `default_case`, `name`, `field_name`, `field_decl`, `type_decl`, `range`, `list`, `loop_clause`, `index`, `declare` (assignments that declare their names in the enclosing block), `send`, `global`, `map_type`, `keyed`, `element`, `conversion`, `generic` (see Object tracking).
+- `[fields]`: `params`, `left`, `right`, `operator`, `condition`, `initializer`, `update`, `consequence`, `alternative`, `body`, `alias`, `case_label`, `function`, `arguments`, `operand`, `field`, `name`.
 - `[tokens]`: `plain_assign` (operators that replace the left side) `blank` (names that discard a value) and `declare` (the token that makes a range header declare its names, `:=`).
 
 ## API
 
 - `start_at(&FlowCtx, start_byte, end_byte) -> Option<Start>` classifies the node at a byte range. A field name, in a struct declaration or a read, gives `StartKind::Field` with its owner type when known. A plain name gives `StartKind::Var`.
 - `enclosing_function(root, &Mechanics, byte)` finds the function to walk.
-- `analyse_function(&FlowCtx, func, &Start, is_end, &dyn Outside) -> FlowResult` walks it. `is_end` is a closure over call nodes. `Outside` answers for every other call that receives tracked data with `CallEffect::Unknown`, `Pass`, `Clear` or `Whole`. A closure `Fn(&CallSite) -> CallEffect` is an `Outside`, and `no_models` answers `Unknown` for everything.
+- `analyse_function(&FlowCtx, func, &Start, is_end, &dyn Outside) -> FlowResult` walks it. `is_end` is a closure over call nodes. `Outside` answers for every other call that receives tracked data with a `CallEffect`: `Unknown`, `Pass`, `Clear`, `Whole`, and the variants the later sections add (`Model`, `Via`, `Into`, `Cut`, `Stop`). A closure `Fn(&CallSite) -> CallEffect` is an `Outside`, and `no_models` answers `Unknown` for everything.
 - `FlowResult.root` is a tree of `Hop` (file, line, function, trimmed source line, tags, children). A hop's children read what it produced.
 - `report(&[FlowResult]) -> String` prints the rows of the Output format, two spaces of indent per level, then the sink count and the routes that end at an unmodelled call.
 
@@ -450,7 +452,7 @@ With no model, a call into the repo gives `CallEffect::Via(name)`: the result ca
 
 # Cross-function flow
 
-`semantic::flows::evaluate_flows` runs the data-flow combinators of `ctsq path`. `=>` reads "flows in one step to", `==>` reads "eventually flows to". The backward forms `<=` and `<==`, a chain of more than one flow step, `:not()` and a mix with call combinators exit 2.
+`semantic::flows::evaluate_flows` runs the data-flow combinators of `ctsq path`. `=>` reads "flows in one step to", `==>` reads "eventually flows to". A chain of more than one flow step, `:not()` and a mix with call combinators exit 2. The backward forms `<=` and `<==` run through `evaluate_upward`, see Upward flow.
 
 ## Starts and ends
 
