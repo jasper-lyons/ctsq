@@ -56,6 +56,9 @@ struct Fragment {
     params_needs_bridge: bool,
     body_field: Option<&'static str>,
     body_container: Option<&'static str>,
+    /// Also capture the emitted node as `@_root`, so a scoped runner can find the
+    /// head node even when the user's own captures sit elsewhere in the pattern.
+    extra_root: bool,
 }
 
 impl Fragment {
@@ -85,6 +88,7 @@ impl Fragment {
             let name_cap = format!("@_n{}", id);
             let pred = name_predicate(&name_cap, &nm);
             let cap = self.outer_capture.get_or_insert_with(|| format!("_root{}", fresh_id()));
+            let cap = if self.extra_root { format!("{} @_root", cap) } else { cap.clone() };
             let inner_name = format!("({}) {}", wrap.name_node, name_cap);
             let wrapped = format!(
                 "({} {}: {} {}: {} @{})",
@@ -95,7 +99,11 @@ impl Fragment {
         }
 
         let cap = self.outer_capture.get_or_insert_with(|| format!("_root{}", fresh_id()));
-        let with_cap = format!("{} @{}", node, cap);
+        let with_cap = if self.extra_root {
+            format!("{} @{} @_root", node, cap)
+        } else {
+            format!("{} @{}", node, cap)
+        };
         if self.predicates.is_empty() {
             with_cap
         } else {
@@ -134,8 +142,40 @@ pub fn compile(query: &Query, lang: &dyn Lang) -> CompiledQuery {
     if let Some((outer, scope_field, inner)) = try_compile_scoped(query, lang) {
         return CompiledQuery::Scoped { outer, scope_field, inner };
     }
+    if let Some((outer, scope_field, inner)) = try_compile_descendant(query, lang) {
+        return CompiledQuery::Scoped { outer, scope_field, inner };
+    }
     let frags = compile_query(query, lang);
     CompiledQuery::Simple(emit_alternation(frags))
+}
+
+/// Compile a top-level `head tail...` descendant as a two-phase scoped query so
+/// the tail may sit at any depth under the head, not just one grammar node down.
+/// Only the first top-level descendant gets this treatment. The rest of the query
+/// becomes the inner query, where later descendants keep the one-level `(_ ...)`
+/// bridge. The scope field is empty, which the runner reads as "the whole node".
+fn try_compile_descendant(query: &Query, lang: &dyn Lang) -> Option<(String, String, String)> {
+    let (first, rest) = query.tail.split_first()?;
+    if first.0 != Combinator::Descendant {
+        return None;
+    }
+    let outer_frags: Vec<Fragment> = compile_selector(&query.head, lang)
+        .into_iter()
+        .map(|mut f| {
+            f.extra_root = true;
+            f
+        })
+        .collect();
+    let outer = emit_alternation(outer_frags);
+    if outer.is_empty() {
+        return None;
+    }
+    let inner_query = Query { head: first.1.clone(), tail: rest.to_vec() };
+    let inner = emit_alternation(compile_query(&inner_query, lang));
+    if inner.is_empty() {
+        return None;
+    }
+    Some((outer, String::new(), inner))
 }
 
 /// The abstract kinds this language resolves, in vocabulary order. Used for the
@@ -391,6 +431,7 @@ fn compile_wildcard(atom: &Atom) -> Fragment {
         params_needs_bridge: false,
         body_field: None,
         body_container: None,
+        extra_root: false,
     }
 }
 
@@ -407,6 +448,7 @@ fn compile_passthrough(node_type: &str, atom: &Atom) -> Fragment {
         params_needs_bridge: false,
         body_field: None,
         body_container: None,
+        extra_root: false,
     }
 }
 
@@ -474,6 +516,7 @@ fn compile_variant(variant: &TsVariant, atom: &Atom) -> Fragment {
         params_needs_bridge: variant.params_needs_bridge,
         body_field: variant.body_field,
         body_container: variant.body_container,
+        extra_root: false,
     }
 }
 
@@ -490,6 +533,7 @@ fn apply_field_access(frags: Vec<Fragment>, fa: &FieldAccess, lang: &dyn Lang) -
             params_needs_bridge: false,
             body_field: None,
             body_container: None,
+            extra_root: false,
         }],
         Some(inner_query) => compile_query(inner_query, lang),
     };
@@ -871,5 +915,39 @@ mod tests {
         // call is now a known-absent no-op in all languages
         assert!(compile_str("call", "c").is_empty());
         assert!(compile_str("call", "javascript").is_empty());
+    }
+
+    #[test]
+    fn a_top_level_descendant_compiles_to_an_empty_field_scope() {
+        let q = parse("(*function#handle @f) variable#name").unwrap();
+        let lang = for_name("go").unwrap();
+        match compile(&q, lang.as_ref()) {
+            CompiledQuery::Scoped { outer, scope_field, inner } => {
+                assert_eq!(scope_field, "");
+                assert!(outer.contains("@f @_root"), "explicit @_root beside the user capture: {}", outer);
+                assert!(inner.contains("\"name\""), "{}", inner);
+            }
+            other => panic!("expected Scoped, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn nested_and_later_descendants_keep_the_one_level_bridge() {
+        let lang = for_name("go").unwrap();
+        // Inside a group: stays Simple with the (_ ...) bridge.
+        let q = parse("(function#a variable#b)").unwrap();
+        match compile(&q, lang.as_ref()) {
+            CompiledQuery::Simple(s) => assert!(s.contains("(_ "), "{}", s),
+            other => panic!("expected Simple, got {:?}", other),
+        }
+        // A second descendant stays in the inner query as a bridge.
+        let q = parse("function#a block variable#b").unwrap();
+        match compile(&q, lang.as_ref()) {
+            CompiledQuery::Scoped { inner, .. } => assert!(inner.contains("(_ "), "{}", inner),
+            other => panic!("expected Scoped, got {:?}", other),
+        }
+        // Child combinator is untouched.
+        let q = parse("function#a > variable#b").unwrap();
+        assert!(matches!(compile(&q, lang.as_ref()), CompiledQuery::Simple(_)));
     }
 }

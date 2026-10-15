@@ -110,6 +110,10 @@ The arrow function case is structural: the name lives in a parent `variable_decl
 4. Emit      — produce TreeSitter S-expression query string
 ```
 
+### Descendant depth
+
+A descendant at the top level of a query (`function#handle variable#name`) matches the tail at any depth below the head. It compiles to a two-phase scoped query whose scope field is empty, meaning the whole head node. The head pattern also gets an explicit `@_root` capture, and the runner scopes to that node in preference to any user capture. The tail must be strictly below the head, so a head that matches its own tail pattern does not count. Each row sits on the tail match, not on the head. Only the first top-level descendant gets this treatment. Descendants inside groups, inside field inner queries, and after the first top-level one keep the older form, where the tail is wrapped in one `(_ ...)` node and so reaches one grammar level down.
+
 ### Name match compilation
 
 | Abstract | TreeSitter predicate |
