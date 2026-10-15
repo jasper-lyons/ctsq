@@ -7,6 +7,17 @@ use serde::{Deserialize, Serialize};
 pub struct Mechanics {
     pub outside: Outside,
     pub nodes: Nodes,
+    /// Child field names the flow engine reads from the node kinds above.
+    pub fields: Fields,
+    /// Token texts the flow engine compares against.
+    pub tokens: Tokens,
+}
+
+impl Mechanics {
+    /// Whether `kind` is listed in `list`.
+    pub fn is(list: &[String], kind: &str) -> bool {
+        list.iter().any(|k| k == kind)
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -31,4 +42,75 @@ pub struct Nodes {
     pub loop_: Vec<String>,
     pub assert: Vec<String>,
     pub composite: Vec<String>,
+    /// Function bodies: declarations, methods and literals.
+    pub function: Vec<String>,
+    /// Statement containers walked in order.
+    pub block: Vec<String>,
+    /// Arms of a branch node (switch cases).
+    pub case: Vec<String>,
+    /// The arm taken when no other matches. Without one a switch may run no arm.
+    pub default_case: Vec<String>,
+    /// Plain variable names.
+    pub name: Vec<String>,
+    /// The field name inside a field read, and in a struct declaration.
+    pub field_name: Vec<String>,
+    /// A field declared in a struct type.
+    pub field_decl: Vec<String>,
+    /// A named type declaration, its name gives the owner of a field.
+    pub type_decl: Vec<String>,
+    /// Loop header that binds each element of a collection.
+    pub range: Vec<String>,
+    /// Comma separated lists flattened into their items.
+    pub list: Vec<String>,
+    /// Header of a counted loop (initializer, condition, update).
+    pub loop_clause: Vec<String>,
+    /// Element store such as `m[k]`, assigning through it follows the collection.
+    pub index: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Fields {
+    /// Left side of an assignment.
+    pub left: Vec<String>,
+    /// Right side of an assignment.
+    pub right: Vec<String>,
+    /// Operator of an assignment.
+    pub operator: Vec<String>,
+    /// Condition of a branch or loop, which carries no data.
+    pub condition: Vec<String>,
+    /// Statement run before a branch or loop.
+    pub initializer: Vec<String>,
+    /// Statement run after each loop iteration.
+    pub update: Vec<String>,
+    /// Then arm of a branch.
+    pub consequence: Vec<String>,
+    /// Else arm of a branch.
+    pub alternative: Vec<String>,
+    /// Body of a loop or function.
+    pub body: Vec<String>,
+    /// Name bound to the switched value in a type switch.
+    pub alias: Vec<String>,
+    /// Case labels, skipped when walking a case body.
+    pub case_label: Vec<String>,
+    /// Callee of a call.
+    pub function: Vec<String>,
+    /// Argument list of a call.
+    pub arguments: Vec<String>,
+    /// Object part of a field read.
+    pub operand: Vec<String>,
+    /// Field part of a field read.
+    pub field: Vec<String>,
+    /// Name of a function or type declaration.
+    pub name: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Tokens {
+    /// Assignment operators that replace the left side. Any other operator
+    /// (such as `+=`) keeps what the left side already held.
+    pub plain_assign: Vec<String>,
+    /// Names that discard a value.
+    pub blank: Vec<String>,
 }

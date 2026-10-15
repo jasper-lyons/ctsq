@@ -368,3 +368,36 @@ For Go, a call is outside when the import path is neither the module path from `
 
 - `ctsq config path` prints the four locations in lookup order.
 - `ctsq config dump <lang>` prints the merged mechanics, the selected Go version and the model count per source.
+
+# Flow engine
+
+`src/flow` follows one value through one function. It reads node kinds from `[nodes]`, child field names from `[fields]` and token texts from `[tokens]` in the language's mechanics file, and names no language node itself.
+
+## Mechanics keys it adds
+
+- `[nodes]`: `function`, `block`, `case`, `default_case`, `name`, `field_name`, `field_decl`, `type_decl`, `range`, `list`, `loop_clause`, `index`.
+- `[fields]`: `left`, `right`, `operator`, `condition`, `initializer`, `update`, `consequence`, `alternative`, `body`, `alias`, `case_label`, `function`, `arguments`, `operand`, `field`, `name`.
+- `[tokens]`: `plain_assign` (operators that replace the left side) and `blank` (names that discard a value).
+
+## API
+
+- `start_at(&FlowCtx, start_byte, end_byte) -> Option<Start>` classifies the node at a byte range. A field name, in a struct declaration or a read, gives `StartKind::Field` with its owner type when known. A plain name gives `StartKind::Var`.
+- `enclosing_function(root, &Mechanics, byte)` finds the function to walk.
+- `analyse_function(&FlowCtx, func, &Start, is_end, &dyn Outside) -> FlowResult` walks it. `is_end` is a closure over call nodes. `Outside` answers for every other call that receives tracked data with `CallEffect::Unknown`, `Pass`, `Clear` or `Whole`. A closure `Fn(&CallSite) -> CallEffect` is an `Outside`, and `no_models` answers `Unknown` for everything.
+- `FlowResult.root` is a tree of `Hop` (file, line, function, trimmed source line, tags, children). A hop's children read what it produced.
+- `report(&[FlowResult]) -> String` prints the rows of the Output format, two spaces of indent per level, then the sink count and the routes that end at an unmodelled call.
+
+## Rules (in order)
+
+1. A parameter, or a variable bound outside the body, is tracked from the first statement. A variable bound inside the body is tracked after its binding statement. A variable read inside the body is tracked from that statement.
+2. A field start tracks every read `x.Field` in the function. When the owner type is known and `binding_type` gives `x` another type, the read is skipped.
+3. Assignment with a tracked right side tracks each name on the left: `exact` when the right side is just the tracked value, `derived` otherwise. Unequal left and right counts give `derived`. A range header binds one element, so it is `derived`.
+4. Assignment with nothing tracked on the right drops each name on the left. An operator outside `plain_assign`, such as `+=`, keeps what the left side held.
+5. A store into `o.F` or `m[k]` tracks the object `o` or `m`. A field store adds the tag `field F`.
+6. Conditions carry no data. A sink called inside a condition is still recorded.
+7. After an if or switch, a name is tracked when any arm tracked it, tagged `conditional@<line>` of the condition when not every arm did. An if without else and a switch without a default arm count the untaken path as an arm.
+8. A loop reruns its header and body until the tracked set stops changing (at most 32 passes). The set after the loop joins the set before it, since the body may not run.
+9. A call whose argument is tracked and that `is_end` accepts is a `sink`. Any other call that receives a tracked argument or receiver asks `Outside`. `Unknown` carries the data and tags `unmodelled`. `Pass` carries it. `Clear` stops it (decision 11). `Whole` carries it and also tracks the receiver object.
+10. A call statement that receives tracked data is `moved`, and so is a return of a tracked value.
+11. A hop's tags read in the order primary (`exact`, `derived`, `moved`), `field`, `conditional@`, `unmodelled`, `sink`. A hop's parent is the hop that produced the first tracked value it reads.
+12. Names are tracked without scopes, so shadowing is not modelled. Function literals inside the function are not walked.
