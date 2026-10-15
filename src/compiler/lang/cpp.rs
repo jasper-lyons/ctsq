@@ -98,6 +98,23 @@ impl Lang for CppLang {
             "while" => Some(vec![simple("while_statement")]),
             "switch" => Some(vec![simple("switch_statement")]),
             "op" => Some(vec![simple("binary_expression")]),
+            "field" => Some(match sigil {
+                Some(Sigil::Def) => vec![
+                field_at("field_declaration", "declarator", "field_identifier", &[]),
+                field_at("field_declaration", "declarator", "field_identifier", &[("pointer_declarator", "declarator")]),
+                field_at("field_declaration", "declarator", "field_identifier", &[("array_declarator", "declarator")]),
+            ],
+                Some(Sigil::Ref) => vec![field_at("field_expression", "field", "field_identifier", &[])],
+                None => {
+                    let mut v = vec![
+                field_at("field_declaration", "declarator", "field_identifier", &[]),
+                field_at("field_declaration", "declarator", "field_identifier", &[("pointer_declarator", "declarator")]),
+                field_at("field_declaration", "declarator", "field_identifier", &[("array_declarator", "declarator")]),
+            ];
+                    v.extend(vec![field_at("field_expression", "field", "field_identifier", &[])]);
+                    v
+                }
+            }),
             "call" => Some(vec![]),
             _ => None,
         }
@@ -238,6 +255,18 @@ fn field_identifier() -> TsVariant {
         always_constraint: None,
         parent_name_wrap: None, always_callee_eq: None,
     }
+}
+
+/// A field node whose name is the `name_node` child reached through
+/// `name_field` and `path`. The match lands on the declaration or access, and
+/// attribute filters read the field name back off it.
+fn field_at(
+    node: &'static str,
+    name_field: &'static str,
+    name_node: &'static str,
+    path: &'static [(&'static str, &'static str)],
+) -> TsVariant {
+    TsVariant { name_field: Some(name_field), name_node, name_path: path, ..simple(node) }
 }
 
 fn simple(node: &'static str) -> TsVariant {

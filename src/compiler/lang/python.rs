@@ -46,6 +46,16 @@ impl Lang for PyLang {
             "for" => Some(vec![simple("for_statement")]),
             "while" => Some(vec![simple("while_statement")]),
             "call" => Some(vec![simple("call")]),
+            // `self.x = …` declares an instance field. Every `a.b` is an access.
+            "field" => Some(match sigil {
+                Some(Sigil::Def) => vec![field_at("assignment", "left", "identifier", &[("attribute", "attribute")])],
+                Some(Sigil::Ref) => vec![field_at("attribute", "attribute", "identifier", &[])],
+                None => {
+                    let mut v = vec![field_at("assignment", "left", "identifier", &[("attribute", "attribute")])];
+                    v.extend(vec![field_at("attribute", "attribute", "identifier", &[])]);
+                    v
+                }
+            }),
             "module" | "switch" | "type" | "op" => Some(vec![]),
             _ => None,
         }
@@ -119,6 +129,18 @@ fn identifier() -> TsVariant {
         always_constraint: None,
         parent_name_wrap: None, always_callee_eq: None,
     }
+}
+
+/// A field node whose name is the `name_node` child reached through
+/// `name_field` and `path`. The match lands on the declaration or access, and
+/// attribute filters read the field name back off it.
+fn field_at(
+    node: &'static str,
+    name_field: &'static str,
+    name_node: &'static str,
+    path: &'static [(&'static str, &'static str)],
+) -> TsVariant {
+    TsVariant { name_field: Some(name_field), name_node, name_path: path, ..simple(node) }
 }
 
 fn simple(node: &'static str) -> TsVariant {
