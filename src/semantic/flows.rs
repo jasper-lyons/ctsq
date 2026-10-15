@@ -15,6 +15,7 @@ use tree_sitter::Node;
 use super::print::{plural, row};
 use super::{segment_rows, split_query};
 use crate::config::{self, gomod, LangConfig, Slot};
+use crate::flow::widen;
 use crate::flow::{
     self, upward, analyse_function, analyse_function_with, enclosing_function, start_at, start_in, CallEffect, CallSite,
     EndFn, FlowCtx, FlowResult, Hop, ModelOutside, Module, Outside, Paths, StartKind,
@@ -31,11 +32,14 @@ pub struct FlowOptions {
     /// Keep only hops carrying one of these tags, with their ancestors. Only
     /// routes with such a hop count.
     pub only: Vec<String>,
+    /// List the implementations of module interfaces that live outside the
+    /// module (`--expand`).
+    pub expand: bool,
 }
 
 impl Default for FlowOptions {
     fn default() -> Self {
-        FlowOptions { max: 12, only: vec![] }
+        FlowOptions { max: 12, only: vec![], expand: false }
     }
 }
 
@@ -143,7 +147,8 @@ pub fn evaluate_flows(
         .filter_map(|(f, pf)| pf.tree.as_ref().map(|t| (f, t.root_node(), pf.source.as_slice())))
         .collect();
     let module = Module::build(&files, &cfg.mechanics);
-    let walk = Walk::new(store, graph, &cfg, &module, &is_end, eventually, opts.max);
+    let mut walk = Walk::new(store, graph, &cfg, &module, &is_end, eventually, opts.max);
+    walk.expand = opts.expand;
     let mut groups: Vec<FlowResult> = vec![];
     let mut raw: Vec<FlowResult> = vec![];
 
@@ -234,6 +239,7 @@ pub fn evaluate_flows(
         cut += pruned.walk().iter().filter(|h| h.has(MAX_DEPTH)).count();
         print_tree(&pruned, 0, &mut out);
     }
+    out.push_str(&walk.outside_rows());
     if groups.is_empty() {
         out.push_str("note: the start selector matched no variable, parameter or field\n");
     }
@@ -543,7 +549,12 @@ fn prune(h: &Hop, end: &str, eventually: bool, depth: usize, need_return: bool) 
 /// Whether a hop's tag is one of `wanted`: the whole tag, or its first word
 /// (`via` keeps `via normalise`, `conditional` keeps `conditional@4`).
 fn tag_matches(tag: &str, wanted: &[String]) -> bool {
-    wanted.iter().any(|w| tag == w || tag.starts_with(&format!("{} ", w)) || tag.starts_with(&format!("{}@", w)))
+    wanted.iter().any(|w| {
+        tag == w
+            || tag.starts_with(&format!("{} ", w))
+            || tag.starts_with(&format!("{}@", w))
+            || tag.starts_with(&format!("{}:", w))
+    })
 }
 
 /// Keep hops carrying one of the `wanted` tags and their ancestors.
@@ -599,6 +610,12 @@ struct Walk<'a> {
     memo: RefCell<HashMap<(String, usize, Vec<usize>, bool, String), CallEffect>>,
     /// The end predicate, used inside callees too.
     end: &'a EndFn<'a>,
+    /// Outside implementations of module interfaces, found on first use.
+    outside: std::cell::OnceCell<HashMap<String, Vec<widen::OutsideImpl>>>,
+    /// Print the outside implementations of the interfaces widened (`--expand`).
+    expand: bool,
+    /// Interfaces whose widened calls were followed and have outside implementations.
+    widened_ifaces: RefCell<Vec<String>>,
 }
 
 impl<'a> Walk<'a> {
@@ -631,6 +648,9 @@ impl<'a> Walk<'a> {
             active: RefCell::new(vec![]),
             memo: RefCell::new(HashMap::new()),
             end,
+            outside: std::cell::OnceCell::new(),
+            expand: false,
+            widened_ifaces: RefCell::new(vec![]),
         }
     }
 
@@ -776,15 +796,74 @@ impl<'a> Walk<'a> {
                 }
                 r.root.tags = vec!["moved".into()];
                 r.root.into = true;
-                if targets.len() > 1 {
+                if targets.len() > 1 || self.has_outside(site) {
                     r.root.tags.push("widened".into());
                 }
                 trees.push(r.root);
             }
         }
+        let iface = site.recv_type.as_deref().map(|t| t.rsplit('.').next().unwrap_or(t).to_string());
+        let outside = iface.as_deref().map(|i| self.outside_of(i)).unwrap_or_default();
+        let in_repo = targets.len();
+        if walked && (in_repo > 1 || !outside.is_empty()) {
+            let tag = widen::widened_tag(in_repo, outside.len());
+            for t in &mut trees {
+                if let Some(w) = t.tags.iter_mut().find(|x| x.as_str() == "widened") {
+                    *w = tag.clone();
+                }
+            }
+            if let (Some(i), false) = (iface, outside.is_empty()) {
+                let mut seen = self.widened_ifaces.borrow_mut();
+                if !seen.contains(&i) {
+                    seen.push(i);
+                }
+            }
+        }
         let effect = if walked { CallEffect::Into { name, returns, writes, trees } } else { CallEffect::Via(name) };
         self.memo.borrow_mut().insert(key, effect.clone());
         effect
+    }
+
+    fn outside_map(&self) -> &HashMap<String, Vec<widen::OutsideImpl>> {
+        self.outside.get_or_init(|| {
+            let files: Vec<(&str, Node, &[u8])> = self
+                .store
+                .iter()
+                .filter(|(_, pf)| pf.lang == "go")
+                .filter_map(|(f, pf)| pf.tree.as_ref().map(|t| (f, t.root_node(), pf.source.as_slice())))
+                .collect();
+            widen::outside_impls(&files, &self.graph.index, self.cfg.module_path.as_deref())
+        })
+    }
+
+    /// Outside implementations of the interface named `iface`.
+    fn outside_of(&self, iface: &str) -> Vec<widen::OutsideImpl> {
+        self.outside_map().get(iface).cloned().unwrap_or_default()
+    }
+
+    fn has_outside(&self, site: &CallSite) -> bool {
+        site.recv_type
+            .as_deref()
+            .is_some_and(|t| self.outside_map().contains_key(t.rsplit('.').next().unwrap_or(t)))
+    }
+
+    /// Rows for the outside implementations of the interfaces this run
+    /// widened, printed only with `--expand`.
+    fn outside_rows(&self) -> String {
+        let mut out = String::new();
+        if !self.expand {
+            return out;
+        }
+        let mut names = self.widened_ifaces.borrow().clone();
+        names.sort();
+        for i in names {
+            for o in self.outside_of(&i) {
+                let tags = vec![format!("outside implementation of {}", i)];
+                out.push_str(&row(&o.file, o.line, &o.ty, &o.text, &tags));
+                out.push('\n');
+            }
+        }
+        out
     }
 
     /// A call through a variable holding a function (`send(x)` after

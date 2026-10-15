@@ -544,6 +544,7 @@ func done() {}
 func Save(w W) {
   w.Write()
 }
+func mk() { _, _ = &F{}, &B{} }
 ";
         let res = eval(&[("a/a.go", src)], "function#Save --> function#done", &CallOptions::default());
         assert_eq!(res.routes.len(), 2, "{:?}", res.routes);

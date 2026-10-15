@@ -534,7 +534,15 @@ The cross-function walk follows calls whose callee is not a declared function na
 
 ## Interfaces
 
-A method call whose call graph targets are all interface method signatures (no implementation in the scanned files) is tagged `stopped: interface`. A call with several implementations keeps one walk per target, tagged `widened`.
+A method call whose call graph targets are all interface method signatures (no constructed implementation in the scanned files) is tagged `stopped: interface`. A call with several implementations keeps one walk per target, tagged `widened`. See "Interface widening" below.
+
+### Interface widening
+
+A call through an interface goes to every implementation the program constructs, not every type with the methods (rapid type analysis, plan decision 14). The Go resolver's `collect_impls` records each type built by a composite literal (`T{}`, `&T{}`) or `new(T)` as `(T, "#constructed")` in `DefIndex.impls`. `resolve::go::constructed_types` adds the return types of functions and the `NewT` naming convention. `interface_impls` keeps only implementations in that set, so the call routes and the flow walk see the same targets. With none constructed the edge points at the signature and the flow walk stops with `stopped: interface`.
+
+A type assertion (`v, ok := x.(*T)`, `v := x.(*T)`) binds `v` to T, and `switch t := x.(type) { case *T: }` binds `t` to T inside that case. A `default` case or a case with several types binds nothing. Calls on the narrowed variable then resolve to T alone.
+
+Implementations outside the module are found best effort by `flow::widen::outside_impls`: a literal of a type from another package that is assigned to a `var` of the interface type, or passed to a module function whose parameter has the interface type. When there are any, the row of each followed target is tagged `widened: N in repo, M outside`. `--expand` on `ctsq path` prints one row per outside type after the trees, tagged `outside implementation of I`. Interfaces from the standard library (`io.Writer`) are not widened, the walk ends at the outside call.
 
 # Upward flow
 

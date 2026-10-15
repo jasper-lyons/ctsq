@@ -13,6 +13,7 @@ mod report;
 mod tests;
 pub mod upward;
 pub mod values;
+pub mod widen;
 
 // Used by the path and models packages.
 #[allow(unused_imports)]
