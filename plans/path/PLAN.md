@@ -14,7 +14,7 @@ Example queries this plan must make work:
 ctsq path 'function#parseConfig --> function#validate'
 ctsq path 'function#handle variable#name ==> function#/Printf|Log/'
 ctsq path 'field#Booking.CustomerPhone ==> function#log.Printf'
-ctsq path 'field#User.Username ==> template-action'
+ctsq path 'field#User.Username ==> template_action'
 ```
 
 ## Decisions
@@ -31,7 +31,7 @@ Why: one query often mixes contexts, for example "the variable `name` written in
 
 ### 02. Syntax stays as close to CSS as possible
 
-Attributes use CSS form `[name=value]` with `^=` (starts with), `*=` (contains), `$=` (ends with) and `=/regex/`. Avoiding routes uses `:not(selector)`. Why: Jasper's rule. Beat: flags like `--via` and `--avoid`.
+Attributes use CSS form `[name=value]` (values containing `/` are quoted: `[from="log/slog"]`) with `^=` (starts with), `*=` (contains), `$=` (ends with) and `=/regex/`. Avoiding routes uses `:not(selector)`. Why: Jasper's rule. Beat: flags like `--via` and `--avoid`.
 
 ### 03. Attributes exist for every language
 
@@ -46,7 +46,7 @@ Why: qualifying names without language-specific syntax. Beat: package syntax per
 
 ### 05. Dot shorthand inside a name
 
-`function#log.Printf` means `function#Printf` where `from=log` OR `in=log` holds. `field#User.Email` reads the same way. A dot followed by an identifier and `(` stays field access (`.body(...)`). A dot inside a `#name` with no following `(` is the qualifier. The query always uses a dot, whatever separator the language uses. Why: short to type, one rule for every language.
+`function#log.Printf` means `function#Printf` where `in=log` holds or the import's local name (alias, else last path segment) is `log`. So `slog.Info` matches an import of `"log/slog"`. `field#User.Email` reads the same way. A dot followed by an identifier and `(` stays field access (`.body(...)`). A dot inside a `#name` with no following `(` is the qualifier. The query always uses a dot, whatever separator the language uses. Why: short to type, one rule for every language.
 
 ### 06. Every output row carries file and line numbers
 
@@ -141,7 +141,7 @@ Why: the `toml` crate is maintained and Rust-native. Beat: YAML (`serde_yaml` is
 
 ### 22. Semantic combinators evaluate after tree-sitter matching
 
-Tree-sitter cannot see across functions or files, or know import origins. The query AST is split into AST segments (compiled as today) joined by semantic combinators, evaluated in a new stage that joins runner matches against the call graph or the flow engine. Attributes are also filtered in this stage. Why: the compiler only emits S-expressions (see `src/compiler/mod.rs:272`).
+Tree-sitter cannot see across functions or files, or know import origins. The query AST is split into AST segments (compiled as today) joined by semantic combinators, evaluated in a new stage that joins runner matches against the call graph or the flow engine. Attributes are also filtered in this stage. Semantic combinators are only allowed at the top level of a query, never inside groups or field inner queries. The last selector of each AST segment supplies the start or end node. Why: the compiler only emits S-expressions (see `src/compiler/mod.rs:272`).
 
 ### 23. Semantic combinators live in the `path` subcommand
 
@@ -178,7 +178,7 @@ The acceptance fixture is a small synthetic Go app written for ctsq that reprodu
 ## Conventions
 
 - Read `CLAUDE.md` and `DESIGN.md` in the repo root before starting. Use ctsq itself for code reading (`ctsq explain`, `ctsq tree`, `ctsq -q '*function#X' --body`), mdq for markdown.
-- Abstract vocabulary lives in `types::ABSTRACT_TYPES` (`src/types.rs:11`). New abstract kinds (`field`, `template-action`) are added there and validated by `compiler::validate` (`src/compiler/mod.rs:155`).
+- Abstract vocabulary lives in `types::ABSTRACT_TYPES` (`src/types.rs:11`). New abstract kinds (`field`, `template_action`) are added there and validated by `compiler::validate` (`src/compiler/mod.rs:155`).
 - Unknown kinds fail in `validate` with exit 1 before any file is read. Usage errors exit 2. A query with no results prints a report and exits 1.
 - `-q` output stays `path:LINE: <trimmed source line>`. Nothing in this plan changes it.
 - Write report functions that return `String` and test them directly (the pattern of `explain::report`, `tree::report`, `resolve::def_rows`). `tests/cli.rs` only covers the process boundary.
@@ -264,13 +264,13 @@ This is a CLI, so this section lists the command surface.
 
 | Command | Purpose | Package |
 |---|---|---|
-| `ctsq -q '<query>'` | unchanged, plus attributes and dot shorthand | attributes |
-| `ctsq path '<query>' [paths...]` | evaluate a query with call or data-flow combinators | call-walk, flow-local |
-| `--max N` | longest route in hops, default 12 | call-walk |
-| `--all` | every route, default is the 5 shortest per start | call-walk |
-| `--only <tag,...>` | keep only hops carrying these tags | flow-local |
+| `ctsq -q '<query>'` | unchanged, plus attributes and dot shorthand | attributes-syntax, attributes-eval |
+| `ctsq path '<query>' [paths...]` | evaluate a query with call or data-flow combinators | path-cli, flow-calls |
+| `--max N` | longest route in hops, default 12 | path-cli |
+| `--all` | every route, default is the 5 shortest per start | path-cli |
+| `--only <tag,...>` | keep only hops carrying these tags | path-cli declares, flow-calls applies |
 | `--expand` | list grouped outside implementations | widening |
-| `--body` | print each hop's function body under the row | call-walk |
+| `--body` | print each hop's function body under the row | path-cli |
 | `ctsq config path` | print the config and model directories in lookup order | models |
 | `ctsq config dump <lang>` | print the merged mechanics file and model count for a language | models |
 
@@ -308,166 +308,213 @@ src/order.go:14         parseOrder    o.Items = decode(data)               stopp
 
 ## Work packages
 
-`Cargo.toml` and `Cargo.lock` are owned by the orchestrator. `regex`, `serde` (derive) and `toml` are already added on the build branch. A package that needs another crate reports a blocker, except templates, which owns its grammar dependency.
+`Cargo.toml` and `Cargo.lock` are owned by the orchestrator. `regex`, `serde` (derive) and `toml` are already added. A package that needs another crate reports a blocker, except templates-grammar, which may edit `[dependencies]` and `[build-dependencies]` for its grammar.
 
-Each flow package owns its own fixture folder `fixtures/flow/<package>/` and test file `tests/path_<package>.rs`. Acceptance owns `fixtures/flow/booking/` and `tests/path.rs`.
+The crate is a binary only, so every `mod` line lives in `src/main.rs`. The orchestrator has already added `mod config;`, `mod semantic;` and `mod flow;` with empty stubs (`src/config/mod.rs`, `src/semantic/mod.rs`, `src/flow/mod.rs`). No package adds a `mod` line to `main.rs` for these. Submodules are declared inside the owning folder's `mod.rs`.
+
+Tests: there is no lib crate, so `tests/*.rs` can only drive the `ctsq` binary. Engine packages before path-cli test with `#[cfg(test)]` modules inside their own files. From flow-calls on, each flow package also owns `fixtures/flow/<package>/` and `tests/path_<package>.rs`. Acceptance owns `fixtures/flow/booking/` and `tests/path.rs`.
 
 | Stage | Package | Owns | Depends on | Tier |
 |---|---|---|---|---|
-| 1 | descendant | `src/compiler/mod.rs` (descendant compile only), `src/runner.rs` | none | Sonnet |
-| 1 | models | `src/config/`, `config/`, `src/main.rs` (`config` subcommand only) | none | Sonnet |
-| 2 | attributes | `src/query/`, `src/semantic/mod.rs` (created, minimal), `src/semantic/attrs.rs`, `src/compiler/mod.rs` (new combinator variants rejected, attribute stripping), `src/main.rs` (exit 2 hint, attribute filter call), additive import-origin helpers in `src/resolve/imports.rs` and `src/resolve/go.rs` | descendant, models | Sonnet |
-| 3 | call-walk | `src/semantic/mod.rs`, `src/semantic/calls.rs`, `src/semantic/print.rs`, `src/resolve/graph.rs`, `src/resolve/mod.rs`, `src/resolve/go.rs` (parse store, params), `src/main.rs` (`path` subcommand) | attributes | Opus |
-| 3 | flow-local | `src/flow/` (engine, tracked set, tags, report function), `config/languages/go.toml` (additive keys) | attributes | Opus |
-| 4 | flow-calls | `src/flow/interproc.rs`, `==>` and `=>` wiring in `src/semantic/`, `src/semantic/print.rs`, additive helpers in `src/resolve/go.rs` | call-walk, flow-local | Opus |
-| 5 | flow-objects | `src/flow/objects.rs`, edits in `src/flow/` needed for field paths, closures, function values, generics | flow-calls | Opus |
-| 6 | flow-up | `src/flow/upward.rs`, `src/semantic/mod.rs`, `src/semantic/attrs.rs` | flow-objects (after review fixes) | Opus |
-| 7 | widening | `src/flow/widen.rs`, `src/resolve/go.rs`, `src/semantic/print.rs`, `src/main.rs` (`--expand`) | flow-up | Sonnet |
-| 8 | templates | `src/compiler/lang/gotmpl.rs`, `src/compiler/lang/mod.rs`, `src/flow/template.rs`, `build.rs` or the grammar crate, `src/types.rs` | widening | Opus |
-| 9 | acceptance | `fixtures/flow/booking/`, `tests/path.rs` | templates | Sonnet |
+| 1 | descendant | `src/compiler/mod.rs` (descendant compile), `src/runner.rs`, `src/cooccur.rs` (only if counts need adjusting) | none | Sonnet |
+| 1 | models | `src/config/**`, `config/**`, `src/main.rs` (the `Config` subcommand variant and its dispatch arm only) | none | Sonnet |
+| 2 | attributes-syntax | `src/query/**`, `src/compiler/mod.rs` | descendant | Sonnet |
+| 3 | attributes-eval | `src/semantic/mod.rs`, `src/semantic/attrs.rs`, `src/resolve/imports.rs` (additive), `src/resolve/go.rs` (additive pub exports), `src/main.rs` (attribute filter call, `-q` exit 2 hint) | attributes-syntax, models | Opus |
+| 4 | call-walk | `src/semantic/calls.rs`, `src/semantic/mod.rs`, `src/resolve/graph.rs`, `src/resolve/mod.rs` (additive), `src/resolve/go.rs` (additive) | attributes-eval | Opus |
+| 4 | flow-engine | `src/flow/**`, `src/config/mechanics.rs` (additive fields) | attributes-eval | Opus |
+| 5 | path-cli | `src/semantic/print.rs`, `src/main.rs` (`path` subcommand and flags), `tests/path_cli.rs`, `fixtures/path/` | call-walk | Sonnet |
+| 5 | flow-models | `src/flow/**` | flow-engine | Opus |
+| 6 | flow-calls | `src/flow/**`, `src/semantic/mod.rs`, `src/semantic/flows.rs`, `src/semantic/print.rs`, `src/resolve/go.rs` (additive) | path-cli, flow-models | Opus |
+| 7 | flow-objects | `src/flow/**` | flow-calls | Opus |
+| 8 | flow-funcs | `src/flow/**`, `src/resolve/go.rs` (additive) | flow-objects | Opus |
+| 9 | adversarial review and fixer | read-only, then fixes by name | flow-funcs | Opus |
+| 10 | flow-up | `src/flow/**`, `src/semantic/mod.rs`, `src/semantic/flows.rs`, `src/semantic/attrs.rs` | review fixes | Opus |
+| 11 | widening | `src/flow/**`, `src/resolve/go.rs`, `src/semantic/print.rs`, `src/semantic/calls.rs`, `src/main.rs` (`--expand`) | flow-up | Sonnet |
+| 12 | templates-grammar | `src/compiler/lang/gotmpl.rs`, `src/compiler/lang/mod.rs`, `src/types.rs`, `build.rs`, `vendor/`, `Cargo.toml` (dependency sections) | widening | Opus |
+| 13 | templates-flow | `src/flow/**`, `src/semantic/flows.rs` | templates-grammar | Opus |
+| 14 | acceptance | `fixtures/flow/booking/`, `tests/path.rs`, `DESIGN.md` (final consistency) | templates-flow | Sonnet |
 
-Stage 1 packages run in parallel. Stage 3 packages run in parallel: flow-local does not touch `src/semantic/` or `src/resolve/`, it exposes a report function tested directly. An adversarial review runs after stage 5, before anything builds on the flow engine.
+Every package also owns the `DESIGN.md` section for its subsystem (additive). Stages run in order. Packages in the same stage run in parallel.
 
 ## Package: descendant
 
-**Problem.** `compile_query` (`src/compiler/mod.rs:272`) compiles the descendant combinator through one `(_ ...)` wildcard, so `function#handle variable#name` only finds `name` one grammar level below the function. Adjacent `+` and sibling `~` are not enforced either (`:319`), but they are out of scope.
+**Problem.** `compile_query` (`src/compiler/mod.rs:272`, descendant at `:297`) compiles descendant through one `(_ ...)` wildcard, so `function#handle variable#name` only finds `name` one level below the function.
 
-**Do.** Make descendant true descendant at any depth, by evaluating it the way `Scoped` evaluates `.body()`: run the head, then run the tail on each head match's subtree (`runner::run_rows`, `src/runner.rs:34`). Keep `Child` as a direct nesting.
-
-**Acceptance.**
-- A Go fixture with a variable three blocks deep inside a function is found by `function#handle variable#name`.
-- Every existing test in `cargo test` passes.
-- `DESIGN.md` describes descendant semantics.
-
-## Package: attributes
-
-**Lexer** (`src/query/parser.rs`, `Lexer::next_token` :31). Add real tokens for `[`, `]`, `=`, `^=`, `*=`, `$=`, `:`, and the multi-char combinators `->`, `-->`, `<-`, `<--`, `=>`, `==>`, `<=`, `<==` (the combinators are parsed here, evaluated by later packages). Today unknown characters lex as one-char `Ident` (fallback :78), so `[` must stop doing that. Regex values keep the `/.../` form.
-
-**Parser.**
-- `parse_atom` (:219): after the name match, parse zero or more `[key op value]`. Store as `Atom.attrs: Vec<AttrMatch>` with `AttrMatch{key, op: Eq|Prefix|Contains|Suffix|Regex, value}`.
-- Dot shorthand (decision 05): inside `#name`, `A.B` where the token after `B` is not `(` becomes name `B` plus `AttrMatch{key: "qual", op: Eq, value: A}`. `qual` matches if `from` or `in` matches. Field access `.body(` keeps working.
-- `:not(<selector>)` parses as a pseudo-class on a selector, stored on `Selector`. Only `path` evaluates it, as "the route must not pass through a match".
-- `parse_query` (:124) and its lookahead (:136, :147) accept the new combinators into `Combinator::{Calls, CallsEventually, CalledBy, CalledByEventually, Flows, FlowsEventually, FlowsFrom, FlowsFromEventually}`.
-- `ctsq -q` with a semantic combinator exits 2 with `use: ctsq path '<query>'` (decision 23).
-
-**Evaluation.** Attributes cannot compile to tree-sitter predicates. Compile the atom without them, then filter `MatchRow`s in `src/semantic/attrs.rs`:
-- `from`: resolve the matched identifier's qualifier or binding to its import origin string. Go: use the import scope in `src/resolve/go.rs` (`FileScope` :207 holds imports, aliases and dot imports). JS/TS, Python, Rust: use `src/resolve/imports.rs` (`ImportResolver` :133). Ruby, C, C++: exit 2 `attribute from is not supported for <lang>`. Pick one import source per language and note in `DESIGN.md` that two import implementations exist.
-- `in`: the nearest enclosing named declaration (struct, class, impl, interface, module), or for a Go method the receiver type.
-- `regex` crate for `=/re/` values.
+**Do.**
+- At the top level of a query only, compile `head tail` (descendant) as `CompiledQuery::Scoped{outer, scope_field: "", inner}`. `child_by_field_name("")` falls back to the whole node in `runner.rs`. Do not add a `CompiledQuery` variant: it is matched exhaustively in `src/example.rs:700,719,733` and `src/main.rs:455,610`.
+- When compiling the outer of such a descendant, add an explicit `@_root` capture on the head node and make the Scoped runner (`runner.rs:186-199`) prefer it, so `(&function#x @c) id#y` scopes to the head node, not the identifier.
+- Nested descendants (inside groups, field inner queries, and any descendant after the first top-level one) keep the `(_ ...)` form. Document this in `DESIGN.md`.
+- `MatchRow` (`runner.rs:15-19`) gains `start_byte`, `end_byte` and `kind` of the primary node. Constructors are at `runner.rs:70` and `:138`. Later packages rely on these to find the matched node.
+- Row semantics change: a top-level descendant prints one row per inner match at the inner match's line. Leave `+` and `~` alone.
 
 **Acceptance.**
-- `ctsq -q '&function#log.Printf' fixtures/` matches `log.Printf` and not `fmt.Printf`.
-- `&function#Printf[from^=lo]`, `[from*=og]`, `[from$=og]`, `[from=/^log$/]` behave as named.
-- `field#User.Email` matches `Email` declared in `User` and not `Email` in `Account`.
-- `function#Info[from=pino]` on a JS fixture matches `logger.info` only when `logger` comes from `pino` in that file via a direct binding. Method receivers bound through calls are out of scope here, they are resolved by flow-up later.
-- `ctsq -q 'function#a --> function#b'` exits 2 with the hint.
-- Unit tests in the parser for every token and the shorthand edge cases (`function#log.body()` stays field access).
+- A Go fixture with a variable three blocks deep in a function is found by `function#handle variable#name`, on the variable's line.
+- `cargo test` passes. Check `ctsq files` (cooccur) output on `fixtures/` before and after and state any count change in the handoff.
+- Unit tests for `@_root` preference and the new `MatchRow` fields.
 
 ## Package: models
 
 **Do.**
-- Add `serde`, `toml`, `regex` to `Cargo.toml`.
 - `src/config/` loads language mechanics and model files in the lookup order from `## Schema`, merges built-in defaults (`config/languages/go.toml`, `config/models/go/stdlib@<ver>.toml` via `include_str!`), and picks the stdlib version from the `go` line in `go.mod` with nearest-lower fallback.
-- Ship a Go stdlib model covering at least: `strings` (pass-through), `strconv` (Itoa clears, Quote passes), `fmt` (Sprintf passes whole, Printf/Fprintf/Println whole), `log` and `log/slog` (whole), `encoding/json` (Marshal, Unmarshal, `(*Encoder).Encode` whole), `bytes`/`bufio` buffers pass, `os.Getenv` source, `builtin.len` clear, `errors.New`/`fmt.Errorf` pass, `html/template` and `text/template` Execute, ExecuteTemplate, Parse, ParseFS, ParseFiles, ParseGlob, `regexp.(*Regexp).ReplaceAllString` pass, `database/sql` Exec/Query args as outside calls.
-- `ctsq config path` and `ctsq config dump <lang>` (see `## Endpoints`).
+- `src/config/mechanics.rs` defines the mechanics struct with a field for every key in `## Schema` (`outside`, `nodes.*`), each `#[serde(default)]`, so later packages can add keys.
+- `src/config/gomod.rs`: `module_path(root) -> Option<String>` and `go_version(root)`, finding the nearest `go.mod` upward from a path. Decision 16 relies on this.
+- Ship a Go stdlib model covering at least: `strings` (pass), `strconv` (Itoa clears, Quote passes), `fmt` (Sprintf passes whole, Printf/Fprintf/Println whole), `log` and `log/slog` (whole), `encoding/json` (Marshal, Unmarshal, `(*Encoder).Encode` whole), `bytes` and `bufio` buffers pass, `os.Getenv` source, `builtin.len` clear, `errors.New` and `fmt.Errorf` pass, `html/template` and `text/template` Execute, ExecuteTemplate, Parse, ParseFS, ParseFiles, ParseGlob, `(*regexp.Regexp).ReplaceAllString` pass, `database/sql` Exec and Query.
+- `ctsq config path` and `ctsq config dump <lang>` (see `## Endpoints`). In `main.rs`, only the `Config` subcommand variant and its dispatch arm.
 - Malformed files report the file, line and key, exit 2.
 
-**Acceptance.**
-- A repo `.ctsq/models/go/app.toml` overrides a built-in model for the same name.
-- `go 1.23.4` in `go.mod` selects `stdlib@1.23`. `go 1.25` with only 1.23 shipped selects 1.23.
-- Unit tests for parsing every `pass` form.
+**Acceptance.** Unit tests: repo `.ctsq/models/go/app.toml` overrides a built-in model for the same name, `go 1.23.4` selects `stdlib@1.23`, `go 1.25` with only 1.23 shipped selects 1.23, every `pass` form parses, `module_path` finds the module line. `ctsq config path` prints the four locations.
+
+## Package: attributes-syntax
+
+**Lexer** (`src/query/parser.rs`, `Lexer::next_token` :31, one-char fallback near :74).
+- Real tokens for `[`, `]`, `=`, `^=`, `*=` (lookahead, so `*` alone stays the Def sigil), `$=`, `:`, and the combinators `->`, `-->`, `<-`, `<--`, `=>`, `==>`, `<=`, `<==`.
+- Unknown characters stop lexing as one-char `Ident`, they are an error.
+- Attribute values are an Ident, a quoted string, or `/regex/`. A value containing `/` must be quoted: `[from="log/slog"]` (a bare `/` starts a regex).
+- Identifiers stay `[A-Za-z0-9_]`. The abstract kind for template output is `template_action` (underscore).
+
+**Parser.**
+- `parse_atom` (:219): after the name match, zero or more `[key op value]` into `Atom.attrs: Vec<AttrMatch>`, `AttrMatch{key, op: Eq|Prefix|Contains|Suffix|Regex, value}`.
+- Dot shorthand (decision 05): inside `#name`, `A.B` where the token after `B` is not `(` becomes name `B` plus `AttrMatch{key: "qual", op: Eq, value: A}`. `.body(` keeps working.
+- `:not(<selector>)` parses onto `Selector` as a new field. Update the struct literal in `try_compile_scoped` (`src/compiler/mod.rs:226`).
+- `parse_query` (:124) and its lookahead (:135-149) accept the new combinators as `Combinator::{Calls, CallsEventually, CalledBy, CalledByEventually, Flows, FlowsEventually, FlowsFrom, FlowsFromEventually}`.
+
+**Compiler.** `compiler::validate` rejects any semantic combinator or `:not` anywhere in a query, including inside groups and field inner queries, with a distinct error kind `SemanticQuery`. Every entry point (`main.rs`, `cooccur.rs:21`, `explain.rs:392`, `resolve/fallback.rs:40`, `example.rs:695`) then fails the same way without edits. `compile_atom` ignores `attrs` (they are filtered after matching).
+
+**Acceptance.** Parser unit tests for every new token and shorthand edge case (`function#log.body()` stays field access, `*=` vs `*function`, `[from="log/slog"]`, unknown char errors). `validate` rejects `a --> b` and `(a --> b)`. `cargo test` passes.
+
+## Package: attributes-eval
+
+**Do.**
+- `src/semantic/mod.rs` and `src/semantic/attrs.rs`: filter `MatchRow`s by `attrs`, using `start_byte`/`end_byte` from descendant to locate the matched node.
+- `from`: the full origin string of the import the identifier's qualifier or binding came through. Go: `FileScope.imports` (`src/resolve/go.rs:219`, `collect_imports` near :304-333). JS/TS, Python, Rust: `src/resolve/imports.rs` (`ImportResolver` trait :133). Add an additive `bindings: Vec<String>` field to `RawImport` (imports.rs:19-34) for local names bound by an import. Ruby, C, C++: exit 2 `attribute from is not supported for <lang>`.
+- `in`: the nearest enclosing named declaration (struct, class, impl, interface, module), or for a Go method the receiver type.
+- `qual` (dot shorthand): true when `in` equals the value, or when the import's local name (alias, else last path segment) equals the value. So `function#slog.Info` matches `slog.Info` from `"log/slog"`.
+- `regex` crate for `/re/` values.
+- Export from `src/resolve/go.rs`, additive and pub: `go_imports(root, src) -> HashMap<String, String>` (local name to import path) and `binding_type(...)` over the existing `Binding`/`var_type` (:196-233, :659). flow-engine relies on these.
+- `src/main.rs`: apply the attribute filter after `run_rows` for `-q`, and map the `SemanticQuery` error to exit 2 with `use: ctsq path '<query>'`.
+
+**Acceptance.** Test against fixtures through the binary in `tests/cli.rs`-style tests you add in a new `tests/attrs.rs`:
+- `&function#log.Printf` matches `log.Printf` and not `fmt.Printf`.
+- `[from^=lo]`, `[from*=og]`, `[from$=og]`, `[from=/^log$/]` behave as named. `&function#slog.Info` and `[from="log/slog"]` both match `slog.Info`.
+- `field#User.Email` matches `Email` in `User`, not in `Account`.
+- JS: `function#info[from=pino]` matches `logger.info` when `logger` is directly bound by `import pino` in that file.
+- `ctsq -q 'function#a --> function#b'` exits 2 with the hint.
 
 ## Package: call-walk
 
-**Graph change.** `graph::build` (`src/resolve/graph.rs:23`) keeps only the first call site per (caller, callee). Add every call site with its line and argument nodes (`ResolvedCall` gains `sites` or one entry per site), without changing `callers`, `callees`, `callgraph` output. Defs gain parameter names and positions (today only in the private `FnScope`).
+**Do.**
+- Per-site call data as a side table: `CallSite{caller, callee target, line, start_byte, arg byte ranges}` collected by the Go resolver only, through a new default `Resolver` trait method that returns nothing for other resolvers. Do not change `ResolvedCall` or `Def` struct shapes (their literals are in `rust.rs`, `fallback.rs`, `go.rs`).
+- Parameter names and positions for Go defs, exposed through the same side table or a pub helper in `go.rs`.
+- Parse once: a `TreeStore` (path to parsed tree and source) built once per `path` run. The Go resolver's `parse()` (`go.rs:101`) takes trees from it when given.
+- `src/semantic/mod.rs`: split a query at top-level semantic combinators into AST segments. The last selector of each segment supplies the start or end node, matched to a `DefId` by file and byte range.
+- `src/semantic/calls.rs`: walk `CallGraph.fwd`/`rev`: `->`/`<-` one edge, `-->`/`<--` bounded BFS shortest first, `max` and `all` options, at most 5 routes per start by default, waypoints, `:not(sel)` exclusion, `Confidence::Guess` marked. Return route data, not text (path-cli prints).
 
-**Parse once.** `path` builds one in-memory store of parsed trees per run, used by graph build and later the flow engine (decision 27). The Go resolver's own `parse()` (`src/resolve/go.rs:101`) takes trees from the store when given.
+**Acceptance.** Unit tests on inline Go: routes, reversed reading order for `<--`, waypoint, `:not`, depth limit. Add a test that pins `callers`, `callees`, `callgraph` output on `fixtures/` as before.
 
-**Evaluate.** `src/semantic/mod.rs` splits a query into AST segments and semantic combinators, runs each AST segment with the existing compiler and runner, maps matches to `DefId`s, then walks `CallGraph.fwd`/`rev`:
-- `->` and `<-`: one edge
-- `-->` and `<--`: bounded BFS, shortest first, `--max`, `--all`, at most 5 routes per start by default
-- waypoints: `a --> b --> c` must pass through `b`
-- `:not(sel)` excludes routes through matching defs
-- an edge with `Confidence::Guess` prints `?`
+## Package: flow-engine
 
-**Print.** `src/semantic/print.rs` owns the tree printer for both call routes and flow trees (`## Output format`). It returns `String`.
+**Do.** `src/flow/` engine for one Go function, driven by the mechanics struct (never hard-coded node names). Add any keys you need to `src/config/mechanics.rs` and `config/languages/go.toml` additively.
+- start points: a variable or parameter node, or every read of a `field` inside the function
+- the tracked set and rules in decision 10, tags in decision 09 (`source`, `exact`, `derived`, `conditional@line`)
+- an end predicate given as a closure over call nodes, giving `sink`
+- outside calls are left as a hook returning `Unknown` for flow-models to fill
+- expose `flow::analyse_function(...) -> FlowResult` and `flow::report(...) -> String` in the `## Output format` row shape
+- use `resolve::go::go_imports` and `binding_type` from attributes-eval, do not edit `src/resolve/`
 
-**Acceptance.**
-- On `fixtures/example.go` (extend as needed), `ctsq path 'function#main --> function#X'` prints the route with call lines.
-- `<--` gives the same routes reversed in reading order.
-- `:not()` removes a route, `--max 1` limits depth.
-- `callers`/`callees`/`callgraph` outputs are byte-identical to before (add a test that pins them).
+**Acceptance.** `#[cfg(test)]` unit tests with inline Go: exact copy, derived concat, overwrite removes, if/else both-branch vs one-branch (`conditional@line`), for-loop fixed point, switch, condition-only use not tracked.
 
-## Package: flow-local
+## Package: path-cli
 
-**Do.** `src/flow/` holds the engine for one function, driven by the Go mechanics file (never hard-coded node names):
-- start points: a `variable` or parameter match, or a `field#T.F` match (every read of the field in the function)
-- the tracked set and rules in decision 10, the tags in decision 09
-- models applied at outside calls: `pass`, `clear`, `whole`, otherwise `unmodelled` (decision 18)
-- the end selector matched at a call where a tracked value is an argument gives `sink`
-- `via <function>` recorded when a tracked value passes through an in-repo function named in the route
+**Do.**
+- `src/semantic/print.rs`: the tree printer for call routes and flow trees, `## Output format`, returning `String`. Every row starts `path:line`, two-space indent, tags comma-separated, trailer counts.
+- `src/main.rs`: `ctsq path '<query>' [paths...]` with `--max`, `--all`, `--only`, `--body`, wiring call routes from call-walk. `--only` is declared here and read by flow-calls.
+- `tests/path_cli.rs` with `fixtures/path/`: call routes through the binary.
 
-Do not wire into `src/semantic/` or `src/main.rs` (call-walk owns those in the same stage). Expose `flow::report(...) -> String` and test it directly. Flow-calls does the wiring.
+**Acceptance.** `ctsq path 'function#main --> function#X' fixtures/path/` prints the route with call lines. `--max 1` limits. `:not` removes a route. `--body` prints bodies under rows.
 
-**Acceptance.** Unit tests with inline Go source covering: exact copy, derived concat, overwrite removes, if/else both-branch vs one-branch (`conditional@line`), for loop fixed point, `len` clears, unmodelled call continues, condition-only use is not tracked.
+## Package: flow-models
+
+**Do.** Fill the outside-call hook in `src/flow/` from the model files:
+- resolve a call to its model key with `go_imports` (`strings.ToUpper`, `(*html/template.Template).Execute` via `binding_type` for receivers)
+- `pass`, `clear`, `whole`, `source`, otherwise `unmodelled` (decision 18)
+- `via <function>` recorded for in-repo calls on the route
+
+**Acceptance.** Unit tests: `strings.ToUpper` passes as `derived`, `len` clears, an unknown outside call continues tagged `unmodelled`, a repo `.ctsq/models` override takes effect, `fmt.Printf("%v", s)` with `whole` matches an end predicate on any field of `s`.
 
 ## Package: flow-calls
 
 **Do.**
-- Arguments into parameters, using the per-site call data from call-walk. Returns back to the caller's receiving variable.
-- Wire `=>` and `==>` into `src/semantic/` and the printer.
-- Outside rule (decision 16) using `go.mod`.
+- Arguments into parameters using call-walk's `CallSite` table, returns back to the caller's receiving variable.
+- Wire `=>`, `==>` in `src/semantic/` (new `src/semantic/flows.rs`), respecting `--only`.
+- Outside rule (decision 16) with `config::gomod::module_path`.
 - Field queries group output by source (`## Output format`).
 
-**Acceptance.** `fixtures/flow/flow-calls/` with a value passed through three functions, returned back, normalised by a helper (`via`), and handed to `log.Printf` and `json.Marshal`. `tests/path_flow-calls.rs` asserts the routes.
+**Acceptance.** `fixtures/flow/flow-calls/` with a value passed through three functions, returned back, normalised by a helper (`via`), handed to `log.Printf` and `json.Marshal`. `tests/path_flow-calls.rs` asserts the routes through the binary.
 
 ## Package: flow-objects
 
 **Do.**
-- Follow the object (decision 12), including through embedded struct promotion (`AdminBooking{Booking}` exposes `.CustomerPhone`).
+- Follow the object (decision 12), including embedded struct promotion (`AdminBooking{Booking}` exposes `.CustomerPhone`).
 - Shared stop for maps, package-level variables, channels.
+- Generic functions (`ExtractForm[T]`, `JSON[T]`): track by value regardless of `T`. Read struct tags so `json:"phone"` shows in the row.
+
+**Acceptance.** `fixtures/flow/flow-objects/`: a JSON form decoded by a generic helper, a struct stored by a reflection-based helper, a `log.Printf("%v")` of a struct, a JSON response helper, an embedded struct read, a map store that stops. `tests/path_flow-objects.rs` asserts `field#Booking.CustomerPhone ==> function#/Printf|Encode/`.
+
+## Package: flow-funcs
+
+**Do.**
 - Calls through function-valued variables (`var send = SendEmail`): resolve when the variable has exactly one assignment in the module, otherwise `stopped: function value`.
 - Closures returned by functions (`Template(name, data)` returning a handler): captured variables flow into the closure body.
-- Generic functions (`ExtractForm[T]`, `JSON[T]`): track by value regardless of `T`. Struct tags are read so `json:"phone"` on a field is shown in the row.
+- Interface method calls are left to widening, mark them `stopped: interface` for now.
 
-**Acceptance.** `fixtures/flow/flow-objects/` (synthetic, decision 28) with: a JSON form decoded by a generic helper, a normaliser function, a struct stored by a reflection-based DB helper through an interface, a `log.Printf("%v")` of a struct, a JSON response helper, an email built from a template data struct. `tests/path_flow-objects.rs` asserts the routes from `field#Booking.CustomerPhone ==> function#/Printf|Exec|Encode/`.
+**Acceptance.** `fixtures/flow/flow-funcs/` covering both cases. `tests/path_flow-funcs.rs`.
 
 ## Package: flow-up
 
 **Do.**
-- `<=` and `<==`: the same engine run in reverse, from a value back to where it was created. Stops at a `source` model, a literal, a parameter of an exported entry point, or an outside call's return.
+- `<=` and `<==`: the engine run in reverse, from a value back to where it was created. Stops at a `source` model, a literal, a parameter of an exported entry point, or an outside call's return.
 - Value sets for strings (decision 25): literals, constants, union over callers for parameters, concatenation as glob, open otherwise.
-- `from` for method receivers: `logger.info` gets its origin by walking `logger` upward to its creation and reading that file's import. Plug into the attribute filter from Package: attributes.
+- `from` for method receivers: `logger.info` gets its origin by walking `logger` upward to its creation. Plug into `src/semantic/attrs.rs`.
 
-**Acceptance.** Unit tests for each value-set rule. A fixture where a template name parameter has three literal callers resolves to those three names.
+**Acceptance.** Unit tests for each value-set rule. `fixtures/flow/flow-up/`: a template name parameter with three literal callers resolves to those three names. `tests/path_flow-up.rs`.
 
 ## Package: widening
 
-**Do.** Decision 14. Build a constructed-type index (composite literals, `&T{}`, `new(T)`, constructor return types) once per run. Extend `interface_impls` (`src/resolve/go.rs:561`) to filter by it. Narrow on type assertions and type switches. Group outside implementations, `--expand` lists them.
+**Do.** Decision 14. Constructed-type index (composite literals, `&T{}`, `new(T)`, constructor return types) once per run. Extend `interface_impls` (`src/resolve/go.rs:561`) to filter by it. Narrow on type assertions and type switches. Replace flow-funcs' `stopped: interface`. Group outside implementations in the printer, `--expand` lists them.
 
-**Acceptance.** A fixture interface with three implementations, two constructed: the walk widens to two. A type assertion narrows to one. `io.Writer`-typed sink groups outside implementations.
+**Acceptance.** `fixtures/flow/widening/`: an interface with three implementations, two constructed, the walk widens to two, a type assertion narrows to one, an `io.Writer` sink groups outside implementations. `tests/path_widening.rs`.
 
-## Package: templates
+## Package: templates-grammar
 
 **Do.**
-- Add a Go template tree-sitter grammar. Check crates.io for a maintained crate first. If none fits tree-sitter 0.26, vendor the grammar source (`ngalaiko/tree-sitter-go-template` is the known one) and build it with `cc` in `build.rs`. Record the choice in `DESIGN.md`.
-- Register the template language for `.tmpl`, `.gotmpl`, `.html.tmpl`, and for Go string constants passed to `Parse`.
-- Template flow mechanics (decision 24): `.`, `range`/`with` rebinding (element type of the ranged slice), `template`/`block`/`define` as calls, `$x :=`, printing actions tagged `rendered`.
-- Linking: from a modelled `Execute` call, resolve which template files are parsed into that `*Template` via `template_load` models, the value set (flow-up), and `//go:embed` patterns on the `embed.FS` (decision 25). The first `ParseFS` name argument picks the root template.
-- Add abstract kind `template-action` to `types::ABSTRACT_TYPES`.
+- Add a Go template tree-sitter grammar. Check crates.io for a maintained crate compatible with tree-sitter 0.26 first. Otherwise vendor `ngalaiko/tree-sitter-go-template` under `vendor/` and build it with `cc` in `build.rs`. Record the choice in `DESIGN.md`.
+- Register the language in `src/compiler/lang/mod.rs` for `.tmpl`, `.gotmpl` (`.html.tmpl` ends in `.tmpl`) with a `Lang` impl in `lang/gotmpl.rs` mapping the abstract kinds that make sense.
+- Add abstract kind `template_action` to `types::ABSTRACT_TYPES`.
+- Add template mechanics keys to the config only through a new `config/languages/gotmpl.toml` default (orchestrator note: `config/` belongs to no other active package in this stage).
 
-**Acceptance.** Fixture with a layout calling `{{block "body" .}}`, a page `{{define "body"}}` with `{{range .Items}}` printing `{{.Phone}}`, loaded through `ParseFS(files, name, "layout.html.tmpl")` where `name` comes from string literals at call sites. `field#Item.Phone ==> template-action` reaches the page line, tagged `rendered`. An inline template in a Go string constant is also reached.
+**Acceptance.** `ctsq -q 'template_action' fixtures/` lists actions in a `.tmpl` fixture. `ctsq tree` on a `.tmpl` file does not crash. `cargo test` passes.
+
+## Package: templates-flow
+
+**Do.** Decision 24 and 25.
+- Template flow: `.`, `range`/`with` rebinding, `template`/`block`/`define` as calls, `$x :=`, printing actions tagged `rendered`.
+- Linking: from a modelled `Execute`, find the files parsed into that `*Template` through `template_load` models, the value set (flow-up), and `//go:embed` patterns on the `embed.FS`. The first `ParseFS` name argument picks the root template.
+- Inline templates: a Go string constant or package-level string variable passed to `Parse` is parsed as a template.
+
+**Acceptance.** `fixtures/flow/templates/` with a layout calling `{{block "body" .}}`, a page `{{define "body"}}` with `{{range .Items}}` printing `{{.Phone}}`, loaded through `ParseFS(files, name, "layout.html.tmpl")` with `name` from literals. `field#Item.Phone ==> template_action` reaches the page line, tagged `rendered`. An inline template is also reached. `tests/path_templates.rs`.
 
 ## Package: acceptance
 
 **Do.**
-- Own `fixtures/flow/booking/` and `tests/path.rs`. Build a fixture app combining the cases from every earlier package fixture.
-- Final pass: run every example query in `## Goal` and the four questions below on the fixtures, assert outputs.
+- Build `fixtures/flow/booking/` combining the cases of every earlier fixture, and `tests/path.rs` running every example query in `## Goal` plus:
   1. `field#Booking.CustomerPhone ==> function#log.Printf` finds the `%v` log line.
-  2. `field#Booking.CustomerPhone ==> function#/Encode/` finds the JSON response helper, including through public handlers.
-  3. `field#Booking.CustomerPhone ==> template-action` reaches template lines.
+  2. `field#Booking.CustomerPhone ==> function#/Encode/` finds the JSON response helper.
+  3. `field#Booking.CustomerPhone ==> template_action` reaches template lines.
   4. `field#Booking.CustomerPhone ==>` with no end lists every outside leaf and the unmodelled trailer.
-- Manual run (not a test): the same four queries against `~/workspace/projects/badhabit/rehearsal-booking`, compared with the hand trace in `## Appendix: hand trace`. Report differences in the delivery note.
+- `DESIGN.md` consistency pass over every section the build added.
+- Manual run (not a test): the same four queries against `~/workspace/projects/badhabit/rehearsal-booking` with the built binary (`target/release/ctsq`, never `make install`), compared with `## Appendix: hand trace`. Report differences in the handoff.
+
+## Appendix: hand trace`. Report differences in the delivery note.
 
 ## Appendix: hand trace
 

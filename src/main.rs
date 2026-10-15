@@ -10,6 +10,9 @@ mod calltree;
 mod importgraph;
 mod types;
 mod resolve;
+mod config;
+mod flow;
+mod semantic;
 
 use clap::{Parser, Subcommand};
 use compiler::lang;
