@@ -108,23 +108,23 @@ fn no_end_lists_every_outside_leaf_and_the_trailer() {
     assert!(row(&t, "log.Printf(\"%v\", b)").ends_with("outside"), "{t}");
     // trailers
     assert!(t.contains("routes to outside"), "{t}");
-    assert!(t.contains("unmodelled call"), "{t}");
+    // reflection helpers are modelled (fixer D), so none of them ends a route
+    let trailer: Vec<&str> = t.lines().filter(|l| l.contains("unmodelled call")).collect();
+    assert!(trailer.iter().all(|l| !l.contains("v.Field") && !l.contains("v.Type")), "{t}");
 }
 
-/// Known gap: Template(name, page) returns a closure that is handed to
-/// http.HandleFunc, so the page rendered by the closure is not reached.
+/// Template(name, page) returns a closure that is handed to http.HandleFunc:
+/// the closure body is walked under the call, so the page is reached.
 #[test]
-#[ignore = "closure returned from Template and passed to an unmodelled call is not walked"]
 fn the_template_closure_reaches_the_page() {
     let o = path_cmd("field#Booking.CustomerPhone ==> template_action");
     let t = out(&o);
     assert!(t.contains("bookings.go:60"), "{t}");
 }
 
-/// Known gap: a call used directly as an argument of an unmodelled call
-/// (`Send(to, ConfirmationEmail(b))`) is not walked.
+/// A call used directly as an argument of another call
+/// (`Send(to, ConfirmationEmail(b))`) is walked.
 #[test]
-#[ignore = "nested call inside the arguments of an unmodelled call is not walked"]
 fn a_nested_call_argument_is_walked() {
     let o = path_cmd("field#Booking.CustomerPhone ==> template_action");
     let t = out(&o);

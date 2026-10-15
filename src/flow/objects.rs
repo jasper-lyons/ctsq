@@ -7,7 +7,9 @@ use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
 
 use super::engine::{function_name, kids, named, text};
+use super::models::qualify_type;
 use crate::config::Mechanics;
+use crate::resolve::go::go_imports;
 
 /// Where a tracked value holds the data: `None` for the value itself, or the
 /// field paths of an object that holds it, as `[["CustomerPhone"]]`.
@@ -55,6 +57,10 @@ pub struct FieldInfo {
     pub embedded: bool,
     /// Struct tag without the quotes, as `json:"phone"`.
     pub tag: Option<String>,
+    /// The declared type with its package qualifier replaced by the import
+    /// path, as `database/sql.DB` for `*sql.DB`. None when the type has no
+    /// package part or is not a plain named type.
+    pub path: Option<String>,
 }
 
 /// A function that reads a package-level variable.
@@ -74,6 +80,11 @@ pub struct Module {
     pub globals: HashMap<String, bool>,
     /// Package-level variable name to the functions that use it.
     pub readers: HashMap<String, Vec<Reader>>,
+    /// Names of every type the scanned files declare.
+    pub types: HashSet<String>,
+    /// First result type of each function (`F`), method and interface
+    /// method (`T.M`), as (base name, `path.T` when it has a package part).
+    pub results: HashMap<String, (String, Option<String>)>,
 }
 
 /// `*pkg.Name[T]` as `Name`.
@@ -97,15 +108,26 @@ impl Module {
     }
 
     fn add_decls(&mut self, root: Node, src: &[u8], m: &Mechanics) {
+        let imports = go_imports(root, src);
         let mut stack = vec![root];
         while let Some(n) = stack.pop() {
             if Mechanics::is(&m.nodes.function, n.kind()) {
+                self.add_result(n, None, src, &imports);
                 continue;
             }
             if Mechanics::is(&m.nodes.type_decl, n.kind()) {
                 let name = kids(n, &m.fields.name).first().map(|x| text(*x, src).to_string());
                 if let Some(name) = name {
-                    let fields = struct_fields(n, src, m);
+                    self.types.insert(name.clone());
+                    // Interface methods.
+                    if let Some(t) = n.child_by_field_name("type").filter(|t| t.kind() == "interface_type") {
+                        for e in named(t) {
+                            if matches!(e.kind(), "method_elem" | "method_spec") {
+                                self.add_result(e, Some(&name), src, &imports);
+                            }
+                        }
+                    }
+                    let fields = struct_fields(n, src, m, &imports);
                     if !fields.is_empty() {
                         self.structs.insert(name, fields);
                     }
@@ -134,6 +156,35 @@ impl Module {
             }
             stack.extend(named(n));
         }
+    }
+
+    /// Record the first result type of function or method `f`, keyed `F`,
+    /// or `T.M` with `T` its receiver or `owner` (an interface).
+    fn add_result(&mut self, f: Node, owner: Option<&str>, src: &[u8], imports: &HashMap<String, String>) {
+        let Some(name) = f.child_by_field_name("name").map(|x| text(x, src).to_string()) else { return };
+        let recv = f
+            .child_by_field_name("receiver")
+            .and_then(|r| named(r).into_iter().next())
+            .and_then(|p| p.child_by_field_name("type"))
+            .map(|t| base_type(text(t, src)));
+        let key = match (owner, recv) {
+            (Some(o), _) => format!("{}.{}", o, name),
+            (None, Some(r)) => format!("{}.{}", r, name),
+            (None, None) => name,
+        };
+        let Some(res) = f.child_by_field_name("result") else { return };
+        let ty = if res.kind() == "parameter_list" {
+            match named(res).into_iter().next().and_then(|p| p.child_by_field_name("type")) {
+                Some(t) => t,
+                None => return,
+            }
+        } else {
+            res
+        };
+        let full = text(ty, src).trim().to_string();
+        let plain = full.trim_start_matches('*');
+        let path = if plain.contains(['[', ' ', '(', '{']) { None } else { qualify_type(plain, imports) };
+        self.results.insert(key, (base_type(&full), path));
     }
 
     fn add_readers(&mut self, file: &str, root: Node, src: &[u8], m: &Mechanics) {
@@ -251,7 +302,7 @@ pub fn is_map_expr(n: Node, m: &Mechanics) -> bool {
 }
 
 /// The fields of a struct type declaration, empty when it is not a struct.
-fn struct_fields(decl: Node, src: &[u8], m: &Mechanics) -> Vec<FieldInfo> {
+fn struct_fields(decl: Node, src: &[u8], m: &Mechanics, imports: &HashMap<String, String>) -> Vec<FieldInfo> {
     let mut out = vec![];
     let mut stack: Vec<Node> = kids(decl, &m.fields.ty);
     let mut decls = vec![];
@@ -266,15 +317,39 @@ fn struct_fields(decl: Node, src: &[u8], m: &Mechanics) -> Vec<FieldInfo> {
         stack.extend(named(n));
     }
     decls.sort_by_key(|d| d.start_byte());
+    // Type parameters with their constraints: a field of type `D` in
+    // `Repo[D Driver]` has the methods of `Driver`.
+    let mut tparams: HashMap<String, String> = HashMap::new();
+    if let Some(list) = decl.child_by_field_name("type_parameters") {
+        for p in named(list) {
+            let Some(c) = p.child_by_field_name("type") else { continue };
+            let mut cur = p.walk();
+            for nm in p.children_by_field_name("name", &mut cur) {
+                tparams.insert(text(nm, src).to_string(), text(c, src).trim().to_string());
+            }
+        }
+    }
     for d in decls {
-        let ty = kids(d, &m.fields.ty).first().map(|t| base_type(text(*t, src))).unwrap_or_default();
+        let mut full = kids(d, &m.fields.ty).first().map(|t| text(*t, src).trim().to_string()).unwrap_or_default();
+        if let Some(c) = tparams.get(full.trim_start_matches('*')) {
+            full = c.clone();
+        }
+        let ty = base_type(&full);
+        let plain = full.trim_start_matches('*');
+        let path = if plain.contains(['[', ' ', '(', '{']) { None } else { qualify_type(plain, imports) };
         let tag = kids(d, &m.fields.tag).first().map(|t| text(*t, src).trim_matches('`').to_string());
         let names = kids(d, &m.fields.name);
         if names.is_empty() {
-            out.push(FieldInfo { name: ty.clone(), ty: ty.clone(), embedded: true, tag: tag.clone() });
+            out.push(FieldInfo { name: ty.clone(), ty: ty.clone(), embedded: true, tag: tag.clone(), path: path.clone() });
         }
         for nm in names {
-            out.push(FieldInfo { name: text(nm, src).to_string(), ty: ty.clone(), embedded: false, tag: tag.clone() });
+            out.push(FieldInfo {
+                name: text(nm, src).to_string(),
+                ty: ty.clone(),
+                embedded: false,
+                tag: tag.clone(),
+                path: path.clone(),
+            });
         }
     }
     out

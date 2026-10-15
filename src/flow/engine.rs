@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use tree_sitter::Node;
 
-use super::models::qualify_type;
+use super::models::{qualify_type, result_type};
 use super::objects::{is_map_expr, join_paths, under, Paths};
 use super::{CallEffect, CallSite, EndFn, FlowCtx, FlowResult, Hop, Outside, Start, StartKind};
 use crate::config::{Mechanics, Slot};
@@ -129,6 +129,61 @@ pub fn operand_type(cx: &FlowCtx, op: Node, line: usize) -> Option<String> {
         return cx.module.field(&inner, text(f, cx.src)).map(|(_, fi)| fi.ty.clone());
     }
     None
+}
+
+/// The type of field selector `sel` (`d.db`), from the struct declaring the
+/// field: its base name and, when the declared type has a package part, the
+/// type as `path.T` (`database/sql.DB` for `*sql.DB`). None when the owner
+/// type or the field is unknown.
+pub fn field_type_path(cx: &FlowCtx, sel: Node, line: usize) -> Option<(String, Option<String>)> {
+    let m = cx.mech;
+    if !Mechanics::is(&m.nodes.field, sel.kind()) {
+        return None;
+    }
+    let owner = operand_type(cx, *kids(sel, &m.fields.operand).first()?, line)?;
+    let f = kids(sel, &m.fields.field).first().copied()?;
+    cx.module.field(&owner, text(f, cx.src)).map(|(_, fi)| (fi.ty.clone(), fi.path.clone()))
+}
+
+/// The call variable `name` was last bound from before this use, as its
+/// first result or paired with it. None when that value is not a call.
+pub fn bound_from<'t>(m: &Mechanics, src: &[u8], name: Node<'t>) -> Option<Node<'t>> {
+    let want = text(name, src);
+    let mut outer = None;
+    let mut x = name;
+    while let Some(p) = x.parent() {
+        if Mechanics::is(&m.nodes.function, p.kind()) {
+            outer = Some(p);
+        }
+        x = p;
+    }
+    let flat = |ns: Vec<Node<'t>>| -> Vec<Node<'t>> {
+        ns.into_iter().flat_map(|n| if Mechanics::is(&m.nodes.list, n.kind()) { named(n) } else { vec![n] }).collect()
+    };
+    let mut best: Option<Node<'t>> = None;
+    let mut stack = vec![outer?];
+    while let Some(a) = stack.pop() {
+        stack.extend(named(a));
+        if !Mechanics::is(&m.nodes.assign, a.kind()) || a.start_byte() >= name.start_byte() {
+            continue;
+        }
+        let lefts = flat(kids(a, &m.fields.left));
+        let rights = flat(kids(a, &m.fields.right));
+        let Some(i) = lefts.iter().position(|l| text(*l, src) == want) else { continue };
+        let v = if rights.len() == lefts.len() {
+            rights.get(i).copied()
+        } else if i == 0 && rights.len() == 1 {
+            rights.first().copied()
+        } else {
+            None
+        };
+        if let Some(v) = v {
+            if best.is_none_or(|b| b.start_byte() < v.start_byte()) {
+                best = Some(v);
+            }
+        }
+    }
+    best.filter(|v| Mechanics::is(&m.nodes.call, v.kind()))
 }
 
 /// Pointer variables of a function and the names each one aliases, both
@@ -1191,6 +1246,14 @@ impl<'a, 't> Walker<'a, 't> {
             let readers = self.stop_tags(&stops, &mut prim);
             let hid = self.hop(n, &summary, &prim);
             self.add_readers(hid, readers);
+            // An unmodelled result nobody reads is not where a route ends.
+            if summary.unmodelled.is_some() && stops.is_empty() && !ptr_stop {
+                let set: Vec<String> =
+                    acts.iter().filter_map(|a| if let Act::Set(x, ..) = a { Some(x.clone()) } else { None }).collect();
+                if !set.is_empty() && !self.read_after(n, &set, n.end_byte()) {
+                    self.hops[hid].unmodelled = None;
+                }
+            }
             id = Some(hid);
         }
         if self.is_declaration(n) {
@@ -1735,6 +1798,94 @@ impl<'a, 't> Walker<'a, 't> {
 
     /// `path.T` for a receiver built by a constructor call `pkg.NewT(...)`,
     /// so `json.NewDecoder(r).Decode` finds the `Decoder` model.
+    /// The type of expression `n` as (base name, `path.T` when it has a
+    /// package part): a variable's declared type, or the result type of the
+    /// call it is bound from, a field selector's declared type, or the
+    /// result type of a call (`NewT` constructors and `RESULT_TYPES`).
+    fn expr_type(&self, n: Node<'t>, st: &State, depth: usize) -> Option<(String, Option<String>)> {
+        let m = self.m;
+        if depth > 6 {
+            return None;
+        }
+        let from_path = |p: String| Some((p.rsplit('.').next().unwrap_or("").to_string(), Some(p)));
+        if self.is(&m.nodes.name, n) {
+            let on = self.t(n);
+            if self.imports.contains_key(on) && !st.contains_key(on) {
+                return None;
+            }
+            let q = binding_type_qualified(self.cx.root, self.cx.src, self.cx.file, on, line_of(n), &DefIndex::default());
+            if let Some(q) = q {
+                let path = qualify_type(&q, &self.imports);
+                return Some((q.rsplit('.').next().unwrap_or("").to_string(), path));
+            }
+            let call = self.bound_from(n)?;
+            return self.expr_type(call, st, depth + 1);
+        }
+        if self.is(&m.nodes.field, n) {
+            return field_type_path(self.cx, n, line_of(n));
+        }
+        if !self.is(&m.nodes.call, n) {
+            return None;
+        }
+        if let Some(t) = self.ctor_type(n, st) {
+            return from_path(t);
+        }
+        let f = kids(n, &m.fields.function).first().copied()?;
+        if self.is(&m.nodes.name, f) {
+            // A function in the module.
+            return self.cx.module.results.get(self.t(f)).cloned();
+        }
+        if !self.is(&m.nodes.field, f) {
+            return None;
+        }
+        let o = kids(f, &m.fields.operand).first().copied()?;
+        let meth = self.t(*kids(f, &m.fields.field).first()?);
+        let on = self.t(o);
+        if self.is(&m.nodes.name, o) && !st.contains_key(on) {
+            if let Some(path) = self.imports.get(on) {
+                return result_type(Some(&format!("{}.{}", path, meth)), None, None).and_then(from_path);
+            }
+        }
+        match self.expr_type(o, st, depth + 1)? {
+            (_, Some(recv)) => result_type(None, Some(&recv), Some(meth)).and_then(from_path),
+            // A method on a type the module declares.
+            (base, None) => self.cx.module.results.get(&format!("{}.{}", base, meth)).cloned(),
+        }
+    }
+
+    fn bound_from(&self, name: Node<'t>) -> Option<Node<'t>> {
+        bound_from(self.m, self.cx.src, name)
+    }
+
+    /// Whether any of `names` is read after byte `after` in the function
+    /// holding `n`. Being assigned to, and `_ = name`, are not reads.
+    fn read_after(&self, n: Node<'t>, names: &[String], after: usize) -> bool {
+        let m = self.m;
+        let Some(func) = enclosing_function(self.cx.root, m, n.start_byte()) else { return true };
+        let mut stack = vec![func];
+        while let Some(x) = stack.pop() {
+            stack.extend(named(x));
+            if x.start_byte() < after || !self.is(&m.nodes.name, x) || !names.iter().any(|v| v == self.t(x)) {
+                continue;
+            }
+            let Some(p) = x.parent() else { return true };
+            let p = if self.is(&m.nodes.list, p) { p.parent().unwrap_or(p) } else { p };
+            if self.is(&m.nodes.assign, p) {
+                let lefts = self.flat(kids(p, &m.fields.left));
+                if lefts.iter().any(|l| l.id() == x.id()) {
+                    continue;
+                }
+                let blank = |l: &Node| m.tokens.blank.iter().any(|b| b == self.t(*l));
+                let rights = self.flat(kids(p, &m.fields.right));
+                if lefts.iter().all(blank) && rights.iter().any(|r| r.id() == x.id()) {
+                    continue;
+                }
+            }
+            return true;
+        }
+        false
+    }
+
     fn ctor_type(&self, recv: Node<'t>, st: &State) -> Option<String> {
         if !self.is(&self.m.nodes.call, recv) {
             return None;
@@ -1861,7 +2012,10 @@ impl<'a, 't> Walker<'a, 't> {
             return out;
         }
         let is_end = (self.is_end)(n, self.cx.src);
-        if !tracked_args.is_empty() && is_end {
+        // A sink that takes `&x` may still write the data into x (a template
+        // rendering into a buffer), so its effect is asked for those writes.
+        let sink_writes = !tracked_args.is_empty() && is_end && args.iter().any(|a| self.t(*a).starts_with('&'));
+        if !tracked_args.is_empty() && is_end && !sink_writes {
             out.calls += 1;
             out.sink = true;
             out.carry = inner.carry;
@@ -1885,29 +2039,64 @@ impl<'a, 't> Walker<'a, 't> {
         };
         if let (Some(f), Some(o)) = (func, recv_node) {
             site.method = kids(f, &m.fields.field).first().map(|x| self.t(*x).to_string());
-            if self.is(&m.nodes.name, o) {
-                let on = self.t(o);
-                match self.imports.get(on) {
-                    Some(path) if !st.contains_key(on) => site.package = Some(path.clone()),
-                    _ => {
-                        let q = binding_type_qualified(
-                            self.cx.root,
-                            self.cx.src,
-                            self.cx.file,
-                            on,
-                            line_of(n),
-                            &DefIndex::default(),
-                        );
-                        site.recv_path = q.as_deref().and_then(|t| qualify_type(t, &self.imports));
-                        site.recv_type = q.map(|t| t.rsplit('.').next().unwrap_or("").to_string());
+            let on = self.t(o);
+            match self.imports.get(on) {
+                Some(path) if self.is(&m.nodes.name, o) && !st.contains_key(on) => site.package = Some(path.clone()),
+                _ => {
+                    if let Some((t, p)) = self.expr_type(o, st, 0) {
+                        site.recv_type = Some(t);
+                        site.recv_path = p;
                     }
                 }
-            } else if let Some(t) = self.ctor_type(o, st) {
-                site.recv_type = t.rsplit('.').next().map(str::to_string);
-                site.recv_path = Some(t);
             }
         }
         let effect = self.outside.effect(&site);
+        if sink_writes {
+            match &effect {
+                CallEffect::Into { writes, .. } => {
+                    for (slot, paths) in writes {
+                        let Some(t) = (match slot {
+                            Slot::Arg(i) => args.get(*i).copied(),
+                            Slot::Receiver => recv_node,
+                            _ => None,
+                        }) else {
+                            continue;
+                        };
+                        if let Some(name) = self.root_name(t) {
+                            let chain = self.field_chain(t);
+                            let p = if chain.is_empty() { paths.clone() } else { under(&chain, paths) };
+                            out.writes.push((name, p));
+                        }
+                    }
+                }
+                CallEffect::Model { pass, .. } => {
+                    for p in pass {
+                        let from_tracked = match p.from {
+                            Slot::Arg(i) => argvals.get(i).is_some_and(|v| v.carry.is_some()),
+                            Slot::AllArgs => !tracked_args.is_empty(),
+                            Slot::Receiver => recv_tracked,
+                            Slot::Return => false,
+                        };
+                        let target = match p.to {
+                            Slot::Arg(j) => args.get(j).copied(),
+                            Slot::Receiver => recv_node,
+                            _ => None,
+                        };
+                        if let Some(name) = target.filter(|_| from_tracked).and_then(|t| self.root_name(t)) {
+                            if !out.whole.contains(&name) {
+                                out.whole.push(name);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            out.calls += 1;
+            out.sink = true;
+            out.carry = inner.carry;
+            out.paths = inner.paths;
+            return out;
+        }
         if matches!(effect, CallEffect::Model { whole: true, .. }) && !whole_args.is_empty() {
             // The object carries every field, the start field among them.
             for &i in &whole_args {

@@ -19,10 +19,11 @@ pub mod widen;
 // Used by the path and models packages.
 #[allow(unused_imports)]
 pub use engine::{
-    analyse_function, analyse_function_with, enclosing_function, function_name, operand_type, start_at, start_in,
+    analyse_function, analyse_function_with, bound_from, enclosing_function, field_type_path, function_name, operand_type, start_at,
+    start_in,
 };
 #[allow(unused_imports)]
-pub use models::{candidate_keys, model_key, qualify_type, ModelOutside};
+pub use models::{candidate_keys, model_key, qualify_type, result_type, ModelOutside};
 #[allow(unused_imports)]
 pub use report::report;
 #[allow(unused_imports)]
