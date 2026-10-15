@@ -141,6 +141,11 @@ pub enum CallEffect {
 /// The hook for calls whose effect the engine cannot see.
 pub trait Outside {
     fn effect(&self, call: &CallSite) -> CallEffect;
+    /// The model effect of a call the end selector matched, when the walk
+    /// should follow its result on. None carries the data unchanged.
+    fn end_effect(&self, _call: &CallSite) -> Option<CallEffect> {
+        None
+    }
 }
 
 impl<F: Fn(&CallSite) -> CallEffect> Outside for F {

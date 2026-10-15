@@ -334,29 +334,58 @@ Constructs with no abstract mapping fall back to raw tree-sitter node kinds.")]
         langs: Vec<String>,
     },
     /// Walk call or data-flow routes between definitions: ctsq path 'function#main --> function#save'
-    #[command(after_help = "Joins two or more selectors with a call combinator and prints each route
-as an indented tree, every row starting path:line.
+    #[command(after_help = "Joins two or more selectors with a call or data-flow arrow and prints each
+route as an indented tree, every row starting path:line.
 
-  ctsq path 'function#main --> function#save' src/
-  ctsq path 'function#save <-- function#main' src/
-  ctsq path 'function#main --> function#save:not(function#log)' src/
+Call arrows, between functions:
+  ->    calls directly
+  -->   calls eventually, through any number of functions
+  <-    called by directly
+  <--   called by eventually
 
-  ->   calls directly       -->  calls eventually
-  <-   called by directly   <--  called by eventually
+Data-flow arrows, between values:
+  =>    flows in one step to
+  ==>   flows eventually to, through called functions
+  <=    comes in one step from
+  <==   comes eventually from, back through callers
+A query ending in => or ==> has no end selector and lists every call that
+hands the data to code outside the module. One ending in <= or <== lists
+every origin.
+
+Tags on each data-flow hop:
+  source              where the walk started, or where data enters from outside
+  exact               the same value, moved or copied unchanged
+  derived             built from a tracked value
+  moved               passed into a call or returned
+  field F             stored into field F, the walk now follows the object
+  conditional@L       only tracked on some branches, L is the line of the condition
+  widened             reached through an interface, one of several implementations
+  unmodelled          passed through an outside call with no model
+  via F               passed through the in-repo function F
+  sink                matched the end selector
+  rendered            printed by a template action
+  outside             handed to code outside the module, the end of a route
+  stopped: reason     the walk would have to guess, so it stops and lists the choices
+A guessed hop prints ? after its tag or callee.
+
+Examples:
+  ctsq path 'field#Booking.CustomerPhone ==> function#log.Printf' .
+  ctsq path 'function#main --> function#save' .
 
 A query reads one way, downward or upward. Upward queries print in the order
-written, the first selector first. A guessed edge prints ? after the callee.
-Exit codes: 0 routes found, 1 none, 2 usage or query error.")]
+written, the first selector first.
+
+Exit codes: 0 routes found, 1 no routes or an unknown kind, 2 usage or query error.")]
     Path {
         /// Query with at least one call or data-flow combinator
         query: String,
         /// Files or directories to search (default: current directory)
         #[arg(num_args(0..))]
         paths: Vec<String>,
-        /// Longest route in hops
+        /// Longest call route in hops, or how many functions deep a data-flow walk follows
         #[arg(long, default_value = "12")]
         max: usize,
-        /// Print every route, not just the 5 shortest per start
+        /// Print every call route, not just the 5 shortest per start (call routes only)
         #[arg(long)]
         all: bool,
         /// Keep only hops carrying these tags, comma-separated (data-flow queries)
@@ -371,7 +400,8 @@ Exit codes: 0 routes found, 1 none, 2 usage or query error.")]
     },
     /// Show where config and model files are read from, or the merged result for a language
     #[command(after_help = "Language mechanics and outside-call models are TOML files, looked up in order:
-repo .ctsq/, then ~/.config/ctsq, then ~/.cache/ctsq, then built-in defaults.
+repo .ctsq/, then $XDG_CONFIG_HOME/ctsq (default ~/.config/ctsq), then
+$XDG_CACHE_HOME/ctsq (default ~/.cache/ctsq), then built-in defaults.
 
   ctsq config path
   ctsq config dump go")]
@@ -379,6 +409,11 @@ repo .ctsq/, then ~/.config/ctsq, then ~/.cache/ctsq, then built-in defaults.
         /// `path` or `dump <lang>`
         #[arg(num_args(1..=2), required = true)]
         args: Vec<String>,
+        // The global --lang and --no-ignore do nothing here, so they are hidden.
+        #[arg(long, short, hide = true)]
+        lang: Option<String>,
+        #[arg(long, hide = true)]
+        no_ignore: bool,
     },
 }
 
@@ -463,7 +498,7 @@ fn main() {
         Some(Commands::Path { query, paths, max, all, only, body, expand }) => {
             std::process::exit(run_path(&query, &paths, cli.lang.as_deref(), cli.no_ignore, max, all, &only, body, expand));
         }
-        Some(Commands::Config { args }) => {
+        Some(Commands::Config { args, .. }) => {
             std::process::exit(config::run(&args));
         }
         None => {}
@@ -878,8 +913,8 @@ fn run_refs(name: &str, path: &str, lang_override: Option<&str>, no_ignore: bool
     }
 }
 
-/// `ctsq path`. Returns the exit code: 0 routes found, 1 none, 2 usage or
-/// query error.
+/// `ctsq path`. Returns the exit code: 0 routes found, 1 none or an unknown
+/// kind, 2 usage or query error.
 #[allow(clippy::too_many_arguments)]
 fn run_path(
     query_str: &str,
@@ -936,7 +971,7 @@ fn run_path(
             }
             Err(e) => {
                 eprintln!("{}", e);
-                2
+                path_error_code(&e)
             }
         };
     }
@@ -951,9 +986,15 @@ fn run_path(
         }
         Err(e) => {
             eprintln!("{}", e);
-            2
+            path_error_code(&e)
         }
     }
+}
+
+/// Exit code for a `ctsq path` error: 1 for an unknown kind, as with `-q`,
+/// and 2 for any other usage or query error.
+fn path_error_code(msg: &str) -> i32 {
+    if msg.starts_with("unknown kind") { 1 } else { 2 }
 }
 
 /// A semantic query is a usage error with a pointer to `ctsq path` (exit 2).

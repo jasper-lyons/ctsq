@@ -329,7 +329,7 @@ Evaluation, in order:
 1. `semantic::split_query` cuts the query at its top-level semantic combinators into AST segments. A semantic combinator inside a group or a field inner query is an error. `:not()` is only allowed on the last selector of a segment, where it is taken off before the segment compiles.
 2. `semantic::segment_defs` compiles and runs each segment like a `-q` query, filters attributes, then maps rows to definitions. A row maps to a definition when it overlaps the definition header, which runs from the start of the declaration to the start of its body. So `function#main` picks the declaration of `main`, and a call to `main` inside another body picks nothing. A file whose language rejects the segment is skipped, and the error is only returned when every file rejects it.
 3. The `:not()` selectors are matched the same way. No route passes through a definition they match, start and end included.
-4. All joins must read one way: `->` and `-->`, or `<-` and `<--`. A data-flow combinator is an error here. Upward queries are reversed into call order, so every route is printed caller first and the query's first selector matches the last hop.
+4. All joins must read one way: `->` and `-->`, or `<-` and `<--`. A data-flow combinator is an error here. Upward queries are reversed into call order for the search, so the query's first selector matches the last hop of the route. They print in the order written, the first selector first, see `ctsq path` output.
 5. For each start, legs are searched in order. `->` and `<-` take exactly one edge. `-->` and `<--` search breadth first over simple paths, shortest first, pruned by a reverse breadth-first distance to the leg's targets. A path stops at the first target it reaches. A middle segment is a waypoint that every route passes through.
 6. Only edges that resolved to a definition are walked. External callees cannot be a step.
 7. `max` (default 12) bounds the whole route in edges. Without `all`, at most `limit` (default 5) routes are kept per start, shortest first. The search stops after 200000 queued paths and sets `truncated`. A start with no route within `max` is searched again without the bound, and when that finds one `cut` counts it, printed as `N routes cut at --max <n>`.
@@ -345,7 +345,7 @@ Each hop carries its definition, the line where it calls the next hop, and the c
 - `--body` prints each definition body under its row, one level deeper.
 - The trailer is `N route(s)`, then notes for selectors that matched nothing, definitions removed by `:not` and a search stopped at its cap.
 - `print::row(path, line, func, text, tags)` lays out one row, and data-flow trees reuse it.
-- Exit codes: 0 routes found, 1 none, 2 usage or query error. Data-flow and upward queries print through `semantic::flows`, see Cross-function flow and Upward flow.
+- Exit codes: 0 routes found, 1 none or an unknown kind (as with `-q`), 2 usage or query error. Data-flow and upward queries print through `semantic::flows`, see Cross-function flow and Upward flow.
 - `fixtures/.ignore` hides `fixtures/path/` and `fixtures/flow/` from directory scans of `fixtures/`, so the pinned call graph test keeps its output. Naming a fixture directory such as `fixtures/flow/booking` directly still works.
 
 ## Verification
@@ -375,7 +375,7 @@ Under each root: `languages/<lang>.toml` (mechanics) and `models/<lang>/*.toml` 
 
 ## Mechanics
 
-`languages/<lang>.toml` has `[outside]` (`module_file`) and `[nodes]` (`assign`, `call`, `return`, `field`, `param`, `import`, `branch`, `loop`, `assert`, `composite`), each a list of tree-sitter node kinds. Layers merge per key, so a repo file that sets only `nodes.loop` leaves the rest as built in. The flow engine reads these keys and hard-codes no node names.
+`languages/<lang>.toml` has `[outside]` (`module_file`) and `[nodes]` (`assign`, `call`, `return`, `field`, `param`, `import`, `branch`, `loop`, `assert`, `composite`), each a list of tree-sitter node kinds. Layers merge per key, so a repo file that sets only `nodes.loop` leaves the rest as built in. The flow engine reads these keys for its forward walk. Some node names are still hard-coded: tree-sitter-go kinds in `src/flow/upward.rs`, `values.rs`, `widen.rs`, `objects.rs`, `template.rs` and `src/semantic/flows.rs`. Moving them into mechanics is listed in `plans/path/FOLLOWUPS.md`.
 
 ## Models
 
@@ -405,13 +405,13 @@ For Go, a call is outside when the import path is neither the module path from `
 
 # Flow engine
 
-`src/flow` follows one value through one function. It reads node kinds from `[nodes]`, child field names from `[fields]` and token texts from `[tokens]` in the language's mechanics file, and names no language node itself.
+`src/flow` follows one value through one function. It reads node kinds from `[nodes]`, child field names from `[fields]` and token texts from `[tokens]` in the language's mechanics file. The forward walk in `engine.rs` names no language node itself. The helpers beside it do: `upward.rs`, `values.rs`, `widen.rs`, `objects.rs` and `template.rs` (and `src/semantic/flows.rs`) hard-code tree-sitter-go node names, listed in `plans/path/FOLLOWUPS.md`.
 
 ## Mechanics keys it adds
 
 - `[nodes]`: `function`, `block`, `case`, `default_case`, `name`, `field_name`, `field_decl`, `type_decl`, `range`, `list`, `loop_clause`, `index`, `declare` (assignments that declare their names in the enclosing block), `send`, `global`, `map_type`, `keyed`, `element`, `conversion`, `generic` (see Object tracking).
 - `[fields]`: `params`, `left`, `right`, `operator`, `condition`, `initializer`, `update`, `consequence`, `alternative`, `body`, `alias`, `case_label`, `function`, `arguments`, `operand`, `field`, `name`.
-- `[tokens]`: `plain_assign` (operators that replace the left side) `blank` (names that discard a value) and `declare` (the token that makes a range header declare its names, `:=`).
+- `[tokens]`: `plain_assign` (operators that replace the left side), `blank` (names that discard a value), `declare` (the token that makes a range header declare its names, `:=`) and `clear_ops` (operators whose result is about the data but is not the data, the comparisons `==`, `!=`, `<`, `<=`, `>`, `>=` in Go, decision 11).
 
 ## API
 
@@ -465,7 +465,7 @@ An unmodelled call whose result is assigned to variables that are never read aga
 1. The query is cut with `split_query`. The head segment's rows are start points: each row is narrowed to the name inside it (a field declaration, field access or parameter declaration gives its name) and classified by `flow::start_in`. A variable start is walked in its enclosing function, once per function and name, from its first row.
 2. A field start (`field#Booking.CustomerPhone`) is one group per field and owner type. The group's root row is the field declaration. Every function in the scanned files that reads or writes a field of that name is walked from the field, and their trees hang side by side under the declaration row. A selector whose operand has another known type (`flow::operand_type`) and a keyed element of a literal of another known type do not make a function a user.
 3. With a tail segment, a call is a sink when one of the tail's rows covers the call's function name (`Printf` in `log.Printf`), so attribute filters such as `function#log.Printf` apply.
-4. With no tail (the query ends in `=>` or `==>`), a call is an end when it goes outside the module (decision 16): a `pkg.F` call on an import outside the go.mod module path, or a method on a variable whose type comes from such a package. Those hops are tagged `outside` in place of `sink`. With no go.mod every import counts as outside.
+4. With no tail (the query ends in `=>` or `==>`), a call is an end when it goes outside the module (decision 16): a `pkg.F` call on an import outside the go.mod module path, or a method on a variable whose type comes from such a package. Those hops are tagged `outside` in place of `sink`. With no go.mod every import counts as outside. `outside` ends a route: the end call's model decides whether its result carries the data on (`Outside::end_effect`, a clear model stops it, no model adds `unmodelled`), and an outside call whose result reaches another end, through its readers or by being returned to a caller that passes it on, keeps only its effect tags (`derived` or `moved`, plus `unmodelled`) and is not counted as a route.
 
 The language config is loaded from the repo root of the first scanned path. The module path and Go version come from the go.mod nearest that path when there is one.
 

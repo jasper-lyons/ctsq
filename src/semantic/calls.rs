@@ -111,7 +111,7 @@ pub fn evaluate_calls(
 ) -> Result<CallRoutes, String> {
     let split = split_query(query)?;
     if split.joins.is_empty() {
-        return Err("no call combinator in the query, use -> --> <- or <--".into());
+        return Err("no call or data-flow arrow in the query, use one of -> --> <- <-- (calls) or => ==> <= <== (data flow)".into());
     }
     let down = |c: &Combinator| matches!(c, Combinator::Calls | Combinator::CallsEventually);
     let up = |c: &Combinator| matches!(c, Combinator::CalledBy | Combinator::CalledByEventually);
