@@ -5,6 +5,12 @@
 ["builtin.len"]
 clear = true
 
+["builtin.copy"]
+pass = ["1 -> 0"]
+
+["builtin.append"]
+pass = ["* -> return"]
+
 ["os.Getenv"]
 source = "return"
 

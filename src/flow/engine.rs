@@ -11,7 +11,11 @@ use crate::config::{Mechanics, Slot};
 use crate::resolve::go::{binding_type, binding_type_qualified, go_imports, go_result_names};
 use crate::resolve::DefIndex;
 
-const MAX_LOOP_PASSES: usize = 32;
+/// Loop passes always allowed. A loop runs to its fixed point, the set of
+/// tracked names only grows inside it, so this floor plus a bound from the
+/// number of names in the function is a safety net for field paths that
+/// keep nesting (`o.Next = o`). A loop that hits it is tagged `stopped: loop cap`.
+const MIN_LOOP_PASSES: usize = 32;
 
 pub(crate) fn text<'s>(n: Node, src: &'s [u8]) -> &'s str {
     n.utf8_text(src).unwrap_or("")
@@ -203,6 +207,28 @@ fn pointer_aliases(func: Node, src: &[u8], m: &Mechanics) -> (HashSet<String>, H
     (ptrs, alias)
 }
 
+/// Names of the parameters and receiver of `func` declared with a pointer
+/// type. Nested function literals are not entered.
+fn pointer_params(func: Node, src: &[u8], m: &Mechanics) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut stack = named(func);
+    while let Some(n) = stack.pop() {
+        if Mechanics::is(&m.nodes.function, n.kind()) {
+            continue;
+        }
+        if Mechanics::is(&m.nodes.param, n.kind()) {
+            if kids(n, &m.fields.ty).first().is_some_and(|t| text(*t, src).starts_with('*')) {
+                for l in kids(n, &m.fields.name) {
+                    out.insert(text(l, src).to_string());
+                }
+            }
+            continue;
+        }
+        stack.extend(named(n));
+    }
+    out
+}
+
 /// `start_at` for a query row, whose node may be a whole field declaration,
 /// field access or parameter declaration: the name inside it is the start.
 pub fn start_in(cx: &FlowCtx, start_byte: usize, end_byte: usize) -> Option<Start> {
@@ -381,6 +407,9 @@ struct Walker<'a, 't> {
     locals: HashSet<String>,
     /// Local names declared as maps.
     local_maps: HashSet<String>,
+    /// One frame per open block: each name the block declared, with the outer
+    /// binding it shadows (None when the outer name was not tracked).
+    scopes: Vec<HashMap<String, Option<Var>>>,
 }
 
 /// Walk `func` from `start`. `is_end` marks sink calls, `outside` answers
@@ -434,6 +463,7 @@ pub fn analyse_function_with(
         aliases,
         locals,
         local_maps,
+        scopes: vec![],
     };
     let mut st = State::new();
     for (name, paths) in also {
@@ -454,14 +484,16 @@ pub fn analyse_function_with(
         w.walk_stmt(b, &mut st);
     }
     w.record_exit(&st);
-    let exits = w
-        .exit
-        .take()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|(_, v)| v.origin != 0)
-        .map(|(k, v)| (k, v.paths))
-        .collect();
+    let exit = w.exit.take().unwrap_or_default();
+    // A write through a pointer parameter or receiver reaches the caller, so
+    // its hop stays in the callee tree the way a return does.
+    let ptr_params = pointer_params(func, cx.src, m);
+    for (k, v) in &exit {
+        if v.origin != 0 && ptr_params.contains(k) {
+            w.hops[v.origin].returns = true;
+        }
+    }
+    let exits = exit.into_iter().filter(|(_, v)| v.origin != 0).map(|(k, v)| (k, v.paths)).collect();
     FlowResult { root: w.tree(), returns: w.ret.clone(), exits }
 }
 
@@ -565,6 +597,46 @@ impl<'a, 't> Walker<'a, 't> {
         }
     }
 
+    // ── Scopes ───────────────────────────────────────────────────────────────
+
+    fn push_scope(&mut self) {
+        self.scopes.push(HashMap::new());
+    }
+
+    /// Close the innermost block: every name it declared gets back the outer
+    /// binding it shadowed.
+    fn pop_scope(&mut self, st: &mut State) {
+        let Some(frame) = self.scopes.pop() else { return };
+        for (name, outer) in frame {
+            match outer {
+                Some(v) => {
+                    st.insert(name, v);
+                }
+                None => {
+                    st.remove(&name);
+                }
+            }
+        }
+    }
+
+    /// `name` is declared in the innermost block. The first declaration there
+    /// saves the outer binding, a redeclaration in the same block reuses it.
+    fn declare(&mut self, name: &str, st: &State) {
+        if let Some(frame) = self.scopes.last_mut() {
+            frame.entry(name.to_string()).or_insert_with(|| st.get(name).cloned());
+        }
+    }
+
+    /// Whether assignment `n` declares its names (`:=`, `var`, a `:=` range).
+    fn is_declaration(&self, n: Node) -> bool {
+        if self.is(&self.m.nodes.declare, n) {
+            return true;
+        }
+        let mut c = n.walk();
+        let found = n.children(&mut c).any(|x| !x.is_named() && self.m.tokens.declare.iter().any(|t| t == x.kind()));
+        found
+    }
+
     // ── Hops ───────────────────────────────────────────────────────────────
 
     /// Record a hop for statement `n`, merging tags when a loop pass sees it again.
@@ -586,6 +658,12 @@ impl<'a, 't> Walker<'a, 't> {
         }
         if v.sink {
             tags.push("sink".into());
+        }
+        // A call `--max` did not enter leads its row, so the rest of the row
+        // reads as it would without the cut.
+        if let Some(i) = tags.iter().position(|t| t == "stopped: max depth") {
+            let t = tags.remove(i);
+            tags.insert(0, t);
         }
         if let Some(&id) = self.by_key.get(&n.start_byte()) {
             for t in tags {
@@ -652,9 +730,11 @@ impl<'a, 't> Walker<'a, 't> {
     fn walk_stmt(&mut self, n: Node<'t>, st: &mut State) {
         let m = self.m;
         if self.is(&m.nodes.block, n) {
+            self.push_scope();
             for c in named(n) {
                 self.walk_stmt(c, st);
             }
+            self.pop_scope(st);
         } else if self.is(&m.nodes.branch, n) {
             self.branch(n, st);
         } else if self.is(&m.nodes.loop_, n) {
@@ -938,6 +1018,8 @@ impl<'a, 't> Walker<'a, 't> {
         enum Act {
             Set(String, Option<usize>, Paths),
             Drop(String),
+            /// An untracked value overwrites this field path of the object.
+            Cut(String, Vec<String>),
         }
         let mut acts = vec![];
         let (mut any_carry, mut any_derived) = (false, false);
@@ -983,6 +1065,16 @@ impl<'a, 't> Walker<'a, 't> {
             if v.carry.is_none() {
                 if self.is(&m.nodes.name, *l) {
                     acts.push(Act::Drop(lt.to_string()));
+                } else if !compound && self.is(&m.nodes.field, *l) {
+                    if let Some(obj) = self.root_name(*l).filter(|o| self.stop_kind(*l, o).is_none()) {
+                        let chain = self.field_chain(*l);
+                        if !chain.is_empty() {
+                            for a in self.alias_set(&obj) {
+                                acts.push(Act::Cut(a, chain.clone()));
+                            }
+                            acts.push(Act::Cut(obj, chain));
+                        }
+                    }
                 }
                 continue;
             }
@@ -1058,6 +1150,14 @@ impl<'a, 't> Walker<'a, 't> {
             self.add_readers(hid, readers);
             id = Some(hid);
         }
+        if self.is_declaration(n) {
+            for l in &lefts {
+                let lt = self.t(*l);
+                if self.is(&m.nodes.name, *l) && !m.tokens.blank.iter().any(|b| b == lt) {
+                    self.declare(lt, st);
+                }
+            }
+        }
         for a in acts {
             match a {
                 Act::Set(name, cond, paths) => {
@@ -1065,6 +1165,18 @@ impl<'a, 't> Walker<'a, 't> {
                 }
                 Act::Drop(name) => {
                     st.remove(&name);
+                }
+                Act::Cut(name, chain) => {
+                    let empty = match st.get_mut(&name).and_then(|v| v.paths.as_mut()) {
+                        Some(ps) => {
+                            ps.retain(|p| !p.starts_with(&chain));
+                            ps.is_empty()
+                        }
+                        None => false,
+                    };
+                    if empty {
+                        st.remove(&name);
+                    }
                 }
             }
         }
@@ -1225,6 +1337,13 @@ impl<'a, 't> Walker<'a, 't> {
     }
 
     fn branch(&mut self, n: Node<'t>, st: &mut State) {
+        // The header's declarations live until the end of the statement.
+        self.push_scope();
+        self.branch_inner(n, st);
+        self.pop_scope(st);
+    }
+
+    fn branch_inner(&mut self, n: Node<'t>, st: &mut State) {
         let m = self.m;
         for init in kids(n, &m.fields.initializer) {
             self.walk_stmt(init, st);
@@ -1252,6 +1371,7 @@ impl<'a, 't> Walker<'a, 't> {
             };
             for a in &aliases {
                 let name = self.t(*a).to_string();
+                self.declare(&name, st);
                 match id.filter(|_| v.carry.is_some()) {
                     Some(id) => {
                         st.insert(name, Var { origin: id, cond: v.cond, paths: v.paths.clone() });
@@ -1283,9 +1403,12 @@ impl<'a, 't> Walker<'a, 't> {
                 has_default |= self.is(&m.nodes.default_case, case);
                 let labels: Vec<usize> = kids(case, &m.fields.case_label).iter().map(|l| l.id()).collect();
                 let mut s = st.clone();
+                // Each case body is its own block.
+                self.push_scope();
                 for c in named(case).into_iter().filter(|c| !labels.contains(&c.id())) {
                     self.walk_stmt(c, &mut s);
                 }
+                self.pop_scope(&mut s);
                 outs.push(s);
             }
             if !has_default {
@@ -1296,6 +1419,14 @@ impl<'a, 't> Walker<'a, 't> {
     }
 
     fn lp(&mut self, n: Node<'t>, st: &mut State) {
+        // The header's declarations (`i := 0`, `for _, x := range`) live
+        // until the end of the loop and shadow outer names.
+        self.push_scope();
+        self.lp_inner(n, st);
+        self.pop_scope(st);
+    }
+
+    fn lp_inner(&mut self, n: Node<'t>, st: &mut State) {
         let m = self.m;
         let line = line_of(n);
         let header = named(n);
@@ -1308,7 +1439,9 @@ impl<'a, 't> Walker<'a, 't> {
         }
         let body = kids(n, &m.fields.body);
         let mut acc = st.clone();
-        for _ in 0..MAX_LOOP_PASSES {
+        let cap = MIN_LOOP_PASSES + 4 * (self.locals.len() + 1);
+        let mut converged = false;
+        for _ in 0..cap {
             let mut s = acc.clone();
             if let Some(r) = range {
                 let p = self.pending_in(r);
@@ -1334,8 +1467,14 @@ impl<'a, 't> Walker<'a, 't> {
             let done = same(&next, &acc);
             acc = next;
             if done {
+                converged = true;
                 break;
             }
+        }
+        if !converged {
+            let from = acc.values().map(|v| v.origin).max();
+            let v = Val { carry: from, used: from, ..Val::default() };
+            self.hop(n, &v, &["stopped: loop cap".into()]);
         }
         *st = acc;
     }
@@ -1734,6 +1873,14 @@ impl<'a, 't> Walker<'a, 't> {
             CallEffect::Via(name) => {
                 keep(&mut out);
                 out.via.get_or_insert(name);
+            }
+            CallEffect::Cut(name) => {
+                keep(&mut out);
+                out.via.get_or_insert(name);
+                let tag = "stopped: max depth".to_string();
+                if !out.extra.contains(&tag) {
+                    out.extra.push(tag);
+                }
             }
             CallEffect::Into { name, returns, writes, trees } => {
                 if returns.iter().any(|r| *r) {

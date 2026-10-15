@@ -330,7 +330,7 @@ Evaluation, in order:
 4. All joins must read one way: `->` and `-->`, or `<-` and `<--`. A data-flow combinator is an error here. Upward queries are reversed into call order, so every route is printed caller first and the query's first selector matches the last hop.
 5. For each start, legs are searched in order. `->` and `<-` take exactly one edge. `-->` and `<--` search breadth first over simple paths, shortest first, pruned by a reverse breadth-first distance to the leg's targets. A path stops at the first target it reaches. A middle segment is a waypoint that every route passes through.
 6. Only edges that resolved to a definition are walked. External callees cannot be a step.
-7. `max` (default 12) bounds the whole route in edges. Without `all`, at most `limit` (default 5) routes are kept per start, shortest first. The search stops after 200000 queued paths and sets `truncated`.
+7. `max` (default 12) bounds the whole route in edges. Without `all`, at most `limit` (default 5) routes are kept per start, shortest first. The search stops after 200000 queued paths and sets `truncated`. A start with no route within `max` is searched again without the bound, and when that finds one `cut` counts it, printed as `N routes cut at --max <n>`.
 
 Each hop carries its definition, the line where it calls the next hop, and the confidence of the edge that reached it. A guessed edge (ranked candidates, interface dispatch to several types) prints `?`.
 
@@ -407,9 +407,9 @@ For Go, a call is outside when the import path is neither the module path from `
 
 ## Mechanics keys it adds
 
-- `[nodes]`: `function`, `block`, `case`, `default_case`, `name`, `field_name`, `field_decl`, `type_decl`, `range`, `list`, `loop_clause`, `index`.
+- `[nodes]`: `function`, `block`, `case`, `default_case`, `name`, `field_name`, `field_decl`, `type_decl`, `range`, `list`, `loop_clause`, `index`, `declare` (assignments that declare their names in the enclosing block).
 - `[fields]`: `left`, `right`, `operator`, `condition`, `initializer`, `update`, `consequence`, `alternative`, `body`, `alias`, `case_label`, `function`, `arguments`, `operand`, `field`, `name`.
-- `[tokens]`: `plain_assign` (operators that replace the left side) and `blank` (names that discard a value).
+- `[tokens]`: `plain_assign` (operators that replace the left side) `blank` (names that discard a value) and `declare` (the token that makes a range header declare its names, `:=`).
 
 ## API
 
@@ -424,15 +424,15 @@ For Go, a call is outside when the import path is neither the module path from `
 1. A parameter, or a variable bound outside the body, is tracked from the first statement. A variable bound inside the body is tracked after its binding statement. A variable read inside the body is tracked from that statement.
 2. A field start tracks every read `x.Field` in the function. When the owner type is known and the operand has another type, the read is skipped. The operand's type is `binding_type` for a variable and, for a chain `x.A.Field`, the declared type of `A` on x's type (`flow::operand_type`), so `b.Contact.Phone` is a read of `Contact.Phone`, not `Booking.Phone`.
 3. Assignment with a tracked right side tracks each name on the left: `exact` when the right side is just the tracked value, `derived` otherwise. Unequal left and right counts give `derived`. A range header binds one element, so it is `derived`.
-4. Assignment with nothing tracked on the right drops each name on the left. An operator outside `plain_assign`, such as `+=`, keeps what the left side held.
+4. Assignment with nothing tracked on the right drops each name on the left. An operator outside `plain_assign`, such as `+=`, keeps what the left side held. A plain store of an untracked value into `o.A.B` removes the paths of `o` that begin with `[A, B]`, and stops tracking `o` when none are left.
 5. A store into `o.F` or `m[k]` tracks the object `o` or `m`. A field store adds the tag `field F`.
 6. Conditions carry no data. A sink called inside a condition is still recorded.
 7. After an if or switch, a name is tracked when any arm tracked it, tagged `conditional@<line>` of the condition when not every arm did. An if without else and a switch without a default arm count the untaken path as an arm.
-8. A loop reruns its header and body until the tracked set stops changing (at most 32 passes). The set after the loop joins the set before it, since the body may not run.
+8. A loop reruns its header and body until the tracked set stops changing. The set only grows inside a loop, so this ends. A safety cap of 32 passes plus 4 per name the function declares catches field paths that keep nesting (`o.Next = &o`), and a loop that hits it gets a hop tagged `stopped: loop cap`. The set after the loop joins the set before it, since the body may not run.
 9. A call whose argument is tracked and that `is_end` accepts is a `sink`. Any other call that receives a tracked argument or receiver asks `Outside`. `Unknown` carries the data and tags `unmodelled`. `Pass` carries it. `Clear` stops it (decision 11). `Whole` carries it and also tracks the receiver object.
 10. A call statement that receives tracked data is `moved`, and so is a return of a tracked value.
 11. A hop's tags read in the order primary (`exact`, `derived`, `moved`), `field`, `conditional@`, `unmodelled`, `sink`. A hop's parent is the hop that produced the first tracked value it reads.
-12. Names are tracked without scopes, so shadowing is not modelled. Function literals inside the function are not walked.
+12. Names are tracked with block scopes. A `:=`, a `var`, a `:=` range header, the init clause of an if, switch or for, a type switch alias and a case body each declare in their own block, and the new binding shadows the outer one until the block ends, when the outer binding comes back as it was. A plain `=` assigns the nearest binding. Function literals are walked as `Function values and closures` describes.
 
 ## Models in the flow
 
@@ -465,15 +465,15 @@ The language config is loaded from the repo root of the first scanned path. The 
 
 1. When a call receives tracked data, its byte range is looked up in `CallGraph.sites` for the current file. A site with an in-repo target is walked in the callee: the argument positions map to parameters through `go_signatures` (a variadic parameter takes every later argument, the receiver joins when it is tracked). The walk starts at the first such parameter and tracks the rest from the top of the body (`flow::analyse_function_with`). The callee's root row is its signature line, tagged `moved`, and `widened` too when an interface call has several targets.
 2. The engine gets `CallEffect::Into { name, returns, writes, trees }`. The call's hop is tagged `via <name>`, the callee trees hang under it before the caller's later hops, and the call's result carries the data only when a return statement in the callee carries it. So a helper that drops the value ends the route. `returns` (`FlowResult::returns`) has one entry per result position, and in `a, b := f(x)` only the names at positions some return carries are tracked, so `_, err := two(x)` with `return s, nil` does not track `err`. A bare `return` hands back the named results as they stand.
-3. `writes` are the pointer parameters (type `*T`) and the pointer receiver that hold tracked data when the callee returns, set inside it (`FlowResult::exits`, the union of the states at each return and the end of the body), with their field paths. The caller tracks the object the matching argument or receiver is rooted at from the call's hop: `fill(&b, x)` with `b.Phone = s` inside tracks `b` with `[Phone]`, and so does `b.SetPhone(x)` on a pointer receiver.
-4. Recursion is guarded by a stack of (definition, tracked argument positions). A call already on the stack, a call deeper than `--max` functions, and every call under `=>` fall back to `CallEffect::Via`, which carries the data without walking. Effects are memoised per call node and tracked arguments, so loop passes reuse them.
+3. `writes` are the pointer parameters (type `*T`) and the pointer receiver that hold tracked data when the callee returns, set inside it (`FlowResult::exits`, the union of the states at each return and the end of the body), with their field paths. The caller tracks the object the matching argument or receiver is rooted at from the call's hop: `fill(&b, x)` with `b.Phone = s` inside tracks `b` with `[Phone]`, and so does `b.SetPhone(x)` on a pointer receiver. The hop that last stored into a pointer parameter or receiver is kept in the printed callee tree like a return, so the `b.Phone = s` row shows under the call.
+4. Recursion is guarded by a stack of (definition, tracked argument positions). A call already on the stack and every call under `=>` fall back to `CallEffect::Via`, which carries the data without walking. A call deeper than `--max` functions gives `CallEffect::Cut`, which carries the data like `Via` and tags the hop `stopped: max depth`, placed first on the row. Its hop is kept by pruning like any stop. Effects are memoised per call node and tracked arguments, so loop passes reuse them.
 5. Calls with no in-repo target go to the models (`ModelOutside`). Conversions to predeclared types (`string(b)`, `[]byte(s)`) keep the data.
 
 ## Printing
 
 1. Branches that never reach an end are pruned. A callee tree is kept where it reaches an end itself, and along the hops that lead to its returns when the call's hop is kept, so a route through a function that hands the value back shows that function. Under `=>` only ends one step below the start count.
-2. `--only` keeps hops whose tags include one of the given tags, matched whole or by first word (`via` keeps `via normalise`, `conditional` keeps `conditional@4`), with their ancestors.
-3. Rows use `print::row`, two spaces per level. The trailer is `N routes to sink` (or `N routes to outside` with no end), then the unmodelled-ends line counted before pruning.
+2. `--only` keeps hops whose tags include one of the given tags, matched whole or by first word (`via` keeps `via normalise`, `conditional` keeps `conditional@4`), with their ancestors. A route then counts when a hop on it, its end included, carries a wanted tag. A group with no kept hop prints nothing, and when no route counts the trailer is `0 routes match --only <tags>`.
+3. Rows use `print::row`, two spaces per level. The trailer is `N routes to sink` (or `N routes to outside` with no end), then `N routes cut at --max <n>` counting the printed `stopped: max depth` hops, then `N routes passed through unmodelled calls` counting kept routes with an `unmodelled` hop above their end, then the unmodelled-ends line counted before pruning.
 4. Exit 0 when at least one end is found, 1 when none, 2 on errors.
 
 # Object tracking

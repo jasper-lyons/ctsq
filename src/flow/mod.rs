@@ -113,6 +113,10 @@ pub enum CallEffect {
     /// A call into a function in the repo. The result carries the data and the
     /// hop is tagged `via <name>` instead of `unmodelled`.
     Via(String),
+    /// A call into a function in the repo that the walk did not enter
+    /// because it is `--max` calls deep. The result carries the data as with
+    /// `Via` and the hop is also tagged `stopped: max depth`.
+    Cut(String),
     /// A call into a function in the repo whose body was walked. `trees` are
     /// the walks from the parameters that received tracked arguments, hung
     /// under the call's hop. `returns` has one entry per result position,

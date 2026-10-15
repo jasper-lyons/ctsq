@@ -79,6 +79,11 @@ pub struct CallRoutes {
     /// True when the search stopped at its expansion cap, so routes may be
     /// missing.
     pub truncated: bool,
+    /// Starts with no route within `max` that do reach the end on a longer
+    /// one, so `--max` cut their routes.
+    pub cut: usize,
+    /// The `max` the walk ran with.
+    pub max: usize,
 }
 
 /// Paths popped from the search queue before the walk gives up.
@@ -145,6 +150,11 @@ pub fn evaluate_calls(
     let start_pos = if upward { sets.len() - 1 } else { 0 };
 
     let walk = Walk::new(graph, &excluded, opts);
+    // The same walk without a length bound, to tell a start with no route at
+    // all from one whose routes `max` cut.
+    let wide_opts = CallOptions { max: usize::MAX / 2, all: false, limit: 1 };
+    let wide = Walk::new(graph, &excluded, &wide_opts);
+    let mut cut = 0;
     let mut starts = sets[start_pos].clone();
     starts.sort_by(|&a, &b| index.defs[a].id.cmp(&index.defs[b].id));
     let mut routes = Vec::new();
@@ -152,6 +162,9 @@ pub fn evaluate_calls(
         let mut chain: Vec<HashSet<usize>> = sets.iter().map(|v| v.iter().copied().collect()).collect();
         chain[start_pos] = HashSet::from([s]);
         let mut found = walk.chain_routes(&chain, &direct);
+        if found.is_empty() && !wide.chain_routes(&chain, &direct).is_empty() {
+            cut += 1;
+        }
         found.sort_by(|a, b| {
             a.len().cmp(&b.len()).then_with(|| {
                 let ids = |r: &Vec<Step>| r.iter().map(|st| &index.defs[st.def].id).collect::<Vec<_>>();
@@ -171,6 +184,8 @@ pub fn evaluate_calls(
         segment_matches,
         excluded: excluded.len(),
         truncated: walk.truncated.get(),
+        cut,
+        max: opts.max,
     })
 }
 
@@ -490,6 +505,9 @@ func check() {}
         let opts = CallOptions { max: 1, ..CallOptions::default() };
         let res = eval(&[("a/a.go", APP)], "function#main --> function#check", &opts);
         assert!(res.routes.is_empty());
+        assert_eq!(res.cut, 1, "a route exists beyond --max 1");
+        let res = eval(&[("a/a.go", APP)], "function#check --> function#main", &opts);
+        assert_eq!(res.cut, 0, "no route at all is not a cut");
     }
 
     #[test]

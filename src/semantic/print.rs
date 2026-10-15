@@ -201,6 +201,9 @@ pub fn print_call_routes(routes: &CallRoutes, store: &TreeStore, opts: &PrintOpt
     if routes.excluded > 0 {
         out.push_str(&format!("note: {} excluded by :not\n", plural(routes.excluded, "definition")));
     }
+    if routes.cut > 0 {
+        out.push_str(&format!("{} cut at --max {}\n", plural(routes.cut, "route"), routes.max));
+    }
     if routes.truncated {
         out.push_str("note: the search stopped at its limit, some routes may be missing\n");
     }

@@ -31,12 +31,24 @@ fn one_route(func: &str, sink_row: &str) -> String {
 fn a_write_through_a_pointer_parameter_reaches_the_caller() {
     let t = one_route("ParamWrite", "fmt.Println(b.Phone)");
     assert!(t.contains("fill(&b, x)  moved, via fill"), "{t}");
+    // the write inside the callee is shown under the call
+    assert!(under(&t, "fill(&b, x)", "b.Phone = s  exact, field Phone"), "{t}");
+}
+
+/// Whether the first row containing `child` comes after the row containing
+/// `parent` and is indented deeper than it.
+fn under(t: &str, parent: &str, child: &str) -> bool {
+    let depth = |l: &str| l.len() - l.trim_start().len();
+    let lines: Vec<&str> = t.lines().collect();
+    let Some(p) = lines.iter().position(|l| l.contains(parent)) else { return false };
+    lines[p + 1..].iter().find(|l| l.contains(child)).is_some_and(|c| depth(c) > depth(lines[p]))
 }
 
 #[test]
 fn a_write_through_a_pointer_receiver_reaches_the_caller() {
     let t = one_route("ReceiverWrite", "fmt.Println(b.Phone)");
     assert!(t.contains("b.SetPhone(x)  moved, via Booking.SetPhone"), "{t}");
+    assert!(under(&t, "b.SetPhone(x)", "b.Phone = p  exact, field Phone"), "{t}");
 }
 
 #[test]

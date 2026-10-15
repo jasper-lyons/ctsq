@@ -28,7 +28,8 @@ use crate::resolve::{DefIndex, DefKind, TreeStore};
 pub struct FlowOptions {
     /// Deepest chain of in-repo calls the walk follows.
     pub max: usize,
-    /// Keep only hops carrying one of these tags, with their ancestors.
+    /// Keep only hops carrying one of these tags, with their ancestors. Only
+    /// routes with such a hop count.
     pub only: Vec<String>,
 }
 
@@ -199,23 +200,44 @@ pub fn evaluate_flows(
 
     let end_tag = if has_end { "sink" } else { "outside" };
     let mut out = String::new();
-    let mut found = 0;
+    let (mut found, mut cut, mut through) = (0, 0, 0);
     for g in &groups {
         let mut root = g.root.clone();
         if !has_end {
             retag(&mut root);
         }
         let mut pruned = prune(&root, end_tag, eventually, 0, false).unwrap_or_else(|| Hop { children: vec![], ..root.clone() });
-        found += pruned.walk().iter().filter(|h| h.has(end_tag)).count();
-        if !opts.only.is_empty() {
-            pruned = only(&pruned, &opts.only, true).unwrap_or(Hop { children: vec![], ..pruned.clone() });
+        let routes_through = through_unmodelled(&pruned, end_tag, false);
+        if opts.only.is_empty() {
+            found += pruned.walk().iter().filter(|h| h.has(end_tag)).count();
+        } else {
+            // Routes count when a hop on them carries a wanted tag. A group
+            // with none of those prints nothing.
+            let n = matching_routes(&pruned, &opts.only, end_tag, false);
+            found += n;
+            match only(&pruned, &opts.only, true) {
+                Some(o) if !o.children.is_empty() => pruned = o,
+                _ => continue,
+            }
         }
+        through += routes_through;
+        cut += pruned.walk().iter().filter(|h| h.has(MAX_DEPTH)).count();
         print_tree(&pruned, 0, &mut out);
     }
     if groups.is_empty() {
         out.push_str("note: the start selector matched no variable, parameter or field\n");
     }
-    out.push_str(&format!("{} to {}\n", plural(found, "route"), end_tag));
+    if !opts.only.is_empty() && found == 0 {
+        out.push_str(&format!("0 routes match --only {}\n", opts.only.join(",")));
+    } else {
+        out.push_str(&format!("{} to {}\n", plural(found, "route"), end_tag));
+    }
+    if cut > 0 {
+        out.push_str(&format!("{} cut at --max {}\n", plural(cut, "route"), opts.max));
+    }
+    if through > 0 {
+        out.push_str(&format!("{} passed through unmodelled calls\n", plural(through, "route")));
+    }
     let ends: Vec<&Hop> = raw.iter().flat_map(|r| r.unmodelled_ends()).collect();
     if !ends.is_empty() {
         let list: Vec<String> = ends
@@ -226,6 +248,24 @@ pub fn evaluate_flows(
         out.push_str(&format!("{} {} at an unmodelled call: {}\n", ends.len(), verb, list.join(", ")));
     }
     Ok(FlowReport { text: out, found })
+}
+
+/// Tag of a call hop the walk did not enter because of `--max`.
+const MAX_DEPTH: &str = "stopped: max depth";
+
+/// End hops below `h` with a wanted tag on the way to them, the end included.
+fn matching_routes(h: &Hop, wanted: &[String], end: &str, above: bool) -> usize {
+    let hit = above || h.tags.iter().any(|t| tag_matches(t, wanted));
+    let here = usize::from(hit && h.has(end));
+    here + h.children.iter().map(|c| matching_routes(c, wanted, end, hit)).sum::<usize>()
+}
+
+/// End hops below `h` with a hop tagged `unmodelled` above them, the end
+/// itself not counted.
+fn through_unmodelled(h: &Hop, end: &str, above: bool) -> usize {
+    let here = usize::from(above && h.has(end));
+    let below = above || h.has("unmodelled");
+    here + h.children.iter().map(|c| through_unmodelled(c, end, below)).sum::<usize>()
 }
 
 /// Whether the row at `byte` is a field declaration, not a read.
@@ -566,8 +606,12 @@ impl<'a> Walk<'a> {
     /// `Via(name)` when calls are not followed here.
     fn walk_targets(&self, site: &CallSite, file: &str, targets: &[usize], name: String) -> CallEffect {
         let depth = self.active.borrow().len();
-        if !self.follow || depth >= self.max {
+        if !self.follow {
             return CallEffect::Via(name);
+        }
+        if depth >= self.max {
+            // Not entered: the hop says so instead of passing as a plain via.
+            return CallEffect::Cut(name);
         }
         let key = (
             file.to_string(),
