@@ -672,6 +672,41 @@ fn var_type(var: &str, line: usize, depth: usize, ctx: &Ctx) -> Option<String> {
     ctx.fun.params.iter().find(|(v, _)| v == var).map(|(_, t)| t.clone())
 }
 
+// ── Public helpers for the attribute and flow stages ──────────────────────────
+
+/// Local package name to full import path for one Go file: `"log/slog"` is
+/// keyed `slog`, `l "log"` is keyed `l`. Dot and blank imports bind no name
+/// and are left out. `root` is the file's root node.
+pub fn go_imports(root: Node, src: &[u8]) -> HashMap<String, String> {
+    let mut s = FileScope { imports: HashMap::new(), globs: vec![], fns: vec![] };
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() == "import_declaration" {
+            collect_imports(child, src, &mut s);
+        }
+    }
+    s.imports.into_iter().map(|(k, v)| (k, v.join("/"))).collect()
+}
+
+/// Base type name of `var` as seen at 1-based `line` inside the function
+/// declared nearest above that line: its last binding (`var x T`, `x := &T{}`,
+/// `x := f()` through `f`'s indexed return type or the `NewT` convention),
+/// else the receiver or parameter type. `index` may be empty, which leaves
+/// only the call-return case unresolved. `file` is the path `index` uses.
+pub fn binding_type(
+    root: Node,
+    src: &[u8],
+    file: &str,
+    var: &str,
+    line: usize,
+    index: &DefIndex,
+) -> Option<String> {
+    let scope = FileScope::build(root, src);
+    let fun = scope.fns.iter().filter(|f| f.line <= line).max_by_key(|f| f.line)?;
+    let ctx = Ctx { file, scope: &scope, fun, index };
+    var_type(var, line, 0, &ctx)
+}
+
 /// Pick the best candidate. A single candidate is Exact; several rank by
 /// locality (same file > same dir > imported > anywhere) and yield a Guess.
 fn rank(mut cands: Vec<usize>, prefer_methods: bool, ctx: &Ctx) -> Option<(usize, Confidence)> {
@@ -1088,6 +1123,34 @@ mod tests {
         ]);
         let (file, _, conf) = target_of(&results, "Go", "Helper").unwrap();
         assert_eq!((file.as_str(), conf), ("a/near.go", Confidence::Guess));
+    }
+
+    #[test]
+    fn go_imports_maps_local_name_to_full_path() {
+        let src = "package main\nimport (\n  \"fmt\"\n  \"log/slog\"\n  l \"log\"\n  . \"proj/dot\"\n  _ \"side\"\n)\n";
+        let tree = parse(src.as_bytes()).unwrap();
+        let m = go_imports(tree.root_node(), src.as_bytes());
+        assert_eq!(m.get("fmt").map(String::as_str), Some("fmt"));
+        assert_eq!(m.get("slog").map(String::as_str), Some("log/slog"));
+        assert_eq!(m.get("l").map(String::as_str), Some("log"));
+        assert_eq!(m.len(), 3, "dot and blank imports bind no name: {:?}", m);
+    }
+
+    #[test]
+    fn binding_type_reads_params_literals_and_returns() {
+        let src = "package a\ntype S struct{}\nfunc makeIt() *S { return &S{} }\nfunc Go(p *S) {\n  var v S\n  x := &S{}\n  y := makeIt()\n  z := NewT()\n  _ = v\n}\n";
+        let tree = parse(src.as_bytes()).unwrap();
+        let root = tree.root_node();
+        let idx = build_index(&[("a/a.go", src)]);
+        let ty = |var: &str| binding_type(root, src.as_bytes(), "a/a.go", var, 9, &idx);
+        assert_eq!(ty("p").as_deref(), Some("S"));
+        assert_eq!(ty("v").as_deref(), Some("S"));
+        assert_eq!(ty("x").as_deref(), Some("S"));
+        assert_eq!(ty("y").as_deref(), Some("S"));
+        assert_eq!(ty("z").as_deref(), Some("T"));
+        assert_eq!(ty("nope"), None);
+        // before the binding line the variable has no type yet
+        assert_eq!(binding_type(root, src.as_bytes(), "a/a.go", "x", 5, &idx), None);
     }
 
     #[test]

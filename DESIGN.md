@@ -67,6 +67,20 @@ combinator   := ... | '->' '-->' '<-' '<--'             -- call graph
 - Semantic combinators and `:not(...)` parse anywhere, but `compiler::validate` rejects them everywhere with an error that starts with `compiler::SEMANTIC_QUERY_PREFIX` (test with `is_semantic_query_error`). `compiler::has_semantic` answers the same question for the `path` subcommand.
 - An unknown character in a query is a parse error.
 
+## Attributes evaluation
+
+`src/semantic/attrs.rs` filters `-q` rows after `runner::run_rows`. It reparses the file and finds each row's primary node by `start_byte` and `end_byte`.
+
+- Only the last selector may carry attributes, because a `-q` row only holds the last selector's node. Attributes on any other selector, inside a group, a field inner query or a `:not` exit 2 with `attributes are only supported on the last selector in -q`.
+- From the primary node the stage finds the name identifier (the called name of a call, the member of a member access, the `name` field of a declaration) and its qualifier: the Go `selector_expression` operand, the JS/TS `member_expression` object, the Python `attribute` object, the Rust scoped path. The qualifier's leftmost identifier is its root.
+- `from` is the import origin of the qualifier root, or of the name itself when it has no qualifier. Go reads `resolve::go::go_imports` (local name to full import path). JS/TS, Python and Rust read `RawImport.bindings` from `resolve::imports`. C, C++ and Ruby exit 2 with `attribute from is not supported for <lang>`.
+- `in` is the nearest enclosing struct, class, impl, interface, module or namespace, or a Go method's receiver type. A declaration does not enclose its own name. For a Go member access through a variable (`u.Email`), `in` is the variable's type from `resolve::go::binding_type`.
+- `qual` (dot shorthand) holds when `in` matches the value, or when the qualifier root is bound by an import and the root or the whole qualifier text matches the value. So `function#slog.Info` matches `slog.Info` from `"log/slog"`, and `function#log.Printf` does not match `fmt.Printf`.
+- Operators: `=` equals, `^=` starts with, `*=` contains, `$=` ends with, `=/re/` uses the `regex` crate. An unknown key or a bad regex exits 2.
+- A row survives only when every attribute holds. A query left with no rows prints the usual miss report and exits 1.
+- A semantic combinator or `:not` in `-q` exits 2 with `use: ctsq path '<query>'`.
+- The runner drops rows with identical node text, so two matches of the same name on one line keep only the first before filtering.
+
 ## Examples
 
 | Abstract query | Meaning |

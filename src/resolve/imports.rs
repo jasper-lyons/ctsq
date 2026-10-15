@@ -31,18 +31,24 @@ pub struct RawImport {
     /// When true, an unresolved import produces NO edge instead of an external
     /// node — used for intra-crate Rust `crate::`/`self`/`super` that we can't map.
     pub drop_if_unresolved: bool,
+    /// Local names this import binds in the importing file: `logger` for
+    /// `import logger from 'pino'`, `os` for `import os.path`, `Map` for
+    /// `use std::collections::HashMap as Map`. Empty when nothing is bound
+    /// or the language does not report bindings (C, C++, Ruby, Go).
+    pub bindings: Vec<String>,
 }
 
 impl RawImport {
     fn new(specifier: impl Into<String>, kind: ImportKind, line: usize) -> Self {
         RawImport {
             specifier: specifier.into(), kind, dots: 0, line,
-            ext_label: None, drop_if_unresolved: false,
+            ext_label: None, drop_if_unresolved: false, bindings: Vec::new(),
         }
     }
     fn with_dots(mut self, d: usize) -> Self { self.dots = d; self }
     fn dropping(mut self) -> Self { self.drop_if_unresolved = true; self }
     fn ext(mut self, label: impl Into<String>) -> Self { self.ext_label = Some(label.into()); self }
+    fn bind(mut self, names: Vec<String>) -> Self { self.bindings = names; self }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -406,9 +412,9 @@ impl ImportResolver for JsTsImports {
     fn imports(&self, source: &[u8]) -> Vec<RawImport> {
         let Some(tree) = self.parse(source) else { return vec![] };
         let mut out = Vec::new();
-        let mut push = |spec: String, line: usize| {
+        let mut push = |spec: String, line: usize, bindings: Vec<String>| {
             let kind = classify_js(&spec);
-            out.push(RawImport::new(spec, kind, line));
+            out.push(RawImport::new(spec, kind, line).bind(bindings));
         };
         walk(tree.root_node(), &mut |n| {
             let line = n.start_position().row + 1;
@@ -416,7 +422,7 @@ impl ImportResolver for JsTsImports {
                 // static import / re-export (`export ... from`)
                 "import_statement" | "export_statement" => {
                     if let Some(src) = n.child_by_field_name("source") {
-                        push(unquote(text(src, source)), line);
+                        push(unquote(text(src, source)), line, js_import_bindings(n, source));
                     }
                 }
                 // require(...) and dynamic import(...)
@@ -431,7 +437,7 @@ impl ImportResolver for JsTsImports {
                     let mut cur = args.walk();
                     for arg in args.children(&mut cur) {
                         if arg.kind() == "string" {
-                            push(unquote(text(arg, source)), line);
+                            push(unquote(text(arg, source)), line, js_require_bindings(n, source));
                             break;
                         }
                     }
@@ -463,6 +469,76 @@ impl ImportResolver for JsTsImports {
         // (`react`) stay external.
         js_alias_resolve(&imp.specifier, known)
     }
+}
+
+/// Local names bound by an `import` statement: the default import, the
+/// namespace import, and each named import (its alias when it has one).
+fn js_import_bindings(stmt: Node, source: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = stmt.walk();
+    for clause in stmt.named_children(&mut cur) {
+        if clause.kind() != "import_clause" { continue; }
+        let mut c = clause.walk();
+        for part in clause.named_children(&mut c) {
+            match part.kind() {
+                "identifier" => out.push(text(part, source).to_string()),
+                "namespace_import" => {
+                    let mut pc = part.walk();
+                    if let Some(id) = part.named_children(&mut pc).find(|x| x.kind() == "identifier") {
+                        out.push(text(id, source).to_string());
+                    }
+                }
+                "named_imports" => {
+                    let mut pc = part.walk();
+                    for spec in part.named_children(&mut pc) {
+                        if spec.kind() != "import_specifier" { continue; }
+                        let local = spec.child_by_field_name("alias")
+                            .or_else(|| spec.child_by_field_name("name"));
+                        if let Some(id) = local {
+                            out.push(unquote(text(id, source)));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// Local names bound by `const x = require('m')` or
+/// `const { a, b: c } = require('m')`. A require whose value is not assigned
+/// straight to a declarator binds nothing.
+fn js_require_bindings(call: Node, source: &[u8]) -> Vec<String> {
+    let mut node = call;
+    // `await import('m')` wraps the call once.
+    if let Some(p) = node.parent().filter(|p| p.kind() == "await_expression") {
+        node = p;
+    }
+    let Some(decl) = node.parent().filter(|p| p.kind() == "variable_declarator") else {
+        return vec![];
+    };
+    let Some(name) = decl.child_by_field_name("name") else { return vec![] };
+    let mut out = Vec::new();
+    match name.kind() {
+        "identifier" => out.push(text(name, source).to_string()),
+        "object_pattern" => {
+            let mut c = name.walk();
+            for prop in name.named_children(&mut c) {
+                match prop.kind() {
+                    "shorthand_property_identifier_pattern" => out.push(text(prop, source).to_string()),
+                    "pair_pattern" => {
+                        if let Some(v) = prop.child_by_field_name("value").filter(|v| v.kind() == "identifier") {
+                            out.push(text(v, source).to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 /// Strip a leading alias sigil (`~`, `@`) and resolve the remaining path tail by
@@ -503,6 +579,21 @@ fn dotted_text(node: Node, source: &[u8]) -> String {
         }
     }
     parts.join(".")
+}
+
+/// Local names bound by a `from … import a, b as c` statement: `a` and `c`.
+fn py_from_bindings(node: Node, source: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = node.walk();
+    for name in node.children_by_field_name("name", &mut cur) {
+        let local = if name.kind() == "aliased_import" {
+            name.child_by_field_name("alias").map(|a| text(a, source).to_string())
+        } else {
+            Some(dotted_text(name, source))
+        };
+        if let Some(l) = local.filter(|l| !l.is_empty()) { out.push(l); }
+    }
+    out
 }
 
 /// The imported names of a `from … import a, b` statement (module submodules
@@ -547,15 +638,26 @@ impl ImportResolver for PyImports {
                         };
                         let path = dotted_text(target, source);
                         if !path.is_empty() {
-                            out.push(RawImport::new(path, ImportKind::Absolute, line));
+                            // `import a.b` binds `a`, `import a.b as c` binds `c`.
+                            let local = if name.kind() == "aliased_import" {
+                                name.child_by_field_name("alias")
+                                    .map(|a| text(a, source).to_string())
+                                    .unwrap_or_default()
+                            } else {
+                                path.split('.').next().unwrap_or("").to_string()
+                            };
+                            let raw = RawImport::new(path, ImportKind::Absolute, line);
+                            out.push(if local.is_empty() { raw } else { raw.bind(vec![local]) });
                         }
                     }
                 }
                 "import_from_statement" => {
                     let Some(module) = n.child_by_field_name("module_name") else { return };
+                    let bound = py_from_bindings(n, source);
                     match module.kind() {
                         "dotted_name" => out.push(
-                            RawImport::new(dotted_text(module, source), ImportKind::Absolute, line)),
+                            RawImport::new(dotted_text(module, source), ImportKind::Absolute, line)
+                                .bind(bound)),
                         "relative_import" => {
                             let mut dots = 0;
                             let mut mod_path = String::new();
@@ -571,11 +673,14 @@ impl ImportResolver for PyImports {
                             }
                             if mod_path.is_empty() {
                                 // `from . import submod` — each imported name is a submodule.
-                                for name in imported_names(n, source) {
-                                    out.push(RawImport::new(name, ImportKind::Relative, line).with_dots(dots));
+                                for (i, name) in imported_names(n, source).into_iter().enumerate() {
+                                    let local = bound.get(i).cloned().into_iter().collect();
+                                    out.push(RawImport::new(name, ImportKind::Relative, line)
+                                        .with_dots(dots).bind(local));
                                 }
                             } else {
-                                out.push(RawImport::new(mod_path, ImportKind::Relative, line).with_dots(dots));
+                                out.push(RawImport::new(mod_path, ImportKind::Relative, line)
+                                    .with_dots(dots).bind(bound));
                             }
                         }
                         _ => {}
@@ -748,13 +853,26 @@ fn rust_flatten(node: Node, source: &[u8], out: &mut Vec<String>) {
     }
 }
 
-/// Recursively collect `use`-tree paths (each a full segment vector, root kept).
-fn rust_collect(node: Node, source: &[u8], prefix: &[String], out: &mut Vec<Vec<String>>) {
+/// The local name a plain `use` path binds: its last segment, or the segment
+/// before a trailing `self` (`use a::b::{self}` binds `b`).
+fn rust_binding(path: &[String]) -> Option<String> {
+    let last = path.last()?;
+    if last == "self" {
+        return path.len().checked_sub(2).map(|i| path[i].clone());
+    }
+    if matches!(last.as_str(), "crate" | "super") { return None; }
+    Some(last.clone())
+}
+
+/// Recursively collect `use`-tree paths (each a full segment vector, root kept)
+/// with the local name each one binds.
+fn rust_collect(node: Node, source: &[u8], prefix: &[String], out: &mut Vec<(Vec<String>, Option<String>)>) {
     match node.kind() {
         "identifier" | "crate" | "self" | "super" | "scoped_identifier" => {
             let mut path = prefix.to_vec();
             rust_flatten(node, source, &mut path);
-            if !path.is_empty() { out.push(path); }
+            let bound = rust_binding(&path);
+            if !path.is_empty() { out.push((path, bound)); }
         }
         "scoped_use_list" => {
             let mut path = prefix.to_vec();
@@ -771,12 +889,14 @@ fn rust_collect(node: Node, source: &[u8], prefix: &[String], out: &mut Vec<Vec<
         "use_as_clause" => {
             let mut path = prefix.to_vec();
             if let Some(p) = node.child_by_field_name("path") { rust_flatten(p, source, &mut path); }
-            if !path.is_empty() { out.push(path); } // alias is irrelevant to file resolution
+            // the alias is irrelevant to file resolution but is the local binding
+            let bound = node.child_by_field_name("alias").map(|a| text(a, source).to_string());
+            if !path.is_empty() { out.push((path, bound)); }
         }
         "use_wildcard" => {
             let mut path = prefix.to_vec();
             if let Some(p) = node.named_child(0) { rust_flatten(p, source, &mut path); }
-            if !path.is_empty() { out.push(path); } // glob resolves to the module file
+            if !path.is_empty() { out.push((path, None)); } // glob resolves to the module file
         }
         _ => {}
     }
@@ -839,7 +959,7 @@ impl ImportResolver for RustImports {
             let line = n.start_position().row + 1;
             let mut paths = Vec::new();
             rust_collect(arg, source, &[], &mut paths);
-            for p in paths {
+            for (p, bound) in paths {
                 let raw = match p.first().map(|s| s.as_str()) {
                     // intra-crate: keep full path; drop (not "external") if unmappable
                     Some("crate") => RawImport::new(p.join("::"), ImportKind::Absolute, line).dropping(),
@@ -850,7 +970,7 @@ impl ImportResolver for RustImports {
                     Some(root) => RawImport::new(p.join("::"), ImportKind::System, line).ext(root.to_string()),
                     None => continue,
                 };
-                out.push(raw);
+                out.push(raw.bind(bound.into_iter().collect()));
             }
         });
         out
@@ -1063,6 +1183,42 @@ fn build_go(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bindings_of(lang: &'static str, src: &str) -> Vec<(String, Vec<String>)> {
+        import_resolver_for(lang).imports(src.as_bytes()).into_iter()
+            .map(|r| (r.specifier, r.bindings))
+            .collect()
+    }
+
+    fn b(spec: &str, names: &[&str]) -> (String, Vec<String>) {
+        (spec.to_string(), names.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn js_imports_report_local_bindings() {
+        let got = bindings_of("javascript", "import pino from 'pino'\nimport * as ns from './ns'\nimport { a, b as c } from 'm'\nimport 'side'\nconst logger = require('winston')\nconst { x, y: z } = require('obj')\n");
+        assert_eq!(got, vec![
+            b("pino", &["pino"]), b("./ns", &["ns"]), b("m", &["a", "c"]), b("side", &[]),
+            b("winston", &["logger"]), b("obj", &["x", "z"]),
+        ]);
+    }
+
+    #[test]
+    fn python_imports_report_local_bindings() {
+        let got = bindings_of("python", "import os.path\nimport numpy as np\nfrom log import info, warn as w\nfrom . import sib\n");
+        assert_eq!(got, vec![
+            b("os.path", &["os"]), b("numpy", &["np"]), b("log", &["info", "w"]), b("sib", &["sib"]),
+        ]);
+    }
+
+    #[test]
+    fn rust_imports_report_local_bindings() {
+        let got = bindings_of("rust", "use std::collections::HashMap;\nuse std::fmt::{self, Write as W};\nuse crate::a::*;\n");
+        assert_eq!(got, vec![
+            b("std::collections::HashMap", &["HashMap"]), b("std::fmt::self", &["fmt"]),
+            b("std::fmt::Write", &["W"]), b("crate::a", &[]),
+        ]);
+    }
 
     #[test]
     fn normalize_lexical_folds_dotdot_and_dot() {

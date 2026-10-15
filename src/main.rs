@@ -449,6 +449,15 @@ fn main() {
         }
     };
 
+    // Attributes are filtered after matching, against the last selector's node.
+    let attrs = match semantic::attrs::last_selector_attrs(&ast) {
+        Ok(a) => a,
+        Err(msg) => {
+            eprintln!("{}", msg);
+            std::process::exit(2);
+        }
+    };
+
     if cli.context.is_some() && cli.node {
         eprintln!("-C/--context does not apply to --node, which already prints the whole node");
         std::process::exit(2);
@@ -461,7 +470,7 @@ fn main() {
             let canonical = lang::lang_for_name_canonical(lang_name).unwrap_or(lang_name);
             if let Err(msg) = compiler::validate(&ast, lang.as_ref(), canonical) {
                 eprintln!("{}", msg);
-                std::process::exit(1);
+                std::process::exit(validate_exit_code(&msg));
             }
             let compiled = compiler::compile(&ast, lang.as_ref());
             println!("=== Compiled S-expression ({}) ===", lang_name);
@@ -604,7 +613,11 @@ fn main() {
         let l = lang::for_name(lang_name).expect("lang_name always valid here");
         if let Err(msg) = compiler::validate(&ast, l.as_ref(), lang_name) {
             eprintln!("{}", msg);
-            std::process::exit(1);
+            std::process::exit(validate_exit_code(&msg));
+        }
+        if let Err(msg) = semantic::attrs::check_lang(&attrs, lang_name) {
+            eprintln!("{}", msg);
+            std::process::exit(2);
         }
     }
 
@@ -649,7 +662,10 @@ fn main() {
 
         let display = if file == "-" { "<stdin>" } else { file.as_str() };
 
-        match runner::run_rows(compiled, lang_box.as_ref(), &source, cli.body) {
+        let result = runner::run_rows(compiled, lang_box.as_ref(), &source, cli.body).map(|rows| {
+            semantic::attrs::filter_rows(rows, &attrs, lang_name, &lang_box.ts_language(), &source)
+        });
+        match result {
             Ok(rows) if rows.is_empty() => {
                 if cli.show_query && !multiple {
                     println!("(no matches)");
@@ -821,6 +837,12 @@ fn run_refs(name: &str, path: &str, lang_override: Option<&str>, no_ignore: bool
             Err(e) => eprintln!("Runner error in {}: {}", file, e),
         }
     }
+}
+
+/// A semantic query is a usage error with a pointer to `ctsq path` (exit 2).
+/// Any other validation failure is an unknown kind (exit 1).
+fn validate_exit_code(msg: &str) -> i32 {
+    if compiler::is_semantic_query_error(msg) { 2 } else { 1 }
 }
 
 fn require_lang(name: &str) -> Box<dyn lang::Lang> {
