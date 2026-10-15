@@ -50,6 +50,23 @@ combinator   := ' '   -- descendant
 
 ---
 
+## Attributes, dot shorthand and semantic combinators
+
+```
+atom         := sigil? node_type? name_match? attr*
+attr         := '[' key op value ']'
+op           := '=' | '^=' | '*=' | '$='                -- equals, starts, contains, ends
+value        := bare_word | '"' text '"' | '/' regex '/'  -- /regex/ only with '='
+selector     := (atom | '(' query capture? ')') (field_access | ':not(' selector ')')*
+combinator   := ... | '->' '-->' '<-' '<--'             -- call graph
+              | '=>' '==>' '<=' '<=='                   -- data flow
+```
+
+- Attributes are carried on `Atom.attrs` and ignored by the compiler. They are filtered after tree-sitter matching. A value containing `/` must be quoted: `[from="log/slog"]`.
+- Dot shorthand: in `#A.B`, when the token after `B` is not `(`, the atom gets name `B` and the attribute `[qual=A]`. `#log.body(...)` stays field access.
+- Semantic combinators and `:not(...)` parse anywhere, but `compiler::validate` rejects them everywhere with an error that starts with `compiler::SEMANTIC_QUERY_PREFIX` (test with `is_semantic_query_error`). `compiler::has_semantic` answers the same question for the `path` subcommand.
+- An unknown character in a query is a parse error.
+
 ## Examples
 
 | Abstract query | Meaning |
