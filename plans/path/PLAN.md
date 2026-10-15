@@ -321,6 +321,7 @@ Tests: there is no lib crate, so `tests/*.rs` can only drive the `ctsq` binary. 
 | 2 | attributes-syntax | `src/query/**`, `src/compiler/mod.rs` | descendant | Sonnet |
 | 3 | attributes-eval | `src/semantic/mod.rs`, `src/semantic/attrs.rs`, `src/resolve/imports.rs` (additive), `src/resolve/go.rs` (additive pub exports), `src/main.rs` (attribute filter call, `-q` exit 2 hint) | attributes-syntax, models | Opus |
 | 4 | call-walk | `src/semantic/calls.rs`, `src/semantic/mod.rs`, `src/resolve/graph.rs`, `src/resolve/mod.rs` (additive), `src/resolve/go.rs` (additive) | attributes-eval | Opus |
+| 4 | field-kind | `src/types.rs`, `src/compiler/lang/*.rs` (adding the `field` kind only), `tests/field.rs` | attributes-eval | Sonnet |
 | 4 | flow-engine | `src/flow/**`, `src/config/mechanics.rs` (additive fields) | attributes-eval | Opus |
 | 5 | path-cli | `src/semantic/print.rs`, `src/main.rs` (`path` subcommand and flags), `tests/path_cli.rs`, `fixtures/path/` | call-walk | Sonnet |
 | 5 | flow-models | `src/flow/**` | flow-engine | Opus |
@@ -410,6 +411,14 @@ Every package also owns the `DESIGN.md` section for its subsystem (additive). St
 - `src/semantic/calls.rs`: walk `CallGraph.fwd`/`rev`: `->`/`<-` one edge, `-->`/`<--` bounded BFS shortest first, `max` and `all` options, at most 5 routes per start by default, waypoints, `:not(sel)` exclusion, `Confidence::Guess` marked. Return route data, not text (path-cli prints).
 
 **Acceptance.** Unit tests on inline Go: routes, reversed reading order for `<--`, waypoint, `:not`, depth limit. Add a test that pins `callers`, `callees`, `callgraph` output on `fixtures/` as before.
+
+## Package: field-kind
+
+**Problem.** The abstract kind `field` does not exist, so `field#User.Email` fails `validate`. Found by attributes-eval.
+
+**Do.** Add `field` to `types::ABSTRACT_TYPES` and map it in every language in `src/compiler/lang/*.rs`: struct or class field declarations (`*field`) and field or member accesses (`&field`), with the field name as the name. Go: `field_declaration` names and `selector_expression` field. JS/TS: class fields and `member_expression` property. Python: attribute access and class-level assignments. Rust: struct fields and `field_expression`. Ruby, C, C++: struct members and member access where the grammar has them.
+
+**Acceptance.** `ctsq -q '*field#Email' fixtures/` lists declarations, `&field#Email` lists accesses, and `field#User.Email` (with attributes-eval's filter) matches `Email` in `User` only. `cargo test` passes.
 
 ## Package: flow-engine
 
