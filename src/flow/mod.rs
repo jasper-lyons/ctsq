@@ -116,6 +116,11 @@ pub enum CallEffect {
     /// under the call's hop. The result carries the data only when the
     /// callee `returns` it. The hop is tagged `via <name>`.
     Into { name: String, returns: bool, trees: Vec<Hop> },
+    /// The walk cannot tell where the call goes, as with a function-valued
+    /// variable assigned more than once. The call's hop is tagged `tag`
+    /// (`stopped: function value`), `rows` (the candidates) hang under it and
+    /// the result does not carry the data.
+    Stop { tag: String, rows: Vec<Hop> },
 }
 
 /// The hook for calls whose effect the engine cannot see.
