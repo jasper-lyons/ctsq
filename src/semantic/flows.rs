@@ -14,7 +14,7 @@ use tree_sitter::Node;
 
 use super::print::{plural, row};
 use super::{segment_rows, split_query};
-use crate::config::{self, gomod, LangConfig};
+use crate::config::{self, gomod, LangConfig, Slot};
 use crate::flow::{
     self, analyse_function, analyse_function_with, enclosing_function, start_at, start_in, CallEffect, CallSite,
     EndFn, FlowCtx, FlowResult, Hop, ModelOutside, Module, Outside, Paths, StartKind,
@@ -171,7 +171,7 @@ pub fn evaluate_flows(
                         .find(|s| s.kind == start.kind && s.func == "field" && is_decl_row(&cx, s.start_byte))
                         .unwrap_or_else(|| start.clone());
                     let mut root: Option<FlowResult> = None;
-                    for (ffile, func_byte) in field_users(store, &cfg, name) {
+                    for (ffile, func_byte) in field_users(store, &cfg, &module, name, owner.as_deref()) {
                         let Some(fpf) = store.get(&ffile) else { continue };
                         let Some(ftree) = &fpf.tree else { continue };
                         let fcx = FlowCtx {
@@ -236,8 +236,16 @@ fn is_decl_row(cx: &FlowCtx, byte: usize) -> bool {
 
 /// (file, byte inside the function) for every function that reads or writes
 /// a field called `name`, by a selector or a keyed composite element, once
-/// per function, in file order.
-fn field_users(store: &TreeStore, cfg: &LangConfig, name: &str) -> Vec<(String, usize)> {
+/// per function, in file order. With an `owner`, a selector whose operand
+/// has another known type (`b.Contact` in `b.Contact.Phone`) and a literal
+/// of another known type do not count, the rule `flow::operand_type` gives.
+fn field_users(
+    store: &TreeStore,
+    cfg: &LangConfig,
+    module: &Module,
+    name: &str,
+    owner: Option<&str>,
+) -> Vec<(String, usize)> {
     let m = &cfg.mechanics;
     let mut out = vec![];
     for (file, pf) in store.iter() {
@@ -245,6 +253,11 @@ fn field_users(store: &TreeStore, cfg: &LangConfig, name: &str) -> Vec<(String, 
             continue;
         }
         let Some(tree) = &pf.tree else { continue };
+        let cx = FlowCtx { file, src: &pf.source, root: tree.root_node(), mech: m, module };
+        let other_owner = |t: Option<String>| match (t, owner) {
+            (Some(t), Some(o)) => t != o && !module.promotes(&t, o),
+            _ => false,
+        };
         let mut seen: HashSet<usize> = HashSet::new();
         let mut stack = vec![tree.root_node()];
         let mut hits: Vec<(usize, usize)> = vec![];
@@ -256,7 +269,18 @@ fn field_users(store: &TreeStore, cfg: &LangConfig, name: &str) -> Vec<(String, 
             } else {
                 None
             };
-            if field.is_some_and(|f| f.utf8_text(&pf.source).unwrap_or("") == name) {
+            let other = field.is_some() && owner.is_some() && {
+                if config::Mechanics::is(&m.nodes.field, n.kind()) {
+                    let line = n.start_position().row + 1;
+                    other_owner(m.fields.operand.iter().find_map(|f| n.child_by_field_name(f)).and_then(|o| flow::operand_type(&cx, o, line)))
+                } else {
+                    // keyed element, in a literal body, in a composite literal
+                    let comp = n.parent().and_then(|b| b.parent()).filter(|c| config::Mechanics::is(&m.nodes.composite, c.kind()));
+                    let ty = comp.and_then(|c| m.fields.ty.iter().find_map(|f| c.child_by_field_name(f)));
+                    other_owner(ty.map(|t| flow::base_type(t.utf8_text(&pf.source).unwrap_or(""))).filter(|t| !t.is_empty()))
+                }
+            };
+            if !other && field.is_some_and(|f| f.utf8_text(&pf.source).unwrap_or("") == name) {
                 if let Some(func) = enclosing_function(tree.root_node(), m, n.start_byte()) {
                     if seen.insert(func.start_byte()) {
                         hits.push((func.start_byte(), n.start_byte()));
@@ -467,7 +491,9 @@ impl<'a> Walk<'a> {
     /// Walk callee `def` from the parameters that receive the tracked
     /// arguments of `site` (and its receiver when tracked), each holding the
     /// data where its argument held it. None when no parameter can be named.
-    fn into_callee(&self, def: usize, site: &CallSite) -> Option<FlowResult> {
+    /// Also gives the pointer parameters and pointer receiver the callee
+    /// stored the data in, as `CallEffect::Into` writes.
+    fn into_callee(&self, def: usize, site: &CallSite) -> Option<(FlowResult, Vec<(Slot, Paths)>)> {
         let d = &self.graph.index.defs[def];
         let sig = self.signature(&d.id.file, d.id.line)?;
         let mut params: Vec<(&crate::resolve::go::GoParam, Paths)> = vec![];
@@ -502,7 +528,19 @@ impl<'a> Walk<'a> {
         self.files.borrow_mut().push(d.id.file.clone());
         let r = analyse_function_with(&cx, func, &start, &also, self.end, self);
         self.files.borrow_mut().pop();
-        Some(r)
+        let is_ptr = |p: &crate::resolve::go::GoParam, name: &str| p.name == name && p.ty.starts_with('*');
+        let mut writes = vec![];
+        for (name, paths) in &r.exits {
+            let slot = if sig.receiver.as_ref().is_some_and(|p| is_ptr(p, name)) {
+                Some(Slot::Receiver)
+            } else {
+                sig.params.iter().find(|p| is_ptr(p, name)).map(|p| Slot::Arg(p.position))
+            };
+            if let Some(s) = slot {
+                writes.push((s, paths.clone()));
+            }
+        }
+        Some((r, writes))
     }
 
     fn callee_effect(&self, site: &CallSite, file: &str) -> Option<CallEffect> {
@@ -542,7 +580,8 @@ impl<'a> Walk<'a> {
             return e.clone();
         }
         let mut trees = vec![];
-        let mut returns = false;
+        let mut returns: Vec<bool> = vec![];
+        let mut writes: Vec<(Slot, Paths)> = vec![];
         let mut walked = false;
         for &t in targets {
             let mark = (t, site.tracked_args.clone());
@@ -552,9 +591,19 @@ impl<'a> Walk<'a> {
             self.active.borrow_mut().push(mark);
             let r = self.into_callee(t, site);
             self.active.borrow_mut().pop();
-            if let Some(mut r) = r {
+            if let Some((mut r, w)) = r {
                 walked = true;
-                returns |= r.returns;
+                if returns.len() < r.returns.len() {
+                    returns.resize(r.returns.len(), false);
+                }
+                for (i, x) in r.returns.iter().enumerate() {
+                    returns[i] |= *x;
+                }
+                for e in w {
+                    if !writes.contains(&e) {
+                        writes.push(e);
+                    }
+                }
                 r.root.tags = vec!["moved".into()];
                 r.root.into = true;
                 if targets.len() > 1 {
@@ -563,7 +612,7 @@ impl<'a> Walk<'a> {
                 trees.push(r.root);
             }
         }
-        let effect = if walked { CallEffect::Into { name, returns, trees } } else { CallEffect::Via(name) };
+        let effect = if walked { CallEffect::Into { name, returns, writes, trees } } else { CallEffect::Via(name) };
         self.memo.borrow_mut().insert(key, effect.clone());
         effect
     }

@@ -8,7 +8,7 @@ use super::models::qualify_type;
 use super::objects::{is_map_expr, join_paths, under, Paths};
 use super::{CallEffect, CallSite, EndFn, FlowCtx, FlowResult, Hop, Outside, Start, StartKind};
 use crate::config::{Mechanics, Slot};
-use crate::resolve::go::{binding_type, binding_type_qualified, go_imports};
+use crate::resolve::go::{binding_type, binding_type_qualified, go_imports, go_result_names};
 use crate::resolve::DefIndex;
 
 const MAX_LOOP_PASSES: usize = 32;
@@ -94,10 +94,7 @@ pub fn start_at(cx: &FlowCtx, start_byte: usize, end_byte: usize) -> Option<Star
                 }
             }
         } else if Mechanics::is(&m.nodes.field, p.kind()) {
-            kids(p, &m.fields.operand)
-                .first()
-                .filter(|o| Mechanics::is(&m.nodes.name, o.kind()))
-                .and_then(|o| binding_type(cx.root, cx.src, cx.file, text(*o, cx.src), line, &DefIndex::default()))
+            kids(p, &m.fields.operand).first().and_then(|o| operand_type(cx, *o, line))
         } else {
             None
         };
@@ -111,6 +108,99 @@ pub fn start_at(cx: &FlowCtx, start_byte: usize, end_byte: usize) -> Option<Star
         return Some(base(StartKind::Var(name), func, line_text(cx.src, line)));
     }
     None
+}
+
+/// The struct type an object expression has: a variable's type, and for a
+/// chain `o.A` the declared type of field `A` on the type of `o`, so the
+/// owner of `F` in `o.A.F` is the type of `A`, not of `o`. None when a step
+/// is unknown.
+pub fn operand_type(cx: &FlowCtx, op: Node, line: usize) -> Option<String> {
+    let m = cx.mech;
+    if Mechanics::is(&m.nodes.name, op.kind()) {
+        return binding_type(cx.root, cx.src, cx.file, text(op, cx.src), line, &DefIndex::default());
+    }
+    if Mechanics::is(&m.nodes.field, op.kind()) {
+        let inner = operand_type(cx, *kids(op, &m.fields.operand).first()?, line)?;
+        let f = kids(op, &m.fields.field).first().copied()?;
+        return cx.module.field(&inner, text(f, cx.src)).map(|(_, fi)| fi.ty.clone());
+    }
+    None
+}
+
+/// Pointer variables of a function and the names each one aliases, both
+/// ways. A parameter or variable of pointer type, `p := &y` and `new(T)`
+/// make pointers. `p := &y` aliases p and y, `c := b` aliases c and b when
+/// b is a pointer, so a write through one reaches the other.
+fn pointer_aliases(func: Node, src: &[u8], m: &Mechanics) -> (HashSet<String>, HashMap<String, Vec<String>>) {
+    let mut ptrs: HashSet<String> = HashSet::new();
+    let mut alias: HashMap<String, Vec<String>> = HashMap::new();
+    let mut pending: Vec<(String, String)> = vec![];
+    let link = |a: &str, b: &str, alias: &mut HashMap<String, Vec<String>>| {
+        for (x, y) in [(a, b), (b, a)] {
+            let e = alias.entry(x.to_string()).or_default();
+            if !e.iter().any(|v| v == y) {
+                e.push(y.to_string());
+            }
+        }
+    };
+    fn flat<'t>(ns: Vec<Node<'t>>, m: &Mechanics) -> Vec<Node<'t>> {
+        let mut out = vec![];
+        for n in ns {
+            if Mechanics::is(&m.nodes.list, n.kind()) {
+                out.extend(named(n));
+            } else {
+                out.push(n);
+            }
+        }
+        out
+    }
+    let mut stack = vec![func];
+    while let Some(n) = stack.pop() {
+        stack.extend(named(n));
+        let is_param = Mechanics::is(&m.nodes.param, n.kind());
+        let is_assign = Mechanics::is(&m.nodes.assign, n.kind());
+        if !is_param && !is_assign {
+            continue;
+        }
+        let lefts: Vec<Node> = flat(kids(n, &m.fields.left), m).into_iter().filter(|l| Mechanics::is(&m.nodes.name, l.kind())).collect();
+        if kids(n, &m.fields.ty).first().is_some_and(|t| text(*t, src).starts_with('*')) {
+            for l in &lefts {
+                ptrs.insert(text(*l, src).to_string());
+            }
+        }
+        if !is_assign {
+            continue;
+        }
+        let rights = flat(kids(n, &m.fields.right), m);
+        if rights.len() != lefts.len() {
+            continue;
+        }
+        for (l, r) in lefts.iter().zip(rights) {
+            let (lt, rt) = (text(*l, src), text(r, src));
+            if rt.starts_with('&') || rt.starts_with("new(") {
+                ptrs.insert(lt.to_string());
+                if let Some(o) = kids(r, &m.fields.operand).first().filter(|o| Mechanics::is(&m.nodes.name, o.kind())) {
+                    link(lt, text(*o, src), &mut alias);
+                }
+            } else if Mechanics::is(&m.nodes.name, r.kind()) {
+                pending.push((lt.to_string(), rt.to_string()));
+            }
+        }
+    }
+    loop {
+        let mut changed = false;
+        for (l, r) in &pending {
+            if ptrs.contains(r) && !alias.get(l).is_some_and(|v| v.contains(r)) {
+                ptrs.insert(l.clone());
+                link(l, r, &mut alias);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    (ptrs, alias)
 }
 
 /// `start_at` for a query row, whose node may be a whole field declaration,
@@ -205,6 +295,11 @@ struct Val {
     paths: Paths,
     /// Tags after the primary one: field writes and struct tags.
     extra: Vec<String>,
+    /// For a call with several results, which result positions carry the data.
+    positions: Option<Vec<bool>>,
+    /// Variables a called function stored the data in through a pointer,
+    /// with the field paths that now hold it.
+    writes: Vec<(String, Paths)>,
 }
 
 impl Val {
@@ -212,9 +307,12 @@ impl Val {
         if self.carry.is_none() {
             self.carry = o.carry;
             self.paths = o.paths;
+            self.positions = o.positions;
         } else if o.carry.is_some() {
             self.paths = join_paths(&self.paths, &o.paths);
+            self.positions = None;
         }
+        self.writes.extend(o.writes);
         for t in o.extra {
             if !self.extra.contains(&t) {
                 self.extra.push(t);
@@ -266,8 +364,19 @@ struct Walker<'a, 't> {
     pending: Option<usize>,
     /// Whether the start node is the bound side of an assignment.
     start_is_decl: bool,
-    /// Whether a return statement carries tracked data.
-    returns: bool,
+    /// Per result position, whether a return statement carries tracked data.
+    ret: Vec<bool>,
+    /// Result names, one per position, empty when unnamed.
+    results: Vec<String>,
+    /// The union of the states at each return and at the end of the body.
+    exit: Option<State>,
+    /// Depth of function literal bodies being walked: their returns are not
+    /// the function's.
+    in_closure: usize,
+    /// Pointer variables, see `pointer_aliases`.
+    pointers: HashSet<String>,
+    /// Names each pointer variable aliases.
+    aliases: HashMap<String, Vec<String>>,
     /// Names the function declares (parameters and local variables).
     locals: HashSet<String>,
     /// Local names declared as maps.
@@ -298,6 +407,8 @@ pub fn analyse_function_with(
 ) -> FlowResult {
     let m = cx.mech;
     let (locals, local_maps) = declared(func, cx.src, m);
+    let (pointers, aliases) = pointer_aliases(func, cx.src, m);
+    let results = go_result_names(func, cx.src);
     let mut w = Walker {
         cx,
         m,
@@ -315,7 +426,12 @@ pub fn analyse_function_with(
             .collect(),
         pending: None,
         start_is_decl: false,
-        returns: false,
+        ret: vec![false; results.len()],
+        results,
+        exit: None,
+        in_closure: 0,
+        pointers,
+        aliases,
         locals,
         local_maps,
     };
@@ -337,7 +453,16 @@ pub fn analyse_function_with(
     for b in body {
         w.walk_stmt(b, &mut st);
     }
-    FlowResult { root: w.tree(), returns: w.returns }
+    w.record_exit(&st);
+    let exits = w
+        .exit
+        .take()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, v)| v.origin != 0)
+        .map(|(k, v)| (k, v.paths))
+        .collect();
+    FlowResult { root: w.tree(), returns: w.ret.clone(), exits }
 }
 
 impl<'a, 't> Walker<'a, 't> {
@@ -383,6 +508,60 @@ impl<'a, 't> Walker<'a, 't> {
             if let StartKind::Var(name) = &self.start.kind {
                 st.insert(name.clone(), Var { origin: 0, cond: None, paths: self.start.paths.clone() });
             }
+        }
+    }
+
+    /// Join `st` into the exit state.
+    fn record_exit(&mut self, st: &State) {
+        let e = self.exit.get_or_insert_with(State::new);
+        for (k, v) in st {
+            match e.get_mut(k) {
+                Some(old) => {
+                    old.paths = join_paths(&old.paths, &v.paths);
+                    if old.origin == 0 {
+                        old.origin = v.origin;
+                    }
+                }
+                None => {
+                    e.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+
+    fn mark_ret(&mut self, i: usize) {
+        if self.ret.len() <= i {
+            self.ret.resize(i + 1, false);
+        }
+        self.ret[i] = true;
+    }
+
+    /// Every name aliased with `name`, through chains of aliases.
+    fn alias_set(&self, name: &str) -> Vec<String> {
+        let mut out: Vec<String> = vec![];
+        let mut stack = vec![name.to_string()];
+        while let Some(x) = stack.pop() {
+            for a in self.aliases.get(&x).into_iter().flatten() {
+                if a != name && !out.contains(a) {
+                    out.push(a.clone());
+                    stack.push(a.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Track `name` and its aliases from hop `id`, holding the data at
+    /// `paths` on top of what they already held.
+    fn store_through(&self, st: &mut State, name: &str, paths: &Paths, id: usize, cond: Option<usize>) {
+        let mut names = vec![name.to_string()];
+        names.extend(self.alias_set(name));
+        for n in names {
+            let p = match st.get(&n) {
+                Some(old) => join_paths(&old.paths, paths),
+                None => paths.clone(),
+            };
+            st.insert(n, Var { origin: id, cond, paths: p });
         }
     }
 
@@ -497,7 +676,11 @@ impl<'a, 't> Walker<'a, 't> {
         let returned = if wrapper { vec![] } else { self.closures(n, st) };
         if !returned.is_empty() {
             // A returned closure hands its captured data to the caller.
-            self.returns = true;
+            if self.in_closure == 0 {
+                for i in 0..self.ret.len().max(1) {
+                    self.mark_ret(i);
+                }
+            }
             for id in returned {
                 self.hops[id].returns = true;
             }
@@ -507,11 +690,45 @@ impl<'a, 't> Walker<'a, 't> {
         } else if self.is(&self.m.nodes.send, n) {
             self.send(n, st);
         } else if self.is(&self.m.nodes.return_, n) {
+            let exprs = self.flat(named(n));
             let mut v = Val::default();
-            for c in named(n) {
-                v.join(self.eval(c, st));
+            let mut pos: Vec<bool> = vec![];
+            if exprs.is_empty() {
+                // A bare return hands back the named results.
+                for r in self.results.clone() {
+                    let x = match st.get(&r) {
+                        Some(var) => Val {
+                            carry: Some(var.origin),
+                            used: Some(var.origin),
+                            cond: var.cond,
+                            paths: var.paths.clone(),
+                            ..Val::default()
+                        },
+                        None => Val::default(),
+                    };
+                    pos.push(x.carry.is_some());
+                    v.join(x);
+                }
+            } else {
+                let one = exprs.len() == 1;
+                for c in exprs {
+                    let x = self.eval(c, st);
+                    match (&x.positions, one) {
+                        // `return two(x)` hands back the callee's positions.
+                        (Some(p), true) => pos = p.clone(),
+                        _ => pos.push(x.carry.is_some()),
+                    }
+                    v.join(x);
+                }
             }
-            self.returns |= v.carry.is_some();
+            if self.in_closure == 0 {
+                for (i, p) in pos.iter().enumerate() {
+                    if *p {
+                        self.mark_ret(i);
+                    }
+                }
+                self.record_exit(st);
+            }
             if v.carry.is_some() || v.sink || !v.trees.is_empty() {
                 let prim: Vec<String> =
                     if v.carry.is_some() || !v.trees.is_empty() { vec!["moved".into()] } else { vec![] };
@@ -529,6 +746,9 @@ impl<'a, 't> Walker<'a, 't> {
                 let id = self.hop(n, &v, &prim);
                 for name in &v.whole {
                     st.insert(name.clone(), Var::new(id, v.cond));
+                }
+                for (name, paths) in &v.writes {
+                    self.store_through(st, name, paths, id, v.cond);
                 }
             }
         }
@@ -598,7 +818,7 @@ impl<'a, 't> Walker<'a, 't> {
     /// literal's line becomes a hop tagged `moved, closure` and the captured
     /// variables are tracked from it inside the body. Returns the hops of
     /// literals in return position.
-    fn closures(&mut self, n: Node<'t>, st: &State) -> Vec<usize> {
+    fn closures(&mut self, n: Node<'t>, st: &mut State) -> Vec<usize> {
         let m = self.m;
         let mut returned = vec![];
         for (lit, call, ret) in self.literals(n) {
@@ -646,9 +866,25 @@ impl<'a, 't> Walker<'a, 't> {
             for (p, v) in bound {
                 inner.insert(p, Var { origin: id, cond: v.cond, paths: v.paths });
             }
+            let before = inner.clone();
+            self.in_closure += 1;
             self.walk_stmt(body, &mut inner);
+            self.in_closure -= 1;
             if ret {
                 returned.push(id);
+            } else {
+                // Outer variables the body stored the data in hold it after the call.
+                let (own, _) = declared(lit, self.cx.src, m);
+                for (name, v) in inner {
+                    if own.contains(&name) || before.get(&name) == Some(&v) {
+                        continue;
+                    }
+                    let paths = match st.get(&name) {
+                        Some(old) => join_paths(&old.paths, &v.paths),
+                        None => v.paths.clone(),
+                    };
+                    st.insert(name, Var { paths, ..v });
+                }
             }
         }
         returned
@@ -707,7 +943,13 @@ impl<'a, 't> Walker<'a, 't> {
         let (mut any_carry, mut any_derived) = (false, false);
         let mut field_tags: Vec<String> = vec![];
         let mut stops: Vec<(&'static str, String)> = vec![];
+        let mut ptr_stop = false;
         let mut summary = all.clone();
+        // `_, err := two(x)`: only the result positions the callee returns
+        // the data in carry it.
+        let positions = (!pairwise && !element && rvals.len() == 1 && lefts.len() > 1)
+            .then(|| rvals[0].positions.clone())
+            .flatten();
         for (i, l) in lefts.iter().enumerate() {
             let lt = self.t(*l);
             if m.tokens.blank.iter().any(|b| b == lt) {
@@ -716,6 +958,9 @@ impl<'a, 't> Walker<'a, 't> {
             let mut v = if pairwise { rvals[i].clone() } else { all.clone() };
             if !pairwise {
                 v.exact = false;
+            }
+            if positions.as_ref().is_some_and(|p| !p.get(i).copied().unwrap_or(false)) {
+                v.carry = None;
             }
             if self.is(&m.nodes.field, *l) && self.field_read(*l) {
                 // A write of the start field: the object now holds it.
@@ -767,6 +1012,18 @@ impl<'a, 't> Walker<'a, 't> {
                     None => {
                         let chain = self.field_chain(*l);
                         let p = if chain.is_empty() { v.paths.clone() } else { under(&chain, &v.paths) };
+                        // A write through a pointer reaches what it aliases.
+                        for a in self.alias_set(&obj) {
+                            let pa = match st.get(&a) {
+                                Some(old) => join_paths(&old.paths, &p),
+                                None => p.clone(),
+                            };
+                            acts.push(Act::Set(a, v.cond, pa));
+                        }
+                        // `*p = x` through a pointer of unknown origin.
+                        if lt.starts_with('*') && !self.pointers.contains(&obj) {
+                            ptr_stop = true;
+                        }
                         let p = match st.get(&obj) {
                             Some(old) => join_paths(&old.paths, &p),
                             None => p,
@@ -774,11 +1031,14 @@ impl<'a, 't> Walker<'a, 't> {
                         acts.push(Act::Set(obj, v.cond, p));
                     }
                 }
+            } else {
+                // `*f() = x`: the walk cannot tell what is written.
+                ptr_stop = true;
             }
             any_carry = true;
             any_derived |= tag == "derived";
         }
-        let carried = acts.iter().any(|a| matches!(a, Act::Set(..))) || !stops.is_empty();
+        let carried = acts.iter().any(|a| matches!(a, Act::Set(..))) || !stops.is_empty() || ptr_stop;
         let mut id = None;
         if carried || summary.sink || !summary.whole.is_empty() || !summary.trees.is_empty() {
             let mut prim: Vec<String> = match (any_carry, any_derived) {
@@ -790,6 +1050,9 @@ impl<'a, 't> Walker<'a, 't> {
                 (true, false) => vec!["exact".into()],
             };
             prim.extend(field_tags);
+            if ptr_stop {
+                prim.push("stopped: pointer write".into());
+            }
             let readers = self.stop_tags(&stops, &mut prim);
             let hid = self.hop(n, &summary, &prim);
             self.add_readers(hid, readers);
@@ -808,6 +1071,9 @@ impl<'a, 't> Walker<'a, 't> {
         if let Some(id) = id {
             for name in &summary.whole {
                 st.insert(name.clone(), Var::new(id, summary.cond));
+            }
+            for (name, paths) in &summary.writes {
+                self.store_through(st, name, paths, id, summary.cond);
             }
         }
     }
@@ -1288,14 +1554,10 @@ impl<'a, 't> Walker<'a, 't> {
         let Some(owner) = owner else {
             return true;
         };
-        match kids(n, &self.m.fields.operand).first() {
-            Some(o) if self.is(&self.m.nodes.name, *o) => {
-                match binding_type(self.cx.root, self.cx.src, self.cx.file, self.t(*o), line_of(n), &DefIndex::default()) {
-                    Some(t) => &t == owner || self.cx.module.promotes(&t, owner),
-                    None => true,
-                }
-            }
-            _ => true,
+        // The type of the operand just before the field: `o.A` in `o.A.F`.
+        match kids(n, &self.m.fields.operand).first().and_then(|o| operand_type(self.cx, *o, line_of(n))) {
+            Some(t) => &t == owner || self.cx.module.promotes(&t, owner),
+            None => true,
         }
     }
 
@@ -1373,6 +1635,7 @@ impl<'a, 't> Walker<'a, 't> {
                 calls: inner.calls,
                 whole: inner.whole.clone(),
                 extra: inner.extra.clone(),
+                writes: inner.writes.clone(),
                 ..Val::default()
             };
             inner
@@ -1472,9 +1735,25 @@ impl<'a, 't> Walker<'a, 't> {
                 keep(&mut out);
                 out.via.get_or_insert(name);
             }
-            CallEffect::Into { name, returns, trees } => {
-                if returns {
+            CallEffect::Into { name, returns, writes, trees } => {
+                if returns.iter().any(|r| *r) {
                     keep(&mut out);
+                    if returns.len() > 1 {
+                        out.positions = Some(returns);
+                    }
+                }
+                for (slot, paths) in writes {
+                    let target = match slot {
+                        Slot::Arg(i) => args.get(i).copied(),
+                        Slot::Receiver => recv_node,
+                        _ => None,
+                    };
+                    let Some(t) = target else { continue };
+                    if let Some(name) = self.root_name(t) {
+                        let chain = self.field_chain(t);
+                        let p = if chain.is_empty() { paths } else { under(&chain, &paths) };
+                        out.writes.push((name, p));
+                    }
                 }
                 out.via.get_or_insert(name);
                 out.trees.extend(trees);

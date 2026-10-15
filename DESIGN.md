@@ -74,7 +74,7 @@ combinator   := ... | '->' '-->' '<-' '<--'             -- call graph
 - Only the last selector may carry attributes, because a `-q` row only holds the last selector's node. Attributes on any other selector, inside a group, a field inner query or a `:not` exit 2 with `attributes are only supported on the last selector in -q`.
 - From the primary node the stage finds the name identifier (the called name of a call, the member of a member access, the `name` field of a declaration) and its qualifier: the Go `selector_expression` operand, the JS/TS `member_expression` object, the Python `attribute` object, the Rust scoped path. The qualifier's leftmost identifier is its root.
 - `from` is the import origin of the qualifier root, or of the name itself when it has no qualifier. Go reads `resolve::go::go_imports` (local name to full import path). JS/TS, Python and Rust read `RawImport.bindings` from `resolve::imports`. C, C++ and Ruby exit 2 with `attribute from is not supported for <lang>`.
-- `in` is the nearest enclosing struct, class, impl, interface, module or namespace, or a Go method's receiver type. A declaration does not enclose its own name. For a Go member access through a variable (`u.Email`), `in` is the variable's type from `resolve::go::binding_type`.
+- `in` is the nearest enclosing struct, class, impl, interface, module or namespace, or a Go method's receiver type. A declaration does not enclose its own name. For a Go member access through a variable (`u.Email`), `in` is the variable's type from `resolve::go::binding_type`. For a chain (`b.Contact.Phone`) it is the type of the operand just before the name: the declared type of field `Contact` on b's type, from the struct declarations of the file (`resolve::go::go_field_type`, embedded fields promoted). A chain whose type is unknown has no `in`.
 - `qual` (dot shorthand) holds when `in` matches the value, or when the qualifier root is bound by an import and the root or the whole qualifier text matches the value. So `function#slog.Info` matches `slog.Info` from `"log/slog"`, and `function#log.Printf` does not match `fmt.Printf`.
 - Operators: `=` equals, `^=` starts with, `*=` contains, `$=` ends with, `=/re/` uses the `regex` crate. An unknown key or a bad regex exits 2.
 - A row survives only when every attribute holds. A query left with no rows prints the usual miss report and exits 1.
@@ -422,7 +422,7 @@ For Go, a call is outside when the import path is neither the module path from `
 ## Rules (in order)
 
 1. A parameter, or a variable bound outside the body, is tracked from the first statement. A variable bound inside the body is tracked after its binding statement. A variable read inside the body is tracked from that statement.
-2. A field start tracks every read `x.Field` in the function. When the owner type is known and `binding_type` gives `x` another type, the read is skipped.
+2. A field start tracks every read `x.Field` in the function. When the owner type is known and the operand has another type, the read is skipped. The operand's type is `binding_type` for a variable and, for a chain `x.A.Field`, the declared type of `A` on x's type (`flow::operand_type`), so `b.Contact.Phone` is a read of `Contact.Phone`, not `Booking.Phone`.
 3. Assignment with a tracked right side tracks each name on the left: `exact` when the right side is just the tracked value, `derived` otherwise. Unequal left and right counts give `derived`. A range header binds one element, so it is `derived`.
 4. Assignment with nothing tracked on the right drops each name on the left. An operator outside `plain_assign`, such as `+=`, keeps what the left side held.
 5. A store into `o.F` or `m[k]` tracks the object `o` or `m`. A field store adds the tag `field F`.
@@ -455,7 +455,7 @@ With no model, a call into the repo gives `CallEffect::Via(name)`: the result ca
 ## Starts and ends
 
 1. The query is cut with `split_query`. The head segment's rows are start points: each row is narrowed to the name inside it (a field declaration, field access or parameter declaration gives its name) and classified by `flow::start_in`. A variable start is walked in its enclosing function, once per function and name, from its first row.
-2. A field start (`field#Booking.CustomerPhone`) is one group per field and owner type. The group's root row is the field declaration. Every function in the scanned files that reads or writes a field of that name is walked from the field, and their trees hang side by side under the declaration row.
+2. A field start (`field#Booking.CustomerPhone`) is one group per field and owner type. The group's root row is the field declaration. Every function in the scanned files that reads or writes a field of that name is walked from the field, and their trees hang side by side under the declaration row. A selector whose operand has another known type (`flow::operand_type`) and a keyed element of a literal of another known type do not make a function a user.
 3. With a tail segment, a call is a sink when one of the tail's rows covers the call's function name (`Printf` in `log.Printf`), so attribute filters such as `function#log.Printf` apply.
 4. With no tail (the query ends in `=>` or `==>`), a call is an end when it goes outside the module (decision 16): a `pkg.F` call on an import outside the go.mod module path, or a method on a variable whose type comes from such a package. Those hops are tagged `outside` in place of `sink`. With no go.mod every import counts as outside.
 
@@ -464,9 +464,10 @@ The language config is loaded from the repo root of the first scanned path. The 
 ## Following calls
 
 1. When a call receives tracked data, its byte range is looked up in `CallGraph.sites` for the current file. A site with an in-repo target is walked in the callee: the argument positions map to parameters through `go_signatures` (a variadic parameter takes every later argument, the receiver joins when it is tracked). The walk starts at the first such parameter and tracks the rest from the top of the body (`flow::analyse_function_with`). The callee's root row is its signature line, tagged `moved`, and `widened` too when an interface call has several targets.
-2. The engine gets `CallEffect::Into { name, returns, trees }`. The call's hop is tagged `via <name>`, the callee trees hang under it before the caller's later hops, and the call's result carries the data only when a return statement in the callee carries it (`FlowResult::returns`). So a helper that drops the value ends the route.
-3. Recursion is guarded by a stack of (definition, tracked argument positions). A call already on the stack, a call deeper than `--max` functions, and every call under `=>` fall back to `CallEffect::Via`, which carries the data without walking. Effects are memoised per call node and tracked arguments, so loop passes reuse them.
-4. Calls with no in-repo target go to the models (`ModelOutside`). Conversions to predeclared types (`string(b)`, `[]byte(s)`) keep the data.
+2. The engine gets `CallEffect::Into { name, returns, writes, trees }`. The call's hop is tagged `via <name>`, the callee trees hang under it before the caller's later hops, and the call's result carries the data only when a return statement in the callee carries it. So a helper that drops the value ends the route. `returns` (`FlowResult::returns`) has one entry per result position, and in `a, b := f(x)` only the names at positions some return carries are tracked, so `_, err := two(x)` with `return s, nil` does not track `err`. A bare `return` hands back the named results as they stand.
+3. `writes` are the pointer parameters (type `*T`) and the pointer receiver that hold tracked data when the callee returns, set inside it (`FlowResult::exits`, the union of the states at each return and the end of the body), with their field paths. The caller tracks the object the matching argument or receiver is rooted at from the call's hop: `fill(&b, x)` with `b.Phone = s` inside tracks `b` with `[Phone]`, and so does `b.SetPhone(x)` on a pointer receiver.
+4. Recursion is guarded by a stack of (definition, tracked argument positions). A call already on the stack, a call deeper than `--max` functions, and every call under `=>` fall back to `CallEffect::Via`, which carries the data without walking. Effects are memoised per call node and tracked arguments, so loop passes reuse them.
+5. Calls with no in-repo target go to the models (`ModelOutside`). Conversions to predeclared types (`string(b)`, `[]byte(s)`) keep the data.
 
 ## Printing
 
@@ -488,6 +489,7 @@ Decision 12 (follow the object) and 13 (reflection moves whole objects). Code in
 5. Paths travel with calls: `CallSite.arg_paths` and `recv_paths` give each tracked argument's paths, the callee parameter starts with them (`Start.paths`, the `also` pairs of `analyse_function_with`), and a call whose callee returns tracked data gives its result the arguments' paths. Effects are memoised per paths too.
 6. Any call that receives an object holding tracked data counts it as tracked, so an end call or a `whole` model (`fmt.Printf`, `(*encoding/json.Encoder).Encode`) fires on the object.
 7. In a field start, a write of the start field (`T{F: x}` or `o.F = x` on the owner type) makes the object hold the field, and `field_users` also walks functions with a keyed element of that name.
+8. Pointers alias inside a function (`pointer_aliases`). A parameter or variable of type `*T`, `p := &y` and `p := new(T)` are pointers. `p := &y` aliases `p` and `y`, and `c := b` aliases `c` and `b` when `b` is a pointer. A store through one (`c.F = x`, `*p = x`) also tracks every name it aliases with the same path. A store `*p = x` through a pointer of unknown origin (`p := slot()`), or through an expression with no root variable, is tagged `stopped: pointer write`.
 
 ## Embedded structs
 
@@ -527,7 +529,7 @@ The cross-function walk follows calls whose callee is not a declared function na
 
 1. A function literal is walked from the statement holding it when it is called in place (`func() { ... }()`, also under `go` and `defer`), passed as an argument of a call, or returned. A literal assigned to a variable is not walked.
 2. The walk enters a literal only when its body reads a tracked variable of the enclosing scope, or when, called in place, it receives a tracked argument. Its own parameters shadow outer names.
-3. The literal's line is a hop tagged `moved, closure`. Inside the body the captured variables and the bound parameters are tracked from that hop, so the body's hops hang under it. Changes the body makes to the state stay inside it.
+3. The literal's line is a hop tagged `moved, closure`. Inside the body the captured variables and the bound parameters are tracked from that hop, so the body's hops hang under it. Outer variables the body assigns tracked data to (`out = x`) are tracked after the statement holding the literal, unless the literal is returned. Returns inside a literal are not returns of the enclosing function.
 4. A returned literal makes the function return its captured data, so `Template(name, data)` returning a handler that passes `data` to `fmt.Fprintf` carries the caller's value into the handler body, and the caller's result carries it too.
 
 ## Interfaces
