@@ -7,6 +7,7 @@
 
 mod engine;
 mod models;
+mod objects;
 mod report;
 #[cfg(test)]
 mod tests;
@@ -18,6 +19,8 @@ pub use engine::{analyse_function, analyse_function_with, enclosing_function, fu
 pub use models::{candidate_keys, model_key, qualify_type, ModelOutside};
 #[allow(unused_imports)]
 pub use report::report;
+#[allow(unused_imports)]
+pub use objects::{base_type, join_paths, FieldInfo, Module, Paths, Reader};
 
 use crate::config::Mechanics;
 use tree_sitter::Node;
@@ -30,6 +33,8 @@ pub struct FlowCtx<'a, 't> {
     /// Root node of the parsed file.
     pub root: Node<'t>,
     pub mech: &'a Mechanics,
+    /// Structs and package-level variables of every scanned file.
+    pub module: &'a Module,
 }
 
 /// What the walk tracks.
@@ -54,6 +59,8 @@ pub struct Start {
     pub line: usize,
     pub func: String,
     pub text: String,
+    /// Where a variable start holds the data: itself, or fields of an object.
+    pub paths: Paths,
 }
 
 /// A call that receives a tracked value, handed to the `Outside` hook.
@@ -72,8 +79,12 @@ pub struct CallSite<'t> {
     pub recv_path: Option<String>,
     /// Zero based positions of the arguments that carry tracked data.
     pub tracked_args: Vec<usize>,
+    /// Where each tracked argument holds the data, in `tracked_args` order.
+    pub arg_paths: Vec<Paths>,
     /// Whether the receiver object carries tracked data.
     pub recv_tracked: bool,
+    /// Where the receiver holds the data, when tracked.
+    pub recv_paths: Paths,
     /// Untracked arguments that are objects of the start field's owner type.
     /// A `whole` model carries the field through them (decision 13).
     pub whole_args: Vec<usize>,
