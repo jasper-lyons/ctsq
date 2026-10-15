@@ -580,3 +580,31 @@ Rows print in reading order, the queried value first and its origins nested unde
 # Receiver origins
 
 `[from=...]` on a method called through a variable (`logger.info`, `l.Info`) uses the import of the call that created the variable when no import binds the name. Go walks the variable back through its reaching definitions in the file (`flow::upward::creating_import`), through chains such as `zap.NewExample().Sugar()`. JS and TS follow a declaration in the same file whose value is a call or `new` of an import (`const logger = pino()`), `require('pino')()` or a member call on such a value.
+
+# Go templates
+
+Go `text/template` and `html/template` files are the language `gotmpl`, chosen by the extensions `.tmpl` and `.gotmpl` (so `.html.tmpl` too).
+
+## Grammar
+
+No crate on crates.io ships a Go template grammar for tree-sitter 0.26 (`gotmpl` and `lithos-gotmpl-*` are template engines, not grammars). The grammar is vendored from `github.com/ngalaiko/tree-sitter-go-template`, version 0.19.5 at commit `06b2fd2ac32a7be71cdcf925eeeb868a68e2acde`, under `vendor/tree-sitter-go-template/` with its MIT `LICENSE`. `build.rs` compiles `src/parser.c` with the `cc` crate and `src/compiler/lang/gotmpl.rs` exposes it as a `tree_sitter_language::LanguageFn` through the `tree_sitter_gotmpl` symbol.
+
+One local change: upstream hides the printing action as `_pipeline_action`, so `{{.X}}` left no node of its own. The vendored copy renames it to the visible `pipeline_action` (`vendor/tree-sitter-go-template/pipeline_action.patch`) and `parser.c` was regenerated with tree-sitter CLI 0.26.6 (ABI 15). To update, apply the patch to a new upstream checkout, run `tree-sitter generate` and copy `src/parser.c`, `src/node-types.json` and `src/tree_sitter/*.h`.
+
+## Node kinds
+
+- dot `dot`, field `.Name` is `field` (name in field `name`, an `identifier`), chained field `.A.B` is `selector_expression` (field `operand`, last part in field `field`, a `field_identifier`)
+- variable `$x` is `variable`, `{{$x := ...}}` is `variable_definition`, `{{$x = ...}}` is `assignment`
+- `range_action`, `with_action`, `if_action`, `define_action`, `block_action`, and `template_action` for `{{template "x" .}}`
+- function call `function_call`, method call `method_call`, pipe `chained_pipeline`
+- a printing action is `pipeline_action`, unless it holds a `variable_definition` or `assignment`
+
+## Abstract kinds
+
+- `template_action` is every `pipeline_action` that prints a value. Other languages do not know it. It shadows the grammar's own `template_action` node, which `call` reaches instead.
+- `field` is `field` and `selector_expression`. `*field` is empty, templates declare no fields.
+- `variable` is `variable_definition` under `*` and `variable` under `&`.
+- `function` is `define_action` and `block_action` under `*` and `function_call` under `&`. A define name is a string literal, so `*function#body` does not match `{{define "body"}}`, `*function#/body/` does.
+- `call` is `function_call`, `method_call` and `template_action`. `if` is `if_action` and `for` is `range_action`.
+
+Flow mechanics for templates live in `config/languages/gotmpl.toml`. That file is not yet compiled in as a built-in language, so `ctsq config dump gotmpl` finds it only from a config root.

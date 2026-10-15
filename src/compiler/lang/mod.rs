@@ -3,6 +3,7 @@ use crate::query::ast::Sigil;
 pub mod c;
 pub mod cpp;
 pub mod go;
+pub mod gotmpl;
 pub mod javascript;
 pub mod python;
 pub mod ruby;
@@ -85,6 +86,7 @@ pub fn for_name(name: &str) -> Option<Box<dyn Lang>> {
         "ruby" | "rb" => Some(Box::new(ruby::RubyLang)),
         "rust" | "rs" => Some(Box::new(rust::RustLang)),
         "go" => Some(Box::new(go::GoLang)),
+        "gotmpl" => Some(Box::new(gotmpl::GotmplLang)),
         _ => None,
     }
 }
@@ -100,6 +102,7 @@ pub fn lang_for_name_canonical(name: &str) -> Option<&'static str> {
         "ruby" | "rb" => Some("ruby"),
         "rust" | "rs" => Some("rust"),
         "go" => Some("go"),
+        "gotmpl" => Some("gotmpl"),
         _ => None,
     }
 }
@@ -115,12 +118,13 @@ pub fn extensions_for_name(name: &str) -> &'static [&'static str] {
         "ruby" | "rb" => &["rb", "rake", "gemspec"],
         "rust" | "rs" => &["rs"],
         "go" => &["go"],
+        "gotmpl" => &["tmpl", "gotmpl"],
         _ => &[],
     }
 }
 
 pub fn all_known_extensions() -> &'static [&'static str] {
-    &["c", "h", "cpp", "cc", "cxx", "hpp", "hxx", "js", "mjs", "cjs", "jsx", "ts", "tsx", "py", "rb", "rake", "gemspec", "rs", "go"]
+    &["c", "h", "cpp", "cc", "cxx", "hpp", "hxx", "js", "mjs", "cjs", "jsx", "ts", "tsx", "py", "rb", "rake", "gemspec", "rs", "go", "tmpl", "gotmpl"]
 }
 
 pub fn lang_for_extension(ext: &str) -> Option<&'static str> {
@@ -134,6 +138,7 @@ pub fn lang_for_extension(ext: &str) -> Option<&'static str> {
         "rb" | "rake" | "gemspec" => Some("ruby"),
         "rs" => Some("rust"),
         "go" => Some("go"),
+        "tmpl" | "gotmpl" => Some("gotmpl"),
         _ => None,
     }
 }
