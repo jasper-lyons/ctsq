@@ -888,28 +888,30 @@ fn run_path(
     only: &[String],
     body: bool,
 ) -> i32 {
-    let _ = only; // applied to data-flow trees by the flow walk
-    let ast = match query::parse(query_str) {
+    // A query ending in `=>` or `==>` has no end selector.
+    let open = semantic::flows::open_end(query_str);
+    let parsed = match &open {
+        Some((head, _)) => query::parse(head),
+        None => query::parse(query_str),
+    };
+    let ast = match parsed {
         Ok(q) => q,
         Err(e) => {
             eprintln!("Parse error: {}", e);
             return 2;
         }
     };
-    let flows = ast.tail.iter().any(|(c, _)| {
-        c.is_semantic()
-            && !matches!(
-                c,
-                query::ast::Combinator::Calls
-                    | query::ast::Combinator::CallsEventually
-                    | query::ast::Combinator::CalledBy
-                    | query::ast::Combinator::CalledByEventually
-            )
-    });
-    if flows {
-        eprintln!("data-flow walking is not available yet");
-        return 2;
-    }
+    let flows = open.is_some()
+        || ast.tail.iter().any(|(c, _)| {
+            c.is_semantic()
+                && !matches!(
+                    c,
+                    query::ast::Combinator::Calls
+                        | query::ast::Combinator::CallsEventually
+                        | query::ast::Combinator::CalledBy
+                        | query::ast::Combinator::CalledByEventually
+                )
+        });
 
     let default = [".".to_string()];
     let paths = if paths.is_empty() { &default[..] } else { paths };
@@ -919,6 +921,21 @@ fn run_path(
         .collect();
     let store = resolve::TreeStore::build(&jobs);
     let graph = resolve::graph::build_from_store(&store);
+    if flows {
+        let scan = std::path::Path::new(&paths[0]);
+        let root = config::find_repo_root(scan);
+        let opts = semantic::flows::FlowOptions { max, only: only.to_vec() };
+        return match semantic::flows::evaluate_flows(&ast, open.map(|(_, c)| c), &store, &graph, &root, scan, &opts) {
+            Ok(r) => {
+                print!("{}", r.text);
+                if r.found > 0 { 0 } else { 1 }
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                2
+            }
+        };
+    }
     let opts = semantic::calls::CallOptions { max, all, ..Default::default() };
     match semantic::calls::evaluate_calls(&ast, &store, &graph, &opts) {
         Ok(routes) => {

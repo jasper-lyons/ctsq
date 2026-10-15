@@ -13,7 +13,7 @@ mod tests;
 
 // Used by the path and models packages.
 #[allow(unused_imports)]
-pub use engine::{analyse_function, enclosing_function, function_name, start_at};
+pub use engine::{analyse_function, analyse_function_with, enclosing_function, function_name, start_at, start_in};
 #[allow(unused_imports)]
 pub use models::{candidate_keys, model_key, qualify_type, ModelOutside};
 #[allow(unused_imports)]
@@ -100,6 +100,11 @@ pub enum CallEffect {
     /// A call into a function in the repo. The result carries the data and the
     /// hop is tagged `via <name>` instead of `unmodelled`.
     Via(String),
+    /// A call into a function in the repo whose body was walked. `trees` are
+    /// the walks from the parameters that received tracked arguments, hung
+    /// under the call's hop. The result carries the data only when the
+    /// callee `returns` it. The hop is tagged `via <name>`.
+    Into { name: String, returns: bool, trees: Vec<Hop> },
 }
 
 /// The hook for calls whose effect the engine cannot see.
@@ -121,8 +126,9 @@ pub fn no_models(_: &CallSite) -> CallEffect {
 /// The end selector: true when a call node is a sink.
 pub type EndFn<'e> = dyn Fn(Node, &[u8]) -> bool + 'e;
 
-/// One step of a route. Children are the hops that read what this hop produced.
-#[derive(Debug, Clone, PartialEq)]
+/// One step of a route. Children are the hops that read what this hop
+/// produced, after the walks into any called in-repo function.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hop {
     pub file: String,
     /// 1 based.
@@ -134,6 +140,10 @@ pub struct Hop {
     pub tags: Vec<String>,
     /// Callee text of the first unmodelled call on this hop.
     pub unmodelled: Option<String>,
+    /// A return statement that hands tracked data back to the caller.
+    pub returns: bool,
+    /// The root of a walk inside a called function, hung under the call.
+    pub into: bool,
     pub children: Vec<Hop>,
 }
 
@@ -157,6 +167,8 @@ impl Hop {
 pub struct FlowResult {
     /// The start point, tagged `source`.
     pub root: Hop,
+    /// Whether a return statement of the walked function carries tracked data.
+    pub returns: bool,
 }
 
 impl FlowResult {

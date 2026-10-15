@@ -1,0 +1,618 @@
+//! The data-flow combinators of `ctsq path`: `=>` (one hop) and `==>`
+//! (eventually). The head segment's rows give the start points, the tail
+//! segment's rows (if any) say which calls are sinks. The walk inside each
+//! function is `flow::analyse_function`. Calls into functions in the repo are
+//! followed through `CallGraph.sites`: the walk continues in the callee from
+//! the parameters that received tracked arguments, and comes back through
+//! the callee's return.
+
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+
+use tree_sitter::Node;
+
+use super::print::{plural, row};
+use super::{segment_rows, split_query};
+use crate::config::{self, gomod, LangConfig};
+use crate::flow::{
+    self, analyse_function, analyse_function_with, enclosing_function, start_at, start_in, CallEffect, CallSite,
+    EndFn, FlowCtx, FlowResult, Hop, ModelOutside, Outside, StartKind,
+};
+use crate::query::ast::{Combinator, Query};
+use crate::resolve::go::{binding_type_qualified, go_imports, go_signatures, GoSignature};
+use crate::resolve::graph::CallGraph;
+use crate::resolve::{DefIndex, TreeStore};
+
+#[derive(Debug, Clone)]
+pub struct FlowOptions {
+    /// Deepest chain of in-repo calls the walk follows.
+    pub max: usize,
+    /// Keep only hops carrying one of these tags, with their ancestors.
+    pub only: Vec<String>,
+}
+
+impl Default for FlowOptions {
+    fn default() -> Self {
+        FlowOptions { max: 12, only: vec![] }
+    }
+}
+
+/// The printed trees and the number of routes found.
+#[derive(Debug, Clone)]
+pub struct FlowReport {
+    pub text: String,
+    /// Sink hops, or `outside` leaves when the query has no end.
+    pub found: usize,
+}
+
+/// A query string that ends in `=>` or `==>` has no end selector. Returns the
+/// query without it and the combinator, or None when it ends otherwise.
+pub fn open_end(query: &str) -> Option<(String, Combinator)> {
+    let t = query.trim_end();
+    if let Some(head) = t.strip_suffix("==>") {
+        return Some((head.to_string(), Combinator::FlowsEventually));
+    }
+    if let Some(head) = t.strip_suffix("=>") {
+        if !head.ends_with('=') && !head.ends_with('<') {
+            return Some((head.to_string(), Combinator::Flows));
+        }
+    }
+    None
+}
+
+/// Evaluate a data-flow path query. `open` is the combinator stripped by
+/// `open_end` when the query has no end selector. `root` is the repo root the
+/// language config is loaded from. The module path and Go version come from
+/// the go.mod nearest `scan`, the first scanned path, when it has one.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_flows(
+    query: &Query,
+    open: Option<Combinator>,
+    store: &TreeStore,
+    graph: &CallGraph,
+    root: &Path,
+    scan: &Path,
+    opts: &FlowOptions,
+) -> Result<FlowReport, String> {
+    let split = split_query(query)?;
+    let (comb, tail) = match (&open, split.joins.as_slice()) {
+        (Some(c), []) => (c.clone(), None),
+        (None, [c]) => (c.clone(), Some(&split.segments[1])),
+        (Some(_), _) => return Err("a data-flow query has one start and at most one end".into()),
+        (None, []) => return Err("no data-flow combinator in the query, use => or ==>".into()),
+        (None, _) => return Err("a data-flow query has one start and at most one end".into()),
+    };
+    match comb {
+        Combinator::Flows | Combinator::FlowsEventually => {}
+        Combinator::FlowsFrom | Combinator::FlowsFromEventually => {
+            return Err("reading a flow backwards (<= and <==) is not available yet".into())
+        }
+        _ => return Err("data-flow combinators cannot be mixed with call combinators".into()),
+    }
+    if split.nots.iter().any(|n| !n.is_empty()) {
+        return Err(":not() is not available in data-flow queries yet".into());
+    }
+    let eventually = comb == Combinator::FlowsEventually;
+
+    let mut cfg = config::load(root, "go").map_err(|e| e.to_string())?;
+    if let Some(m) = gomod::module_path(scan) {
+        cfg.module_path = Some(m);
+    }
+
+    // The end: tail rows by file, or every outside call.
+    let mut ptrs: HashMap<usize, String> = HashMap::new();
+    for (file, pf) in store.iter() {
+        ptrs.insert(pf.source.as_ptr() as usize, file.to_string());
+    }
+    let mut ends: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    if let Some(t) = tail {
+        for (file, rows) in segment_rows(t, store)? {
+            ends.insert(file, rows.iter().map(|r| (r.start_byte, r.end_byte)).collect());
+        }
+    }
+    let imports_cache: RefCell<HashMap<String, HashMap<String, String>>> = RefCell::new(HashMap::new());
+    let module = cfg.module_path.clone();
+    let has_end = tail.is_some();
+    let is_end = |n: Node, src: &[u8]| -> bool {
+        let Some(file) = ptrs.get(&(src.as_ptr() as usize)) else { return false };
+        let Some(f) = n.child_by_field_name("function") else { return false };
+        if has_end {
+            let name = f.child_by_field_name("field").unwrap_or(f);
+            return ends
+                .get(file)
+                .is_some_and(|rs| rs.iter().any(|&(s, e)| s <= name.start_byte() && name.end_byte() <= e));
+        }
+        is_outside_call(n, f, src, file, module.as_deref(), &imports_cache)
+    };
+
+    let walk = Walk::new(store, graph, &cfg, &is_end, eventually, opts.max);
+    let mut groups: Vec<FlowResult> = vec![];
+    let mut raw: Vec<FlowResult> = vec![];
+
+    // Start points from the head segment.
+    let mut seen_vars: HashSet<(String, usize, String)> = HashSet::new();
+    let mut seen_fields: Vec<(String, Option<String>)> = vec![];
+    for (file, rows) in segment_rows(&split.segments[0], store)? {
+        let Some(pf) = store.get(&file) else { continue };
+        let Some(tree) = &pf.tree else { continue };
+        if pf.lang != "go" {
+            continue;
+        }
+        let cx = FlowCtx { file: &file, src: &pf.source, root: tree.root_node(), mech: &cfg.mechanics };
+        for r in &rows {
+            let Some(start) = start_in(&cx, r.start_byte, r.end_byte) else { continue };
+            match &start.kind {
+                StartKind::Var(name) => {
+                    let Some(func) = enclosing_function(cx.root, cx.mech, start.start_byte) else { continue };
+                    if !seen_vars.insert((file.clone(), func.start_byte(), name.clone())) {
+                        continue;
+                    }
+                    let res = walk.run(&file, || analyse_function(&cx, func, &start, walk.end, &walk));
+                    raw.push(res.clone());
+                    groups.push(res);
+                }
+                StartKind::Field { name, owner } => {
+                    let key = (name.clone(), owner.clone());
+                    if seen_fields.contains(&key) {
+                        continue;
+                    }
+                    seen_fields.push(key);
+                    // The declaration row is the group's source when there is one.
+                    let decl = rows
+                        .iter()
+                        .filter_map(|x| start_in(&cx, x.start_byte, x.end_byte))
+                        .find(|s| s.kind == start.kind && s.func == "field" && is_decl_row(&cx, s.start_byte))
+                        .unwrap_or_else(|| start.clone());
+                    let mut root: Option<FlowResult> = None;
+                    for (ffile, func_byte) in field_users(store, &cfg, name) {
+                        let Some(fpf) = store.get(&ffile) else { continue };
+                        let Some(ftree) = &fpf.tree else { continue };
+                        let fcx = FlowCtx { file: &ffile, src: &fpf.source, root: ftree.root_node(), mech: &cfg.mechanics };
+                        let Some(func) = enclosing_function(fcx.root, fcx.mech, func_byte) else { continue };
+                        let res = walk.run(&ffile, || analyse_function(&fcx, func, &decl, walk.end, &walk));
+                        match &mut root {
+                            None => root = Some(res),
+                            Some(r) => r.root.children.extend(res.root.children),
+                        }
+                    }
+                    if let Some(r) = root {
+                        raw.push(r.clone());
+                        groups.push(r);
+                    }
+                }
+            }
+        }
+    }
+
+    let end_tag = if has_end { "sink" } else { "outside" };
+    let mut out = String::new();
+    let mut found = 0;
+    for g in &groups {
+        let mut root = g.root.clone();
+        if !has_end {
+            retag(&mut root);
+        }
+        let mut pruned = prune(&root, end_tag, eventually, 0, false).unwrap_or_else(|| Hop { children: vec![], ..root.clone() });
+        found += pruned.walk().iter().filter(|h| h.has(end_tag)).count();
+        if !opts.only.is_empty() {
+            pruned = only(&pruned, &opts.only, true).unwrap_or(Hop { children: vec![], ..pruned.clone() });
+        }
+        print_tree(&pruned, 0, &mut out);
+    }
+    if groups.is_empty() {
+        out.push_str("note: the start selector matched no variable, parameter or field\n");
+    }
+    out.push_str(&format!("{} to {}\n", plural(found, "route"), end_tag));
+    let ends: Vec<&Hop> = raw.iter().flat_map(|r| r.unmodelled_ends()).collect();
+    if !ends.is_empty() {
+        let list: Vec<String> = ends
+            .iter()
+            .map(|h| format!("{}:{} {}", h.file, h.line, h.unmodelled.as_deref().unwrap_or("")))
+            .collect();
+        let verb = if ends.len() == 1 { "route ends" } else { "routes end" };
+        out.push_str(&format!("{} {} at an unmodelled call: {}\n", ends.len(), verb, list.join(", ")));
+    }
+    Ok(FlowReport { text: out, found })
+}
+
+/// Whether the row at `byte` is a field declaration, not a read.
+fn is_decl_row(cx: &FlowCtx, byte: usize) -> bool {
+    let Some(n) = cx.root.descendant_for_byte_range(byte, byte) else { return false };
+    n.parent().is_some_and(|p| config::Mechanics::is(&cx.mech.nodes.field_decl, p.kind()))
+}
+
+/// (file, byte inside the function) for every function that reads or writes
+/// a field called `name`, once per function, in file order.
+fn field_users(store: &TreeStore, cfg: &LangConfig, name: &str) -> Vec<(String, usize)> {
+    let m = &cfg.mechanics;
+    let mut out = vec![];
+    for (file, pf) in store.iter() {
+        if pf.lang != "go" {
+            continue;
+        }
+        let Some(tree) = &pf.tree else { continue };
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut stack = vec![tree.root_node()];
+        let mut hits: Vec<(usize, usize)> = vec![];
+        while let Some(n) = stack.pop() {
+            if config::Mechanics::is(&m.nodes.field, n.kind()) {
+                let field = m.fields.field.iter().find_map(|f| n.child_by_field_name(f));
+                if field.is_some_and(|f| f.utf8_text(&pf.source).unwrap_or("") == name) {
+                    if let Some(func) = enclosing_function(tree.root_node(), m, n.start_byte()) {
+                        if seen.insert(func.start_byte()) {
+                            hits.push((func.start_byte(), n.start_byte()));
+                        }
+                    }
+                }
+            }
+            let mut c = n.walk();
+            stack.extend(n.named_children(&mut c));
+        }
+        hits.sort();
+        out.extend(hits.into_iter().map(|(_, b)| (file.to_string(), b)));
+    }
+    out
+}
+
+/// Whether call `n` (function part `f`) goes to code outside the module: a
+/// `pkg.F` call on an import outside it, or a method on a variable whose
+/// type comes from such a package.
+fn is_outside_call(
+    n: Node,
+    f: Node,
+    src: &[u8],
+    file: &str,
+    module: Option<&str>,
+    cache: &RefCell<HashMap<String, HashMap<String, String>>>,
+) -> bool {
+    let Some(operand) = f.child_by_field_name("operand") else { return false };
+    if operand.kind() != "identifier" {
+        return false;
+    }
+    let mut root = n;
+    while let Some(p) = root.parent() {
+        root = p;
+    }
+    let imports = cache.borrow_mut().entry(file.to_string()).or_insert_with(|| go_imports(root, src)).clone();
+    let on = operand.utf8_text(src).unwrap_or("");
+    let line = n.start_position().row + 1;
+    let path = match binding_type_qualified(root, src, file, on, line, &DefIndex::default()) {
+        Some(t) => match flow::qualify_type(&t, &imports) {
+            Some(q) => q.rsplit_once('.').map(|(p, _)| p.to_string()),
+            None => None,
+        },
+        None => imports.get(on).cloned(),
+    };
+    match (path, module) {
+        (Some(p), Some(m)) => gomod::is_outside(m, &p),
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
+/// With no end selector the engine marks outside calls `sink`, shown as `outside`.
+fn retag(h: &mut Hop) {
+    for t in h.tags.iter_mut() {
+        if t == "sink" {
+            *t = "outside".into();
+        }
+    }
+    for c in h.children.iter_mut() {
+        retag(c);
+    }
+}
+
+/// Keep branches that reach an `end` hop. For `=>` only ends one step from
+/// the start count. A walk inside a callee is kept where it reaches an end,
+/// and also along its returns when the caller's hop is kept, so a route
+/// through a function that hands the value back shows that function.
+fn prune(h: &Hop, end: &str, eventually: bool, depth: usize, need_return: bool) -> Option<Hop> {
+    let is_end = h.has(end) && (eventually || depth == 1);
+    let mut kept: Vec<Option<Hop>> = h
+        .children
+        .iter()
+        .map(|c| if c.into { None } else { prune(c, end, eventually, depth + 1, need_return) })
+        .collect();
+    let needed = is_end || (need_return && h.returns) || kept.iter().any(|k| k.is_some());
+    for (i, c) in h.children.iter().enumerate() {
+        if c.into {
+            kept[i] = prune(c, end, eventually, depth + 1, needed);
+        }
+    }
+    let children: Vec<Hop> = kept.into_iter().flatten().collect();
+    if !needed && children.is_empty() {
+        return None;
+    }
+    let mut out = Hop { children, ..h.clone() };
+    if h.has(end) && !is_end {
+        out.tags.retain(|t| t != end);
+    }
+    Some(out)
+}
+
+/// Whether a hop's tag is one of `wanted`: the whole tag, or its first word
+/// (`via` keeps `via normalise`, `conditional` keeps `conditional@4`).
+fn tag_matches(tag: &str, wanted: &[String]) -> bool {
+    wanted.iter().any(|w| tag == w || tag.starts_with(&format!("{} ", w)) || tag.starts_with(&format!("{}@", w)))
+}
+
+/// Keep hops carrying one of the `wanted` tags and their ancestors.
+fn only(h: &Hop, wanted: &[String], root: bool) -> Option<Hop> {
+    let children: Vec<Hop> = h.children.iter().filter_map(|c| only(c, wanted, false)).collect();
+    let keep = root || h.tags.iter().any(|t| tag_matches(t, wanted));
+    if !keep && children.is_empty() {
+        return None;
+    }
+    Some(Hop { children, ..h.clone() })
+}
+
+fn print_tree(h: &Hop, depth: usize, out: &mut String) {
+    let tags: Vec<String> = h.tags.iter().filter(|t| !(depth == 0 && *t == "source")).cloned().collect();
+    out.push_str(&"  ".repeat(depth));
+    out.push_str(&row(&h.file, h.line, &h.func, &h.text, &tags));
+    out.push('\n');
+    for c in &h.children {
+        print_tree(c, depth + 1, out);
+    }
+}
+
+/// The `Outside` hook that walks into in-repo callees.
+struct Walk<'a> {
+    store: &'a TreeStore,
+    graph: &'a CallGraph,
+    cfg: &'a LangConfig,
+    models: ModelOutside<'a>,
+    /// Whether calls are followed into callees (`==>`).
+    follow: bool,
+    max: usize,
+    /// (file, call start, call end) to indices into `graph.sites`.
+    sites: HashMap<(String, usize, usize), Vec<usize>>,
+    sigs: RefCell<HashMap<String, Vec<GoSignature>>>,
+    /// Files of the functions being walked, innermost last.
+    files: RefCell<Vec<String>>,
+    /// (def, tracked parameter positions) being walked, to stop recursion.
+    active: RefCell<Vec<(usize, Vec<usize>)>>,
+    /// Effects already worked out, by file, call start and tracked arguments.
+    memo: RefCell<HashMap<(String, usize, Vec<usize>, bool), CallEffect>>,
+    /// The end predicate, used inside callees too.
+    end: &'a EndFn<'a>,
+}
+
+impl<'a> Walk<'a> {
+    fn new(
+        store: &'a TreeStore,
+        graph: &'a CallGraph,
+        cfg: &'a LangConfig,
+        end: &'a EndFn<'a>,
+        follow: bool,
+        max: usize,
+    ) -> Walk<'a> {
+        let mut sites: HashMap<(String, usize, usize), Vec<usize>> = HashMap::new();
+        for (i, s) in graph.sites.iter().enumerate() {
+            if let Some(d) = graph.index.defs.get(s.caller) {
+                sites.entry((d.id.file.clone(), s.start_byte, s.end_byte)).or_default().push(i);
+            }
+        }
+        Walk {
+            store,
+            graph,
+            cfg,
+            models: ModelOutside::new(cfg),
+            follow,
+            max,
+            sites,
+            sigs: RefCell::new(HashMap::new()),
+            files: RefCell::new(vec![]),
+            active: RefCell::new(vec![]),
+            memo: RefCell::new(HashMap::new()),
+            end,
+        }
+    }
+
+    /// Run a top-level walk in `file`.
+    fn run<R>(&self, file: &str, f: impl FnOnce() -> R) -> R {
+        self.files.borrow_mut().push(file.to_string());
+        let r = f();
+        self.files.borrow_mut().pop();
+        r
+    }
+
+    fn signature(&self, file: &str, line: usize) -> Option<GoSignature> {
+        let mut sigs = self.sigs.borrow_mut();
+        let list = sigs.entry(file.to_string()).or_insert_with(|| {
+            let pf = self.store.get(file);
+            match pf.and_then(|p| p.tree.as_ref().map(|t| (p, t))) {
+                Some((p, t)) => go_signatures(t.root_node(), &p.source),
+                None => vec![],
+            }
+        });
+        list.iter().find(|s| s.line == line).cloned()
+    }
+
+    /// Walk callee `def` from the parameters at `positions` (and the
+    /// receiver when `recv`). None when no parameter can be named.
+    fn into_callee(&self, def: usize, positions: &[usize], recv: bool) -> Option<FlowResult> {
+        let d = &self.graph.index.defs[def];
+        let sig = self.signature(&d.id.file, d.id.line)?;
+        let mut params: Vec<&crate::resolve::go::GoParam> = vec![];
+        for &i in positions {
+            let p = sig.params.get(i).or_else(|| sig.params.last().filter(|p| p.ty.starts_with("...")));
+            if let Some(p) = p {
+                if !params.iter().any(|q| q.position == p.position) {
+                    params.push(p);
+                }
+            }
+        }
+        if recv {
+            params.extend(sig.receiver.as_ref());
+        }
+        params.retain(|p| !p.name.is_empty() && p.name != "_");
+        let first = params.first()?;
+        let pf = self.store.get(&d.id.file)?;
+        let tree = pf.tree.as_ref()?;
+        let cx = FlowCtx { file: &d.id.file, src: &pf.source, root: tree.root_node(), mech: &self.cfg.mechanics };
+        let start = start_at(&cx, first.start_byte, first.end_byte)?;
+        let func = enclosing_function(cx.root, cx.mech, first.start_byte)?;
+        let also: Vec<String> = params[1..].iter().map(|p| p.name.clone()).collect();
+        self.files.borrow_mut().push(d.id.file.clone());
+        let r = analyse_function_with(&cx, func, &start, &also, self.end, self);
+        self.files.borrow_mut().pop();
+        Some(r)
+    }
+
+    fn callee_effect(&self, site: &CallSite, file: &str) -> Option<CallEffect> {
+        let ids = self.sites.get(&(file.to_string(), site.node.start_byte(), site.node.end_byte()))?;
+        let targets: Vec<usize> = ids.iter().filter_map(|&i| self.graph.sites[i].target.map(|(t, _)| t)).collect();
+        if targets.is_empty() {
+            return None;
+        }
+        let name = match (&site.recv_type, &site.method) {
+            (Some(t), Some(m)) => format!("{}.{}", t, m),
+            _ => site.callee.clone(),
+        };
+        let depth = self.active.borrow().len();
+        if !self.follow || depth >= self.max {
+            return Some(CallEffect::Via(name));
+        }
+        let key = (file.to_string(), site.node.start_byte(), site.tracked_args.clone(), site.recv_tracked);
+        if let Some(e) = self.memo.borrow().get(&key) {
+            return Some(e.clone());
+        }
+        let mut trees = vec![];
+        let mut returns = false;
+        let mut walked = false;
+        for &t in &targets {
+            let mark = (t, site.tracked_args.clone());
+            if self.active.borrow().contains(&mark) {
+                continue;
+            }
+            self.active.borrow_mut().push(mark);
+            let r = self.into_callee(t, &site.tracked_args, site.recv_tracked);
+            self.active.borrow_mut().pop();
+            if let Some(mut r) = r {
+                walked = true;
+                returns |= r.returns;
+                r.root.tags = vec!["moved".into()];
+                r.root.into = true;
+                if targets.len() > 1 {
+                    r.root.tags.push("widened".into());
+                }
+                trees.push(r.root);
+            }
+        }
+        let effect = if walked { CallEffect::Into { name, returns, trees } } else { CallEffect::Via(name) };
+        self.memo.borrow_mut().insert(key, effect.clone());
+        Some(effect)
+    }
+}
+
+/// Go's predeclared types: a call to one is a conversion, which keeps the data.
+const CONVERSIONS: &[&str] = &[
+    "string", "[]byte", "[]rune", "byte", "rune", "bool", "int", "int8", "int16", "int32", "int64", "uint",
+    "uint8", "uint16", "uint32", "uint64", "uintptr", "float32", "float64", "complex64", "complex128",
+];
+
+impl Outside for Walk<'_> {
+    fn effect(&self, site: &CallSite) -> CallEffect {
+        if site.method.is_none() && CONVERSIONS.contains(&site.callee.as_str()) {
+            return CallEffect::Pass;
+        }
+        let file = self.files.borrow().last().cloned().unwrap_or_default();
+        if let Some(e) = self.callee_effect(site, &file) {
+            return e;
+        }
+        self.models.effect(site)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::query::parser::parse;
+
+    fn hop(tags: &[&str], children: Vec<Hop>) -> Hop {
+        Hop {
+            file: "a.go".into(),
+            line: 1,
+            func: "f".into(),
+            text: String::new(),
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            unmodelled: None,
+            returns: false,
+            into: false,
+            children,
+        }
+    }
+
+    fn eval(files: &[(&str, &str)], q: &str) -> FlowReport {
+        let d = std::env::temp_dir().join(format!("ctsq-flows-{}-{}", std::process::id(), q.len()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("go.mod"), "module example.com/t\n\ngo 1.23\n").unwrap();
+        let mut store = TreeStore::default();
+        for (f, src) in files {
+            store.insert(f, "go", src.as_bytes().to_vec());
+        }
+        let g = crate::resolve::graph::build_from_store(&store);
+        let (head, open) = match open_end(q) {
+            Some((h, c)) => (h, Some(c)),
+            None => (q.to_string(), None),
+        };
+        evaluate_flows(&parse(&head).unwrap(), open, &store, &g, &d, &d, &FlowOptions::default()).unwrap()
+    }
+
+    #[test]
+    fn open_end_strips_a_trailing_flow_combinator() {
+        assert_eq!(open_end("a ==> "), Some(("a ".to_string(), Combinator::FlowsEventually)));
+        assert_eq!(open_end("a =>"), Some(("a ".to_string(), Combinator::Flows)));
+        assert_eq!(open_end("a ==> b"), None);
+        assert_eq!(open_end("a <=="), None);
+    }
+
+    #[test]
+    fn prune_keeps_branches_to_an_end_and_one_hop_only_at_depth_one() {
+        let t = hop(&["source"], vec![hop(&["exact"], vec![hop(&["sink"], vec![])]), hop(&["moved"], vec![])]);
+        let p = prune(&t, "sink", true, 0, false).unwrap();
+        assert_eq!(p.children.len(), 1);
+        assert_eq!(p.children[0].children[0].tags, vec!["sink"]);
+        // `=>` drops a sink two steps away
+        assert!(prune(&t, "sink", false, 0, false).is_none());
+    }
+
+    #[test]
+    fn only_matches_whole_tags_and_their_first_word() {
+        let w = vec!["via".to_string(), "conditional".to_string()];
+        assert!(tag_matches("via clean", &w));
+        assert!(tag_matches("conditional@4", &w));
+        assert!(!tag_matches("viaduct", &w));
+        let t = hop(&["source"], vec![hop(&["exact"], vec![hop(&["via x"], vec![])]), hop(&["sink"], vec![])]);
+        let o = only(&t, &["via".to_string()], true).unwrap();
+        assert_eq!(o.children.len(), 1, "the ancestor of the via hop stays");
+        assert_eq!(o.children[0].children[0].tags, vec!["via x"]);
+    }
+
+    #[test]
+    fn calls_in_another_file_are_walked_and_returns_come_back() {
+        let a = "package t\nimport \"log\"\nfunc F(x string) {\n\ty := clean(x)\n\tlog.Println(y)\n}\n";
+        let b = "package t\nfunc clean(s string) string {\n\tr := s + \"!\"\n\treturn r\n}\n";
+        let r = eval(&[("t/a.go", a), ("t/b.go", b)], "function#F param#x ==> function#log.Println");
+        assert_eq!(r.found, 1, "{}", r.text);
+        assert!(r.text.contains("t/b.go:2"), "{}", r.text);
+        assert!(r.text.contains("return r  moved"), "{}", r.text);
+    }
+
+    #[test]
+    fn a_callee_that_drops_the_value_ends_the_route() {
+        let a = "package t\nimport \"log\"\nfunc F(x string) {\n\ty := drop(x)\n\tlog.Println(y)\n}\n";
+        let b = "package t\nfunc drop(s string) string {\n\treturn \"\"\n}\n";
+        let r = eval(&[("t/a.go", a), ("t/b.go", b)], "function#F param#x ==> function#log.Println");
+        assert_eq!(r.found, 0, "{}", r.text);
+    }
+
+    #[test]
+    fn recursion_stops() {
+        let a = "package t\nimport \"log\"\nfunc F(x string) {\n\tlog.Println(loop(x))\n}\nfunc loop(s string) string {\n\treturn loop(s)\n}\n";
+        let r = eval(&[("t/a.go", a)], "function#F param#x ==> function#log.Println");
+        assert_eq!(r.found, 1, "{}", r.text);
+    }
+}

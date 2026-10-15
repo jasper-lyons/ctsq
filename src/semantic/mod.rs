@@ -7,6 +7,7 @@
 
 pub mod attrs;
 pub mod calls;
+pub mod flows;
 pub mod print;
 
 use crate::compiler;
@@ -77,12 +78,37 @@ fn finish_segment(mut seg: Query, split: &mut Split) -> Result<(), String> {
 /// the language does not support) is skipped. When every file rejects it,
 /// the first error is returned.
 pub fn segment_defs(seg: &Query, store: &TreeStore, index: &DefIndex) -> Result<Vec<usize>, String> {
+    let mut out = Vec::new();
+    for (file, rows) in segment_rows(seg, store)? {
+        let Some(pf) = store.get(&file) else { continue };
+        let Some(tree) = &pf.tree else { continue };
+        let headers = def_headers(&file, tree.root_node(), &pf.source, index);
+        for r in &rows {
+            for &(d, start, end) in &headers {
+                if r.start_byte < end && r.end_byte > start {
+                    out.push(d);
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// The rows `seg` matches in each parsed file of `store`, attribute filters
+/// applied, for files with at least one row. A file whose language rejects
+/// the segment is skipped. When every file rejects it, the first error is
+/// returned.
+pub fn segment_rows(seg: &Query, store: &TreeStore) -> Result<Vec<(String, Vec<crate::runner::MatchRow>)>, String> {
     let attrs = attrs::last_selector_attrs(seg)?;
     let mut first_err: Option<String> = None;
     let mut accepted = false;
     let mut out = Vec::new();
     for (file, pf) in store.iter() {
-        let Some(tree) = &pf.tree else { continue };
+        if pf.tree.is_none() {
+            continue;
+        }
         let Some(lang) = compiler::lang::for_name(pf.lang) else { continue };
         let checked = compiler::validate(seg, lang.as_ref(), pf.lang)
             .and_then(|_| attrs::check_lang(&attrs, pf.lang));
@@ -94,16 +120,8 @@ pub fn segment_defs(seg: &Query, store: &TreeStore, index: &DefIndex) -> Result<
         let compiled = compiler::compile(seg, lang.as_ref());
         let rows = crate::runner::run_rows(&compiled, lang.as_ref(), &pf.source, false)?;
         let rows = attrs::filter_rows(rows, &attrs, pf.lang, &lang.ts_language(), &pf.source);
-        if rows.is_empty() {
-            continue;
-        }
-        let headers = def_headers(file, tree.root_node(), &pf.source, index);
-        for r in &rows {
-            for &(d, start, end) in &headers {
-                if r.start_byte < end && r.end_byte > start {
-                    out.push(d);
-                }
-            }
+        if !rows.is_empty() {
+            out.push((file.to_string(), rows));
         }
     }
     if !accepted {
@@ -111,8 +129,6 @@ pub fn segment_defs(seg: &Query, store: &TreeStore, index: &DefIndex) -> Result<
             return Err(e);
         }
     }
-    out.sort();
-    out.dedup();
     Ok(out)
 }
 

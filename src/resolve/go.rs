@@ -763,6 +763,106 @@ pub fn binding_type(
     var_type(var, line, 0, &ctx)
 }
 
+/// `binding_type` with the package qualifier kept: `strings.Builder` where
+/// `binding_type` gives `Builder`. The type is read from the binding that
+/// `binding_type` used (a `var` type, a composite literal, a receiver or a
+/// parameter). When that binding names no qualified type, as for a call
+/// result, the answer is the same as `binding_type`.
+pub fn binding_type_qualified(
+    root: Node,
+    src: &[u8],
+    file: &str,
+    var: &str,
+    line: usize,
+    index: &DefIndex,
+) -> Option<String> {
+    let base = binding_type(root, src, file, var, line, index)?;
+    let mut decl = None;
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if matches!(child.kind(), "function_declaration" | "method_declaration")
+            && child.start_position().row < line
+        {
+            decl = Some(child);
+        }
+    }
+    let decl = decl?;
+    let mut types: Vec<Node> = Vec::new();
+    for list in ["receiver", "parameters"] {
+        if let Some(l) = decl.child_by_field_name(list) {
+            let mut c = l.walk();
+            for p in l.named_children(&mut c) {
+                let mut nc = p.walk();
+                if p.children_by_field_name("name", &mut nc).any(|n| text(n, src) == var) {
+                    types.extend(p.child_by_field_name("type"));
+                }
+            }
+        }
+    }
+    if let Some(body) = decl.child_by_field_name("body") {
+        let mut stack = vec![body];
+        let mut found: Vec<(usize, Node)> = Vec::new();
+        while let Some(n) = stack.pop() {
+            if n.start_position().row >= line {
+                continue;
+            }
+            match n.kind() {
+                "var_spec" => {
+                    let mut c = n.walk();
+                    if n.children_by_field_name("name", &mut c).any(|x| text(x, src) == var) {
+                        let ty = n.child_by_field_name("type").or_else(|| {
+                            n.child_by_field_name("value").and_then(|v| v.named_child(0)).and_then(literal_type)
+                        });
+                        found.extend(ty.map(|t| (n.start_byte(), t)));
+                    }
+                }
+                "short_var_declaration" => {
+                    let left = n.child_by_field_name("left");
+                    if left.and_then(|l| l.named_child(0)).is_some_and(|x| text(x, src) == var) {
+                        let ty = n.child_by_field_name("right").and_then(|v| v.named_child(0)).and_then(literal_type);
+                        found.extend(ty.map(|t| (n.start_byte(), t)));
+                    }
+                }
+                _ => {}
+            }
+            let mut c = n.walk();
+            stack.extend(n.named_children(&mut c));
+        }
+        found.sort_by_key(|(b, _)| *b);
+        if let Some((_, t)) = found.pop() {
+            types = vec![t];
+        }
+    }
+    let qualified = types.last().and_then(|t| qualified_type_name(*t, src));
+    match qualified {
+        Some(q) if q.rsplit('.').next() == Some(base.as_str()) => Some(q),
+        _ => Some(base),
+    }
+}
+
+/// The type node of a composite literal value, through `&`.
+fn literal_type(value: Node) -> Option<Node> {
+    match value.kind() {
+        "composite_literal" => value.child_by_field_name("type"),
+        "unary_expression" => literal_type(value.child_by_field_name("operand")?),
+        _ => None,
+    }
+}
+
+/// `type_name` that keeps a package qualifier: `pkg.Name`.
+fn qualified_type_name(node: Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "qualified_type" => {
+            let pkg = node.child_by_field_name("package")?;
+            let name = node.child_by_field_name("name")?;
+            Some(format!("{}.{}", text(pkg, source), text(name, source)))
+        }
+        "pointer_type" => node.named_child(0).and_then(|t| qualified_type_name(t, source)),
+        "generic_type" => node.child_by_field_name("type").and_then(|t| qualified_type_name(t, source)),
+        _ => type_name(node, source),
+    }
+}
+
 #[allow(dead_code)] // wired by the path command
 /// One parameter of a Go function or method.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1305,6 +1405,20 @@ mod tests {
         assert_eq!(ty("nope"), None);
         // before the binding line the variable has no type yet
         assert_eq!(binding_type(root, src.as_bytes(), "a/a.go", "x", 5, &idx), None);
+    }
+
+    #[test]
+    fn binding_type_qualified_keeps_the_package() {
+        let src = "package a\nimport \"strings\"\nfunc Go(w *http.Writer, s S) {\n  var b strings.Builder\n  p := &bytes.Buffer{}\n  _ = b\n}\n";
+        let tree = parse(src.as_bytes()).unwrap();
+        let root = tree.root_node();
+        let idx = DefIndex::default();
+        let ty = |var: &str| binding_type_qualified(root, src.as_bytes(), "a/a.go", var, 6, &idx);
+        assert_eq!(ty("b").as_deref(), Some("strings.Builder"));
+        assert_eq!(ty("p").as_deref(), Some("bytes.Buffer"));
+        assert_eq!(ty("w").as_deref(), Some("http.Writer"));
+        assert_eq!(ty("s").as_deref(), Some("S"));
+        assert_eq!(ty("nope"), None);
     }
 
     #[test]

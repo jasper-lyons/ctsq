@@ -102,10 +102,11 @@ fn bad_queries_exit_2() {
 }
 
 #[test]
-fn data_flow_is_not_available_yet() {
+fn data_flow_from_a_function_start_reports_no_variable() {
     let o = path_cmd("function#main ==> function#c", &[]);
-    assert_eq!(code(&o), 2);
-    assert!(String::from_utf8_lossy(&o.stderr).contains("data-flow walking is not available yet"));
+    assert_eq!(code(&o), 1);
+    let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert!(out.contains("matched no variable, parameter or field"));
 }
 
 #[test]

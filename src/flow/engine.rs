@@ -7,7 +7,7 @@ use tree_sitter::Node;
 use super::models::qualify_type;
 use super::{CallEffect, CallSite, EndFn, FlowCtx, FlowResult, Hop, Outside, Start, StartKind};
 use crate::config::{Mechanics, Slot};
-use crate::resolve::go::{binding_type, go_imports};
+use crate::resolve::go::{binding_type, binding_type_qualified, go_imports};
 use crate::resolve::DefIndex;
 
 const MAX_LOOP_PASSES: usize = 32;
@@ -111,6 +111,24 @@ pub fn start_at(cx: &FlowCtx, start_byte: usize, end_byte: usize) -> Option<Star
     None
 }
 
+/// `start_at` for a query row, whose node may be a whole field declaration,
+/// field access or parameter declaration: the name inside it is the start.
+pub fn start_in(cx: &FlowCtx, start_byte: usize, end_byte: usize) -> Option<Start> {
+    let m = cx.mech;
+    let n = cx.root.descendant_for_byte_range(start_byte, end_byte)?;
+    let inner = if Mechanics::is(&m.nodes.field_decl, n.kind()) || Mechanics::is(&m.nodes.param, n.kind()) {
+        kids(n, &m.fields.name).first().copied()
+    } else if Mechanics::is(&m.nodes.field, n.kind()) {
+        kids(n, &m.fields.field).first().copied()
+    } else {
+        None
+    };
+    match inner {
+        Some(x) => start_at(cx, x.start_byte(), x.end_byte()),
+        None => start_at(cx, start_byte, end_byte),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct Var {
     origin: usize,
@@ -135,6 +153,8 @@ struct Val {
     calls: usize,
     /// Receiver variables that now carry the data.
     whole: Vec<String>,
+    /// Walks inside called in-repo functions, hung under this hop.
+    trees: Vec<Hop>,
 }
 
 impl Val {
@@ -158,6 +178,7 @@ impl Val {
         self.sink |= o.sink;
         self.calls += o.calls;
         self.whole.extend(o.whole);
+        self.trees.extend(o.trees);
     }
 }
 
@@ -166,6 +187,9 @@ struct HopData {
     line: usize,
     tags: Vec<String>,
     unmodelled: Option<String>,
+    /// Callee walks, printed before the hops that read this one.
+    inner: Vec<Hop>,
+    returns: bool,
 }
 
 struct Walker<'a, 't> {
@@ -184,6 +208,8 @@ struct Walker<'a, 't> {
     pending: Option<usize>,
     /// Whether the start node is the bound side of an assignment.
     start_is_decl: bool,
+    /// Whether a return statement carries tracked data.
+    returns: bool,
 }
 
 /// Walk `func` from `start`. `is_end` marks sink calls, `outside` answers
@@ -192,6 +218,19 @@ pub fn analyse_function(
     cx: &FlowCtx,
     func: Node,
     start: &Start,
+    is_end: &EndFn,
+    outside: &dyn Outside,
+) -> FlowResult {
+    analyse_function_with(cx, func, start, &[], is_end, outside)
+}
+
+/// `analyse_function` that also tracks the variables `also` from the top of
+/// the body, as when several parameters receive tracked arguments.
+pub fn analyse_function_with(
+    cx: &FlowCtx,
+    func: Node,
+    start: &Start,
+    also: &[String],
     is_end: &EndFn,
     outside: &dyn Outside,
 ) -> FlowResult {
@@ -204,7 +243,7 @@ pub fn analyse_function(
         outside,
         imports: go_imports(cx.root, cx.src),
         func: function_name(func, cx.src, m),
-        hops: vec![HopData { parent: 0, line: start.line, tags: vec!["source".into()], unmodelled: None }],
+        hops: vec![HopData { parent: 0, line: start.line, tags: vec!["source".into()], unmodelled: None, inner: vec![], returns: false }],
         by_key: HashMap::new(),
         local_fns: named(cx.root)
             .into_iter()
@@ -213,8 +252,12 @@ pub fn analyse_function(
             .collect(),
         pending: None,
         start_is_decl: false,
+        returns: false,
     };
     let mut st = State::new();
+    for name in also {
+        st.insert(name.clone(), Var { origin: 0, cond: None });
+    }
     let body = kids(func, &m.fields.body);
     if let StartKind::Var(name) = &start.kind {
         let in_body = start.file == cx.file
@@ -229,7 +272,7 @@ pub fn analyse_function(
     for b in body {
         w.walk_stmt(b, &mut st);
     }
-    FlowResult { root: w.tree() }
+    FlowResult { root: w.tree(), returns: w.returns }
 }
 
 impl<'a, 't> Walker<'a, 't> {
@@ -301,14 +344,27 @@ impl<'a, 't> Walker<'a, 't> {
                     self.hops[id].tags.push(t);
                 }
             }
+            for t in &v.trees {
+                if !self.hops[id].inner.contains(t) {
+                    self.hops[id].inner.push(t.clone());
+                }
+            }
             return id;
         }
         let id = self.hops.len();
+        let mut inner: Vec<Hop> = vec![];
+        for t in &v.trees {
+            if !inner.contains(t) {
+                inner.push(t.clone());
+            }
+        }
         self.hops.push(HopData {
             parent: v.carry.or(v.used).unwrap_or(0),
             line: line_of(n),
             tags,
             unmodelled: v.unmodelled.clone(),
+            inner,
+            returns: false,
         });
         self.by_key.insert(n.start_byte(), id);
         id
@@ -336,7 +392,9 @@ impl<'a, 't> Walker<'a, 't> {
             text,
             tags: h.tags.clone(),
             unmodelled: h.unmodelled.clone(),
-            children: kids[i].iter().map(|&k| self.build(k, kids)).collect(),
+            returns: h.returns,
+            into: false,
+            children: h.inner.iter().cloned().chain(kids[i].iter().map(|&k| self.build(k, kids))).collect(),
         }
     }
 
@@ -371,9 +429,12 @@ impl<'a, 't> Walker<'a, 't> {
             for c in named(n) {
                 v.join(self.eval(c, st));
             }
-            if v.carry.is_some() || v.sink {
-                let prim: Vec<String> = if v.carry.is_some() { vec!["moved".into()] } else { vec![] };
-                self.hop(n, &v, &prim);
+            self.returns |= v.carry.is_some();
+            if v.carry.is_some() || v.sink || !v.trees.is_empty() {
+                let prim: Vec<String> =
+                    if v.carry.is_some() || !v.trees.is_empty() { vec!["moved".into()] } else { vec![] };
+                let id = self.hop(n, &v, &prim);
+                self.hops[id].returns |= v.carry.is_some();
             }
         } else if self.holds_assign(n) {
             for c in named(n) {
@@ -490,9 +551,11 @@ impl<'a, 't> Walker<'a, 't> {
         }
         let carried = acts.iter().any(|a| matches!(a, Act::Set(..)));
         let mut id = None;
-        if carried || summary.sink || !summary.whole.is_empty() {
+        if carried || summary.sink || !summary.whole.is_empty() || !summary.trees.is_empty() {
             let mut prim: Vec<String> = match (any_carry, any_derived) {
-                (false, _) if !summary.whole.is_empty() && !summary.sink => vec!["moved".into()],
+                (false, _) if (!summary.whole.is_empty() || !summary.trees.is_empty()) && !summary.sink => {
+                    vec!["moved".into()]
+                }
                 (false, _) => vec![],
                 (true, true) => vec!["derived".into()],
                 (true, false) => vec!["exact".into()],
@@ -522,8 +585,9 @@ impl<'a, 't> Walker<'a, 't> {
     /// Conditions carry no data, only their sinks are recorded.
     fn condition(&mut self, n: Node<'t>, st: &State) {
         let v = self.eval(n, st);
-        if v.sink {
-            self.hop(n, &v, &[]);
+        if v.sink || !v.trees.is_empty() {
+            let prim: Vec<String> = if v.sink { vec![] } else { vec!["moved".into()] };
+            self.hop(n, &v, &prim);
         }
     }
 
@@ -705,36 +769,6 @@ impl<'a, 't> Walker<'a, 't> {
         }
     }
 
-    /// The import path form of a receiver type, as `strings.Builder`.
-    /// `binding_type` drops the package part, so an unqualified name is
-    /// looked up as `pkg.Name` text in the enclosing function, then the file,
-    /// for each import name. The first import that matches wins.
-    fn qualify_recv(&self, ty: &str, call: Node<'t>) -> Option<String> {
-        if let Some(q) = qualify_type(ty, &self.imports) {
-            return Some(q);
-        }
-        let name = ty.trim_start_matches('*');
-        let scopes = [enclosing_function(self.cx.root, self.m, call.start_byte()), Some(self.cx.root)];
-        let mut names: Vec<(&String, &String)> = self.imports.iter().collect();
-        names.sort();
-        for scope in scopes.into_iter().flatten() {
-            let body = self.t(scope);
-            for (local, path) in &names {
-                let needle = format!("{}.{}", local, name);
-                let hit = body.match_indices(&needle).any(|(i, _)| {
-                    let before = body[..i].chars().next_back();
-                    let after = body[i + needle.len()..].chars().next();
-                    !before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
-                        && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
-                });
-                if hit {
-                    return Some(format!("{}.{}", path, name));
-                }
-            }
-        }
-        None
-    }
-
     /// The variable an argument names, through `&` and `*`: `u` in `&u`.
     fn object_name(&self, mut n: Node<'t>) -> Option<String> {
         loop {
@@ -835,9 +869,16 @@ impl<'a, 't> Walker<'a, 't> {
                 match self.imports.get(on) {
                     Some(path) if !st.contains_key(on) => site.package = Some(path.clone()),
                     _ => {
-                        site.recv_type =
-                            binding_type(self.cx.root, self.cx.src, self.cx.file, on, line_of(n), &DefIndex::default());
-                        site.recv_path = site.recv_type.as_deref().and_then(|t| self.qualify_recv(t, n));
+                        let q = binding_type_qualified(
+                            self.cx.root,
+                            self.cx.src,
+                            self.cx.file,
+                            on,
+                            line_of(n),
+                            &DefIndex::default(),
+                        );
+                        site.recv_path = q.as_deref().and_then(|t| qualify_type(t, &self.imports));
+                        site.recv_type = q.map(|t| t.rsplit('.').next().unwrap_or("").to_string());
                     }
                 }
             }
@@ -876,6 +917,13 @@ impl<'a, 't> Walker<'a, 't> {
             CallEffect::Via(name) => {
                 out.carry = inner.carry;
                 out.via.get_or_insert(name);
+            }
+            CallEffect::Into { name, returns, trees } => {
+                if returns {
+                    out.carry = inner.carry;
+                }
+                out.via.get_or_insert(name);
+                out.trees.extend(trees);
             }
             CallEffect::Model { pass, .. } => {
                 let all: Vec<usize> = (0..args.len()).collect();
