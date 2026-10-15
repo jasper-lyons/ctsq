@@ -120,9 +120,110 @@ pub struct ResolvedCall {
     pub target: Option<(usize, Confidence)>,
 }
 
+#[allow(dead_code)] // wired by the path command
+/// One call expression, kept per site. The graph keeps one edge per
+/// (caller, callee, target), so this table is where every site lives, with
+/// the byte ranges the flow engine needs. Interface dispatch gives one site
+/// per target, like `ResolvedCall`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallSite {
+    /// Index into `DefIndex.defs` of the enclosing (calling) function.
+    pub caller: usize,
+    /// Bare callee name for display.
+    pub callee_display: String,
+    /// Resolved definition, or None for external or unknown callees.
+    pub target: Option<(usize, Confidence)>,
+    /// Line of the call expression (1-based).
+    pub line: usize,
+    /// Byte range of the whole call expression.
+    pub start_byte: usize,
+    pub end_byte: usize,
+    /// Byte range of each argument, in order.
+    pub args: Vec<(usize, usize)>,
+}
+
+#[allow(dead_code)] // wired by the path command
+/// One parsed file in a `TreeStore`.
+pub struct ParsedFile {
+    pub lang: &'static str,
+    pub source: Vec<u8>,
+    /// None when the language has no grammar here or the parse failed.
+    pub tree: Option<tree_sitter::Tree>,
+}
+
+#[allow(dead_code)] // wired by the path command
+/// Every file of one run, read and parsed once, shared by the call graph and
+/// the flow engine. Files keep the order they were added in.
+#[derive(Default)]
+pub struct TreeStore {
+    files: Vec<(String, ParsedFile)>,
+    by_path: HashMap<String, usize>,
+}
+
+#[allow(dead_code)] // wired by the path command
+impl TreeStore {
+    /// Read and parse every job. Unreadable files are left out.
+    pub fn build(jobs: &[(String, &'static str)]) -> TreeStore {
+        let mut store = TreeStore::default();
+        for (file, lang) in jobs {
+            if let Ok(source) = std::fs::read(file) {
+                store.insert(file, lang, source);
+            }
+        }
+        store
+    }
+
+    /// Parse `source` and add it under `file`, replacing an earlier entry.
+    /// Tests use this to build a store from inline sources.
+    pub fn insert(&mut self, file: &str, lang: &'static str, source: Vec<u8>) {
+        let tree = crate::compiler::lang::for_name(lang).and_then(|l| {
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&l.ts_language()).ok()?;
+            parser.parse(&source, None)
+        });
+        let entry = ParsedFile { lang, source, tree };
+        match self.by_path.get(file) {
+            Some(&i) => self.files[i].1 = entry,
+            None => {
+                self.by_path.insert(file.to_string(), self.files.len());
+                self.files.push((file.to_string(), entry));
+            }
+        }
+    }
+
+    pub fn get(&self, file: &str) -> Option<&ParsedFile> {
+        self.by_path.get(file).map(|&i| &self.files[i].1)
+    }
+
+    /// (path, parsed file) in insertion order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &ParsedFile)> {
+        self.files.iter().map(|(f, p)| (f.as_str(), p))
+    }
+
+    pub fn len(&self) -> usize {
+        self.files.len()
+    }
+}
+
 pub trait Resolver {
     /// Phase 1: definitions in one file (feeds the project index).
     fn collect_defs(&self, file: &str, source: &[u8]) -> Vec<Def>;
+    /// Phase 1 with an already parsed tree. Resolvers that do not use it
+    /// parse again.
+    fn collect_defs_tree(&self, file: &str, source: &[u8], _tree: Option<&tree_sitter::Tree>) -> Vec<Def> {
+        self.collect_defs(file, source)
+    }
+    /// Phase 2 with an already parsed tree, plus the per-site table. Only the
+    /// Go resolver fills the sites, the others return none.
+    fn resolve_calls_tree(
+        &self,
+        file: &str,
+        source: &[u8],
+        _tree: Option<&tree_sitter::Tree>,
+        index: &DefIndex,
+    ) -> (Vec<ResolvedCall>, Vec<CallSite>) {
+        (self.resolve_calls(file, source, index), vec![])
+    }
     /// Phase 1b: explicit implements-relations (`impl Trait for Type`).
     /// Languages with structural conformance (Go) don't need this.
     fn collect_impls(&self, _file: &str, _source: &[u8]) -> Vec<(String, String)> {

@@ -15,7 +15,9 @@
 //! `Var` receiver and disambiguated at resolve time — local bindings and
 //! params first (they shadow package names), then the import map.
 
-use super::{Callee, Confidence, Def, DefId, DefIndex, DefKind, Receiver, ResolvedCall, Resolver};
+use super::{
+    CallSite, Callee, Confidence, Def, DefId, DefIndex, DefKind, Receiver, ResolvedCall, Resolver,
+};
 use std::collections::HashMap;
 use tree_sitter::Node;
 
@@ -24,7 +26,11 @@ pub struct GoResolver;
 
 impl Resolver for GoResolver {
     fn collect_defs(&self, file: &str, source: &[u8]) -> Vec<Def> {
-        let tree = match parse(source) { Some(t) => t, None => return vec![] };
+        self.collect_defs_tree(file, source, None)
+    }
+
+    fn collect_defs_tree(&self, file: &str, source: &[u8], given: Option<&tree_sitter::Tree>) -> Vec<Def> {
+        let tree = match parse_or(given, source) { Some(t) => t, None => return vec![] };
         let pkg = file_package_path(file);
         let mut out = Vec::new();
         let mut cursor = tree.root_node().walk();
@@ -64,7 +70,17 @@ impl Resolver for GoResolver {
     }
 
     fn resolve_calls(&self, file: &str, source: &[u8], index: &DefIndex) -> Vec<ResolvedCall> {
-        let tree = match parse(source) { Some(t) => t, None => return vec![] };
+        self.resolve_calls_tree(file, source, None, index).0
+    }
+
+    fn resolve_calls_tree(
+        &self,
+        file: &str,
+        source: &[u8],
+        given: Option<&tree_sitter::Tree>,
+        index: &DefIndex,
+    ) -> (Vec<ResolvedCall>, Vec<CallSite>) {
+        let tree = match parse_or(given, source) { Some(t) => t, None => return (vec![], vec![]) };
         let scope = FileScope::build(tree.root_node(), source);
 
         // def line -> index, for attributing calls to their enclosing function
@@ -74,27 +90,36 @@ impl Resolver for GoResolver {
             .collect();
 
         let mut out = Vec::new();
+        let mut sites = Vec::new();
         for fun in &scope.fns {
             let Some(&caller) = def_at.get(&fun.line) else { continue };
             let ctx = Ctx { file, scope: &scope, fun, index };
-            for (callee, line) in &fun.calls {
+            for call in &fun.calls {
+                let line = call.line;
                 // interface dispatch can yield several targets → one edge each
-                let targets = resolve_callee(callee, *line, 0, &ctx);
-                let display = callee.name().to_string();
-                if targets.is_empty() {
+                let targets: Vec<Option<(usize, Confidence)>> =
+                    match resolve_callee(&call.callee, line, 0, &ctx) {
+                        t if t.is_empty() => vec![None],
+                        t => t.into_iter().map(Some).collect(),
+                    };
+                let display = call.callee.name().to_string();
+                for target in targets {
                     out.push(ResolvedCall {
-                        caller, callee_display: display, line: *line, target: None,
+                        caller, callee_display: display.clone(), line, target,
                     });
-                } else {
-                    for t in targets {
-                        out.push(ResolvedCall {
-                            caller, callee_display: display.clone(), line: *line, target: Some(t),
-                        });
-                    }
+                    sites.push(CallSite {
+                        caller,
+                        callee_display: display.clone(),
+                        target,
+                        line,
+                        start_byte: call.start_byte,
+                        end_byte: call.end_byte,
+                        args: call.args.clone(),
+                    });
                 }
             }
         }
-        out
+        (out, sites)
     }
 }
 
@@ -102,6 +127,12 @@ fn parse(source: &[u8]) -> Option<tree_sitter::Tree> {
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
     parser.parse(source, None)
+}
+
+/// The tree a `TreeStore` already holds, else a fresh parse. Cloning a tree
+/// is a cheap reference count.
+fn parse_or(given: Option<&tree_sitter::Tree>, source: &[u8]) -> Option<tree_sitter::Tree> {
+    given.cloned().or_else(|| parse(source))
 }
 
 fn text<'a>(node: Node, source: &'a [u8]) -> &'a str {
@@ -211,8 +242,18 @@ struct FnScope {
     params: Vec<(String, String)>,
     /// (line, var, binding) in document order.
     bindings: Vec<(usize, String, Binding)>,
-    /// (callee, call-site line) in document order.
-    calls: Vec<(Callee, usize)>,
+    /// Call sites in document order.
+    calls: Vec<CallRec>,
+}
+
+#[derive(Debug)]
+struct CallRec {
+    callee: Callee,
+    line: usize,
+    start_byte: usize,
+    end_byte: usize,
+    /// Byte range of each argument.
+    args: Vec<(usize, usize)>,
 }
 
 #[derive(Debug)]
@@ -281,8 +322,23 @@ fn walk_scope(node: Node, source: &[u8], s: &mut FileScope, fn_stack: &mut Vec<u
         }
         "call_expression" => {
             if let Some(&f) = fn_stack.last() {
-                if let Some(c) = classify_call(node, source) {
-                    s.fns[f].calls.push((c, node.start_position().row + 1));
+                if let Some(callee) = classify_call(node, source) {
+                    let mut args = Vec::new();
+                    if let Some(list) = node.child_by_field_name("arguments") {
+                        let mut c = list.walk();
+                        for a in list.named_children(&mut c) {
+                            if a.kind() != "comment" {
+                                args.push((a.start_byte(), a.end_byte()));
+                            }
+                        }
+                    }
+                    s.fns[f].calls.push(CallRec {
+                        callee,
+                        line: node.start_position().row + 1,
+                        start_byte: node.start_byte(),
+                        end_byte: node.end_byte(),
+                        args,
+                    });
                 }
             }
             // fall through: arguments and receivers may contain calls
@@ -705,6 +761,104 @@ pub fn binding_type(
     let fun = scope.fns.iter().filter(|f| f.line <= line).max_by_key(|f| f.line)?;
     let ctx = Ctx { file, scope: &scope, fun, index };
     var_type(var, line, 0, &ctx)
+}
+
+#[allow(dead_code)] // wired by the path command
+/// One parameter of a Go function or method.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoParam {
+    /// Empty for an unnamed parameter (`func f(int)`) and `_` stays `_`.
+    pub name: String,
+    /// 0-based position in the parameter list, counting every name in
+    /// `a, b int` and unnamed parameters. The receiver is not counted.
+    pub position: usize,
+    /// Type text as written, `...T` for a variadic parameter.
+    pub ty: String,
+    /// Byte range of the name, or of the type when unnamed.
+    pub start_byte: usize,
+    pub end_byte: usize,
+}
+
+#[allow(dead_code)] // wired by the path command
+/// Receiver and parameters of one Go function, method or interface method.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoSignature {
+    /// Start line of the declaration, which equals `Def.id.line`.
+    pub line: usize,
+    pub receiver: Option<GoParam>,
+    pub params: Vec<GoParam>,
+}
+
+#[allow(dead_code)] // wired by the path command
+/// Signatures of every top-level function and method and every interface
+/// method in one Go file, in document order. `root` is the file's root node.
+pub fn go_signatures(root: Node, src: &[u8]) -> Vec<GoSignature> {
+    let mut out = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        match child.kind() {
+            "function_declaration" | "method_declaration" => {
+                let receiver = child.child_by_field_name("receiver")
+                    .and_then(|r| signature_params(r, src).into_iter().next());
+                let params = child.child_by_field_name("parameters")
+                    .map(|p| signature_params(p, src))
+                    .unwrap_or_default();
+                out.push(GoSignature { line: child.start_position().row + 1, receiver, params });
+            }
+            "type_declaration" => {
+                let mut stack = vec![child];
+                while let Some(n) = stack.pop() {
+                    if n.kind() == "method_elem" {
+                        let params = n.child_by_field_name("parameters")
+                            .map(|p| signature_params(p, src))
+                            .unwrap_or_default();
+                        out.push(GoSignature { line: n.start_position().row + 1, receiver: None, params });
+                        continue;
+                    }
+                    let mut c = n.walk();
+                    let kids: Vec<Node> = n.named_children(&mut c).collect();
+                    stack.extend(kids.into_iter().rev());
+                }
+            }
+            _ => {}
+        }
+    }
+    out.sort_by_key(|s| s.line);
+    out
+}
+
+#[allow(dead_code)] // wired by the path command
+fn signature_params(list: Node, src: &[u8]) -> Vec<GoParam> {
+    let mut out = Vec::new();
+    let mut cursor = list.walk();
+    for p in list.named_children(&mut cursor) {
+        if !matches!(p.kind(), "parameter_declaration" | "variadic_parameter_declaration") {
+            continue;
+        }
+        let ty_node = p.child_by_field_name("type");
+        let ty_text = ty_node.map(|t| text(t, src).to_string()).unwrap_or_default();
+        let ty = if p.kind() == "variadic_parameter_declaration" {
+            format!("...{}", ty_text)
+        } else {
+            ty_text
+        };
+        let mut names = p.walk();
+        let named: Vec<Node> = p.children_by_field_name("name", &mut names).collect();
+        if named.is_empty() {
+            let span = ty_node.unwrap_or(p);
+            out.push(GoParam {
+                name: String::new(), position: out.len(), ty: ty.clone(),
+                start_byte: span.start_byte(), end_byte: span.end_byte(),
+            });
+        }
+        for n in named {
+            out.push(GoParam {
+                name: text(n, src).to_string(), position: out.len(), ty: ty.clone(),
+                start_byte: n.start_byte(), end_byte: n.end_byte(),
+            });
+        }
+    }
+    out
 }
 
 /// Pick the best candidate. A single candidate is Exact; several rank by
@@ -1151,6 +1305,31 @@ mod tests {
         assert_eq!(ty("nope"), None);
         // before the binding line the variable has no type yet
         assert_eq!(binding_type(root, src.as_bytes(), "a/a.go", "x", 5, &idx), None);
+    }
+
+    #[test]
+    fn go_signatures_list_receiver_and_positioned_params() {
+        let src = "package a\ntype W interface {\n  Write(p []byte, n int) error\n}\nfunc (s *S) Run(a, b int, _ string, rest ...any) {}\nfunc F(int, *S) {}\n";
+        let tree = parse(src.as_bytes()).unwrap();
+        let sigs = go_signatures(tree.root_node(), src.as_bytes());
+        let lines: Vec<usize> = sigs.iter().map(|s| s.line).collect();
+        assert_eq!(lines, vec![3, 5, 6], "{:?}", sigs);
+        let write: Vec<(&str, usize, &str)> =
+            sigs[0].params.iter().map(|p| (p.name.as_str(), p.position, p.ty.as_str())).collect();
+        assert_eq!(write, vec![("p", 0, "[]byte"), ("n", 1, "int")]);
+        let run = &sigs[1];
+        let recv = run.receiver.as_ref().unwrap();
+        assert_eq!((recv.name.as_str(), recv.ty.as_str()), ("s", "*S"));
+        assert_eq!(&src[recv.start_byte..recv.end_byte], "s");
+        let params: Vec<(&str, usize, &str)> =
+            run.params.iter().map(|p| (p.name.as_str(), p.position, p.ty.as_str())).collect();
+        assert_eq!(
+            params,
+            vec![("a", 0, "int"), ("b", 1, "int"), ("_", 2, "string"), ("rest", 3, "...any")]
+        );
+        let unnamed: Vec<(&str, usize, &str)> =
+            sigs[2].params.iter().map(|p| (p.name.as_str(), p.position, p.ty.as_str())).collect();
+        assert_eq!(unnamed, vec![("", 0, "int"), ("", 1, "*S")]);
     }
 
     #[test]

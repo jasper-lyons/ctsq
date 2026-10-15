@@ -314,6 +314,26 @@ there, not grow new code paths.
 
 ---
 
+## Call walking
+
+`ctsq path` evaluates the call combinators in `src/semantic/calls.rs` over the call graph. The data comes from three places.
+
+- `resolve::TreeStore` reads and parses every file of a run once. `graph::build_from_store` hands each resolver its tree through `Resolver::collect_defs_tree` and `Resolver::resolve_calls_tree`. Resolvers that ignore the tree parse again, which is every resolver but Go's. `graph::build` keeps reading files itself and builds the same graph.
+- `CallGraph.sites` keeps every call site (`resolve::CallSite`: caller, target, line, byte range, argument byte ranges). The edge list keeps one edge per caller, callee and target, so the flow engine reads sites, not edges. Only the Go resolver fills it.
+- `resolve::go::go_signatures` lists the receiver and the parameters of each Go function, method and interface method, with 0-based positions that count every name and every unnamed parameter.
+
+Evaluation, in order:
+
+1. `semantic::split_query` cuts the query at its top-level semantic combinators into AST segments. A semantic combinator inside a group or a field inner query is an error. `:not()` is only allowed on the last selector of a segment, where it is taken off before the segment compiles.
+2. `semantic::segment_defs` compiles and runs each segment like a `-q` query, filters attributes, then maps rows to definitions. A row maps to a definition when it overlaps the definition header, which runs from the start of the declaration to the start of its body. So `function#main` picks the declaration of `main`, and a call to `main` inside another body picks nothing. A file whose language rejects the segment is skipped, and the error is only returned when every file rejects it.
+3. The `:not()` selectors are matched the same way. No route passes through a definition they match, start and end included.
+4. All joins must read one way: `->` and `-->`, or `<-` and `<--`. A data-flow combinator is an error here. Upward queries are reversed into call order, so every route is printed caller first and the query's first selector matches the last hop.
+5. For each start, legs are searched in order. `->` and `<-` take exactly one edge. `-->` and `<--` search breadth first over simple paths, shortest first, pruned by a reverse breadth-first distance to the leg's targets. A path stops at the first target it reaches. A middle segment is a waypoint that every route passes through.
+6. Only edges that resolved to a definition are walked. External callees cannot be a step.
+7. `max` (default 12) bounds the whole route in edges. Without `all`, at most `limit` (default 5) routes are kept per start, shortest first. The search stops after 200000 queued paths and sets `truncated`.
+
+Each hop carries its definition, the line where it calls the next hop, and the confidence of the edge that reached it. A guessed edge (ranked candidates, interface dispatch to several types) prints `?`.
+
 ## Verification
 
 Proof-of-concept compiler targeting JavaScript and C:
