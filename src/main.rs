@@ -333,6 +333,39 @@ Constructs with no abstract mapping fall back to raw tree-sitter node kinds.")]
         #[arg(num_args(0..))]
         langs: Vec<String>,
     },
+    /// Walk call or data-flow routes between definitions: ctsq path 'function#main --> function#save'
+    #[command(after_help = "Joins two or more selectors with a call combinator and prints each route
+as an indented tree, every row starting path:line.
+
+  ctsq path 'function#main --> function#save' src/
+  ctsq path 'function#save <-- function#main' src/
+  ctsq path 'function#main --> function#save:not(function#log)' src/
+
+  ->   calls directly       -->  calls eventually
+  <-   called by directly   <--  called by eventually
+
+A query reads one way, downward or upward. Upward queries print in the order
+written, the first selector first. A guessed edge prints ? after the callee.
+Exit codes: 0 routes found, 1 none, 2 usage or query error.")]
+    Path {
+        /// Query with at least one call or data-flow combinator
+        query: String,
+        /// Files or directories to search (default: current directory)
+        #[arg(num_args(0..))]
+        paths: Vec<String>,
+        /// Longest route in hops
+        #[arg(long, default_value = "12")]
+        max: usize,
+        /// Print every route, not just the 5 shortest per start
+        #[arg(long)]
+        all: bool,
+        /// Keep only hops carrying these tags, comma-separated (data-flow queries)
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
+        /// Print each hop's definition body under its row
+        #[arg(long)]
+        body: bool,
+    },
     /// Show where config and model files are read from, or the merged result for a language
     #[command(after_help = "Language mechanics and outside-call models are TOML files, looked up in order:
 repo .ctsq/, then ~/.config/ctsq, then ~/.cache/ctsq, then built-in defaults.
@@ -423,6 +456,9 @@ fn main() {
         Some(Commands::Types { langs }) => {
             types::run(&langs, cli.lang.as_deref());
             return;
+        }
+        Some(Commands::Path { query, paths, max, all, only, body }) => {
+            std::process::exit(run_path(&query, &paths, cli.lang.as_deref(), cli.no_ignore, max, all, &only, body));
         }
         Some(Commands::Config { args }) => {
             std::process::exit(config::run(&args));
@@ -835,6 +871,66 @@ fn run_refs(name: &str, path: &str, lang_override: Option<&str>, no_ignore: bool
                 }
             }
             Err(e) => eprintln!("Runner error in {}: {}", file, e),
+        }
+    }
+}
+
+/// `ctsq path`. Returns the exit code: 0 routes found, 1 none, 2 usage or
+/// query error.
+#[allow(clippy::too_many_arguments)]
+fn run_path(
+    query_str: &str,
+    paths: &[String],
+    lang_override: Option<&str>,
+    no_ignore: bool,
+    max: usize,
+    all: bool,
+    only: &[String],
+    body: bool,
+) -> i32 {
+    let _ = only; // applied to data-flow trees by the flow walk
+    let ast = match query::parse(query_str) {
+        Ok(q) => q,
+        Err(e) => {
+            eprintln!("Parse error: {}", e);
+            return 2;
+        }
+    };
+    let flows = ast.tail.iter().any(|(c, _)| {
+        c.is_semantic()
+            && !matches!(
+                c,
+                query::ast::Combinator::Calls
+                    | query::ast::Combinator::CallsEventually
+                    | query::ast::Combinator::CalledBy
+                    | query::ast::Combinator::CalledByEventually
+            )
+    });
+    if flows {
+        eprintln!("data-flow walking is not available yet");
+        return 2;
+    }
+
+    let default = [".".to_string()];
+    let paths = if paths.is_empty() { &default[..] } else { paths };
+    let jobs: Vec<_> = paths
+        .iter()
+        .flat_map(|p| files::resolve_jobs(p, lang_override, no_ignore))
+        .collect();
+    let store = resolve::TreeStore::build(&jobs);
+    let graph = resolve::graph::build_from_store(&store);
+    let opts = semantic::calls::CallOptions { max, all, ..Default::default() };
+    match semantic::calls::evaluate_calls(&ast, &store, &graph, &opts) {
+        Ok(routes) => {
+            print!(
+                "{}",
+                semantic::print::print_call_routes(&routes, &store, &semantic::print::PrintOpts { body })
+            );
+            if routes.routes.is_empty() { 1 } else { 0 }
+        }
+        Err(e) => {
+            eprintln!("{}", e);
+            2
         }
     }
 }

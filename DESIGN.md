@@ -334,6 +334,18 @@ Evaluation, in order:
 
 Each hop carries its definition, the line where it calls the next hop, and the confidence of the edge that reached it. A guessed edge (ranked candidates, interface dispatch to several types) prints `?`.
 
+## `ctsq path` output
+
+`src/semantic/print.rs` prints call routes. `main.rs` runs `ctsq path '<query>' [paths...]` with `--max N` (default 12), `--all`, `--only <tag,...>` (stored, applied by the data-flow walk) and `--body`.
+
+- Every row is `path:line`, padded, the definition name (`Owner.name` for methods), then `calls <next> at :<line>`. A guessed edge prints `?` after the callee. Two spaces per level, no box characters.
+- Routes with the same start merge into one tree, so a shared prefix prints once and a row lists each callee it reaches. Upward queries print in the order written, the first selector first, and each row says `called by <caller> at :<line>`.
+- `--body` prints each definition body under its row, one level deeper.
+- The trailer is `N route(s)`, then notes for selectors that matched nothing, definitions removed by `:not` and a search stopped at its cap.
+- `print::row(path, line, func, text, tags)` lays out one row, and data-flow trees reuse it.
+- Exit codes: 0 routes found, 1 none, 2 usage or query error. A query with a data-flow combinator prints `data-flow walking is not available yet` and exits 2 until the flow walk lands.
+- `fixtures/.ignore` hides `fixtures/path/` from directory scans of `fixtures/`, so the pinned call graph test keeps its output. Naming `fixtures/path` directly still works.
+
 ## Verification
 
 Proof-of-concept compiler targeting JavaScript and C:
