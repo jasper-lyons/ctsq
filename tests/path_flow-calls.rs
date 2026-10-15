@@ -154,9 +154,9 @@ fn one_hop_and_no_route_exit_1() {
 }
 
 #[test]
-fn backward_and_mixed_queries_exit_2() {
+fn backward_with_no_matching_origin_exits_1_and_mixed_queries_exit_2() {
     let o = path_cmd("function#handle variable#body <== function#log.Printf", &[]);
-    assert_eq!(code(&o), 2);
+    assert_eq!(code(&o), 1);
     let o = path_cmd("function#handle variable#body ==> function#a --> function#b", &[]);
     assert_eq!(code(&o), 2);
 }
