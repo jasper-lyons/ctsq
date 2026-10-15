@@ -1084,6 +1084,17 @@ fn signature_params(list: Node, src: &[u8]) -> Vec<GoParam> {
 /// Result names of a Go function, method or literal node, one per result
 /// position. An unnamed result gives an empty name, so `(string, error)`
 /// gives two empty names and a single result type gives one.
+/// Declared result types of a function node, one per position: `error`
+/// for `(T, error)`. Empty when it has no results.
+pub fn go_result_types(func: Node, src: &[u8]) -> Vec<String> {
+    let Some(r) = func.child_by_field_name("result") else { return vec![] };
+    if r.kind() == "parameter_list" {
+        signature_params(r, src).into_iter().map(|p| p.ty).collect()
+    } else {
+        vec![text(r, src).to_string()]
+    }
+}
+
 pub fn go_result_names(func: Node, src: &[u8]) -> Vec<String> {
     let Some(r) = func.child_by_field_name("result") else { return vec![] };
     if r.kind() == "parameter_list" {
