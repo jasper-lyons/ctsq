@@ -12,6 +12,7 @@ mod report;
 #[cfg(test)]
 mod tests;
 pub mod upward;
+pub mod template;
 pub mod values;
 pub mod widen;
 

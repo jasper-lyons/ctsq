@@ -15,7 +15,7 @@ use tree_sitter::Node;
 use super::print::{plural, row};
 use super::{segment_rows, split_query};
 use crate::config::{self, gomod, LangConfig, Slot};
-use crate::flow::widen;
+use crate::flow::{template, widen};
 use crate::flow::{
     self, upward, analyse_function, analyse_function_with, enclosing_function, start_at, start_in, CallEffect, CallSite,
     EndFn, FlowCtx, FlowResult, Hop, ModelOutside, Module, Outside, Paths, StartKind,
@@ -122,7 +122,7 @@ pub fn evaluate_flows(
     }
     let mut ends: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
     if let Some(t) = tail {
-        for (file, rows) in segment_rows(t, store)? {
+        for (file, rows) in tail_rows(t, store)? {
             ends.insert(file, rows.iter().map(|r| (r.start_byte, r.end_byte)).collect());
         }
     }
@@ -149,6 +149,8 @@ pub fn evaluate_flows(
     let module = Module::build(&files, &cfg.mechanics);
     let mut walk = Walk::new(store, graph, &cfg, &module, &is_end, eventually, opts.max);
     walk.expand = opts.expand;
+    walk.tail = tail;
+    walk.tmpl_mech = config::load(root, "gotmpl").ok().map(|c| c.mechanics);
     let mut groups: Vec<FlowResult> = vec![];
     let mut raw: Vec<FlowResult> = vec![];
 
@@ -369,6 +371,23 @@ fn evaluate_upward(
         out.push_str(&format!("{} cut at --max {}\n", plural(cut, "route"), opts.max));
     }
     Ok(FlowReport { text: out, found })
+}
+
+/// Rows of the end selector. An end that only template files have, such as
+/// `template_action`, is accepted when no template file was scanned: the
+/// template walk matches it against the templates it links.
+fn tail_rows(t: &Query, store: &TreeStore) -> Result<Vec<(String, Vec<crate::runner::MatchRow>)>, String> {
+    match segment_rows(t, store) {
+        Ok(r) => Ok(r),
+        Err(e) => {
+            let mut probe = TreeStore::default();
+            probe.insert("probe.tmpl", "gotmpl", b"{{.}}".to_vec());
+            match segment_rows(t, &probe) {
+                Ok(_) => Ok(vec![]),
+                Err(_) => Err(e),
+            }
+        }
+    }
 }
 
 /// Tag of a call hop the walk did not enter because of `--max`.
@@ -616,6 +635,10 @@ struct Walk<'a> {
     expand: bool,
     /// Interfaces whose widened calls were followed and have outside implementations.
     widened_ifaces: RefCell<Vec<String>>,
+    /// The end selector, matched against linked templates too.
+    tail: Option<&'a Query>,
+    /// Mechanics of the template language, None when it cannot be loaded.
+    tmpl_mech: Option<config::Mechanics>,
 }
 
 impl<'a> Walk<'a> {
@@ -651,6 +674,8 @@ impl<'a> Walk<'a> {
             outside: std::cell::OnceCell::new(),
             expand: false,
             widened_ifaces: RefCell::new(vec![]),
+            tail: None,
+            tmpl_mech: None,
         }
     }
 
@@ -957,6 +982,34 @@ impl<'a> Walk<'a> {
     }
 }
 
+impl Walk<'_> {
+    /// A modelled `Execute` or `ExecuteTemplate` whose data argument is
+    /// tracked: the templates parsed into its receiver are walked with the
+    /// data as `.`, each tree hung under the call. None when the call is not
+    /// one or no template could be linked.
+    fn template_effect(&self, site: &CallSite, file: &str) -> Option<CallEffect> {
+        let mech = self.tmpl_mech.as_ref()?;
+        let method = site.method.as_deref()?;
+        let model = flow::model_key(self.cfg, site).and_then(|k| self.cfg.model(&k)).and_then(|m| m.template.clone());
+        let data_arg = match (model, method) {
+            (Some(t), _) => t.data_arg,
+            (None, "Execute") => 1,
+            (None, "ExecuteTemplate") => 2,
+            _ => return None,
+        };
+        let k = site.tracked_args.iter().position(|&a| a == data_arg)?;
+        let paths = site.arg_paths.get(k).cloned().flatten();
+        let linker = template::Linker { store: self.store, graph: self.graph, cfg: self.cfg };
+        let name_arg = (data_arg == 2).then_some(1);
+        let sets = linker.link(file, site.node, name_arg);
+        if sets.is_empty() {
+            return None;
+        }
+        let trees = sets.iter().flat_map(|s| template::render(s, mech, paths.clone(), self.tail)).collect();
+        Some(CallEffect::Into { name: site.callee.clone(), returns: vec![], writes: vec![], trees })
+    }
+}
+
 /// One assignment to a function-valued variable.
 struct FnAssign {
     file: String,
@@ -1080,6 +1133,9 @@ impl Outside for Walk<'_> {
             return e;
         }
         if let Some(e) = self.callee_effect(site, &file) {
+            return e;
+        }
+        if let Some(e) = self.template_effect(site, &file) {
             return e;
         }
         self.models.effect(site)

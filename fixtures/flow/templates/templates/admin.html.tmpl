@@ -1,0 +1,6 @@
+{{template "layout.html.tmpl" .}}
+{{define "body"}}
+{{range $i, $it := .Items}}
+<p>{{$i}} {{$it.Name}}</p>
+{{end}}
+{{end}}
