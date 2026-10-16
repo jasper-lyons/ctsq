@@ -256,7 +256,7 @@ pub fn evaluate_flows(
         out.push_str(&format!("{} to {}\n", plural(found, "route"), end_tag));
     }
     if cut > 0 {
-        out.push_str(&format!("{} cut at --max {}\n", plural(cut, "route"), opts.max));
+        out.push_str(&format!("{} cut at --max-depth {}\n", plural(cut, "route"), opts.max));
     }
     if through > 0 {
         out.push_str(&format!("{} passed through unmodelled calls\n", plural(through, "route")));
@@ -373,7 +373,7 @@ fn evaluate_upward(
         out.push_str(&format!("{} from {}\n", plural(found, "route"), if found == 1 { "an origin" } else { "origins" }));
     }
     if cut > 0 {
-        out.push_str(&format!("{} cut at --max {}\n", plural(cut, "route"), opts.max));
+        out.push_str(&format!("{} cut at --max-depth {}\n", plural(cut, "route"), opts.max));
     }
     Ok(FlowReport { text: out, found })
 }

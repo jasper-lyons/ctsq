@@ -95,7 +95,7 @@ fn max_depth_cuts_the_walk_into_callers() {
     let o = run(&["path", "function#render param#name <== ", &dir(), "--max-depth", "0"]);
     let t = out(&o);
     assert!(row(&t, "func render(").1.ends_with("stopped: max depth"), "{t}");
-    assert!(t.contains("1 route cut at --max 0"), "{t}");
+    assert!(t.contains("1 route cut at --max-depth 0"), "{t}");
 }
 
 #[test]

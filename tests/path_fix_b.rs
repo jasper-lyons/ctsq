@@ -73,21 +73,21 @@ fn a_flow_cut_by_max_is_tagged_and_counted() {
     let (code, t) = path_cmd("function#start param#s ==> function#Println", &[]);
     assert_eq!(code, Some(1), "{t}");
     assert!(row(&t, "f13(s)").contains("stopped: max depth"), "{t}");
-    assert!(t.contains("\n0 routes to sink\n1 route cut at --max 12\n"), "{t}");
+    assert!(t.contains("\n0 routes to sink\n1 route cut at --max-depth 12\n"), "{t}");
     let (code, t) = path_cmd("function#start param#s ==> function#Println", &["--max-depth", "25"]);
     assert_eq!(code, Some(0), "{t}");
     assert!(t.contains("\n1 route to sink\n"), "{t}");
-    assert!(!t.contains("cut at --max"), "{t}");
+    assert!(!t.contains("cut at --max-depth"), "{t}");
 }
 
 #[test]
 fn a_call_route_cut_by_max_is_reported() {
     let (code, t) = path_cmd("function#start --> function#f20", &[]);
     assert_eq!(code, Some(1), "{t}");
-    assert!(t.contains("0 routes\n1 route cut at --max 12\n"), "{t}");
+    assert!(t.contains("0 routes\n1 route cut at --max-depth 12\n"), "{t}");
     let (code, t) = path_cmd("function#start --> function#f20", &["--max-depth", "20"]);
     assert_eq!(code, Some(0), "{t}");
-    assert!(!t.contains("cut at --max"), "{t}");
+    assert!(!t.contains("cut at --max-depth"), "{t}");
 }
 
 #[test]
