@@ -114,6 +114,9 @@ impl AnyName {
         if fw != fa || iw != numbered(ia) || eq.replace_all(&ow, r#"(#match? @$1 ".")"#) != numbered(oa) || ow.contains("#match?") {
             return None;
         }
+        // Numbered the same way on every compile, the text is the same for
+        // every file, so the runner's query cache builds it once.
+        let query = compiler::CompiledQuery::Scoped { outer: numbered(oa), scope_field: fa.clone(), inner: numbered(ia) };
         Some(AnyName { outer_with: ow, inner: iw, scope_field: fw.clone(), query })
     }
 
