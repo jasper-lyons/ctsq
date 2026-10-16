@@ -130,9 +130,38 @@ pub fn run_rows_on_at(
     body: bool,
     ranges: Option<&[std::ops::Range<usize>]>,
 ) -> Result<Vec<MatchRow>, String> {
+    Ok(run_core(compiled, lang, source, tree, body, ranges, false)?.0)
+}
+
+/// Rows of a scoped query whose outer pattern filters a name (`_n` capture),
+/// each with the text of that name capture. Rows are deduplicated per name,
+/// so filtering them by a name gives exactly what the query with that name in
+/// an `#eq?` predicate gives. The fallback resolver runs one query per file
+/// with a match-anything name instead of one per function.
+pub fn run_rows_named(
+    compiled: &CompiledQuery,
+    lang: &dyn Lang,
+    source: &[u8],
+    tree: &tree_sitter::Tree,
+) -> Result<Vec<(MatchRow, String)>, String> {
+    let (rows, names) = run_core(compiled, lang, source, tree, false, None, true)?;
+    Ok(rows.into_iter().zip(names).collect())
+}
+
+fn run_core(
+    compiled: &CompiledQuery,
+    lang: &dyn Lang,
+    source: &[u8],
+    tree: &tree_sitter::Tree,
+    body: bool,
+    ranges: Option<&[std::ops::Range<usize>]>,
+    by_name: bool,
+) -> Result<(Vec<MatchRow>, Vec<String>), String> {
     if compiled.is_empty() {
-        return Ok(vec![]);
+        return Ok((vec![], vec![]));
     }
+    // Per row, the outer name capture text of a scoped query (empty otherwise).
+    let mut names: Vec<String> = Vec::new();
     let ts_lang = lang.ts_language();
 
     let source_bytes = source;
@@ -274,7 +303,7 @@ pub fn run_rows_on_at(
             // root_node is the container we'll search within — the first non-internal capture,
             // falling back to the first _root capture, falling back to the first capture overall.
             type CapList<'t> = Vec<(String, tree_sitter::Node<'t>)>;
-            let mut outer_data: Vec<(tree_sitter::Node, CapList)> = Vec::new();
+            let mut outer_data: Vec<(tree_sitter::Node, CapList, String)> = Vec::new();
             {
                 let mut cursor = QueryCursor::new();
                 let mut matches =
@@ -309,15 +338,21 @@ pub fn run_rows_on_at(
                         .or_else(|| m.captures.first())
                         .map(|cap| cap.node);
 
+                    let name: Vec<&str> = m
+                        .captures
+                        .iter()
+                        .filter(|cap| outer_cap_names[cap.index as usize].starts_with("_n"))
+                        .map(|cap| cap.node.utf8_text(source_bytes).unwrap_or(""))
+                        .collect();
                     if let Some(root_node) = root {
-                        outer_data.push((root_node, named));
+                        outer_data.push((root_node, named, name.join("\n")));
                     }
                 }
             }
 
             // Phase 2: for each outer node, navigate to scope_field then run inner query.
             // tree-sitter searches all descendants of the scope node automatically.
-            for (outer_root, outer_named) in &outer_data {
+            for (outer_root, outer_named, outer_name) in &outer_data {
                 // An empty scope field means a top-level descendant: search the whole node.
                 let descendant = scope_field.is_empty();
                 let scope_node = if descendant {
@@ -371,7 +406,9 @@ pub fn run_rows_on_at(
                             } else {
                                 format!("<match>:{}: {:?}", loc(cap.node), display)
                             };
+                            names.resize(results.len(), String::new());
                             results.push(make_row(node_text, cap.node, &[]));
+                            names.push(outer_name.clone());
                         }
                     } else {
                         // A descendant row sits on the inner match, not on the head.
@@ -384,17 +421,28 @@ pub fn run_rows_on_at(
                         } else {
                             user_nodes[0].1
                         };
+                        names.resize(results.len(), String::new());
                         results.push(make_row(parts.join(", "), primary, &user_nodes));
+                        names.push(outer_name.clone());
                     }
                 }
             }
         }
     }
+    names.resize(results.len(), String::new());
 
     let mut seen = std::collections::HashSet::new();
-    results.retain(|r| seen.insert(r.node_text.clone()));
+    let mut kept_names = Vec::new();
+    let mut kept = Vec::new();
+    for (r, n) in results.into_iter().zip(names) {
+        let key = if by_name { (n.clone(), r.node_text.clone()) } else { (String::new(), r.node_text.clone()) };
+        if seen.insert(key) {
+            kept.push(r);
+            kept_names.push(n);
+        }
+    }
 
-    Ok(results)
+    Ok((kept, kept_names))
 }
 
 #[cfg(test)]
