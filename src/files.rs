@@ -133,7 +133,71 @@ struct LangTests {
     dirs: Vec<String>,
     /// Scope selectors compiled for this language. A selector the language has
     /// no kind for is left out, with one note on stderr.
-    scopes: Vec<(Box<dyn lang::Lang>, crate::compiler::CompiledQuery)>,
+    scopes: Vec<Scope>,
+}
+
+/// One compiled scope selector, with the literal its name filter needs when
+/// it has one (`runner::literal_anchor`).
+struct Scope {
+    lang: Box<dyn lang::Lang>,
+    query: crate::compiler::CompiledQuery,
+    anchor: Option<String>,
+}
+
+impl Scope {
+    /// Rows of this selector in `source`. With an anchor, a file without the
+    /// literal is not searched (nor parsed, when `tree` is None), and a file
+    /// with it is searched only around each occurrence.
+    fn rows(&self, source: &[u8], tree: Option<&tree_sitter::Tree>) -> Vec<crate::runner::MatchRow> {
+        let spans: Option<Vec<std::ops::Range<usize>>> = self.anchor.as_ref().map(|a| occurrences(source, a.as_bytes()));
+        if spans.as_ref().is_some_and(|s| s.is_empty()) {
+            return vec![];
+        }
+        let parsed;
+        let tree = match tree {
+            Some(t) => t,
+            None => {
+                let mut parser = tree_sitter::Parser::new();
+                if parser.set_language(&self.lang.ts_language()).is_err() {
+                    return vec![];
+                }
+                match parser.parse(source, None) {
+                    Some(t) => {
+                        parsed = t;
+                        &parsed
+                    }
+                    None => return vec![],
+                }
+            }
+        };
+        crate::runner::run_rows_on_at(&self.query, self.lang.as_ref(), source, tree, false, spans.as_deref())
+            .unwrap_or_default()
+    }
+}
+
+/// Byte ranges of every occurrence of `needle` in `hay`.
+fn occurrences(hay: &[u8], needle: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    if needle.is_empty() || hay.len() < needle.len() {
+        return out;
+    }
+    let mut i = 0;
+    while i + needle.len() <= hay.len() {
+        match hay[i..].iter().position(|b| *b == needle[0]) {
+            Some(p) => i += p,
+            None => break,
+        }
+        if i + needle.len() > hay.len() {
+            break;
+        }
+        if &hay[i..i + needle.len()] == needle {
+            out.push(i..i + needle.len());
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Decides, per file and per line, what a command hides, and remembers the
@@ -207,7 +271,8 @@ impl Hider {
                 let l = lang::for_name(lang_name)?;
                 crate::compiler::validate(&ast, l.as_ref(), lang_name).ok()?;
                 let c = crate::compiler::compile(&ast, l.as_ref());
-                Some((l, c))
+                let anchor = crate::runner::literal_anchor(&c, l.as_ref());
+                Some(Scope { lang: l, query: c, anchor })
             });
             match compiled {
                 Some(c) => scopes.push(c),
@@ -317,19 +382,15 @@ impl Hider {
                     }
                 };
                 if let Some(tree) = tree {
-                    for (l, c) in &t.scopes {
-                        if let Ok(rows) = crate::runner::run_rows_on(c, l.as_ref(), source, tree, false) {
-                            add_rows(rows);
-                        }
+                    for s in &t.scopes {
+                        add_rows(s.rows(source, Some(tree)));
                     }
                     ranges.extend(rust_cfg_test_ranges(tree, source));
                 }
             }
         } else {
-            for (l, c) in &t.scopes {
-                if let Ok(rows) = crate::runner::run_rows(c, l.as_ref(), source, false) {
-                    add_rows(rows);
-                }
+            for s in &t.scopes {
+                add_rows(s.rows(source, tree));
             }
         }
         ranges.sort_unstable();
@@ -721,6 +782,26 @@ mod tests {
         assert_eq!(h.site(&named, 1), Some(Hide::Test));
         assert_eq!(h.site(&plain, 1), None);
         let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_named_scope_selector_is_searched_only_where_its_name_occurs() {
+        let l = lang::for_name("rust").unwrap();
+        let ast = crate::query::parse("module#tests").unwrap();
+        let c = crate::compiler::compile(&ast, l.as_ref());
+        assert_eq!(crate::runner::literal_anchor(&c, l.as_ref()).as_deref(), Some("tests"));
+        let any = crate::compiler::compile(&crate::query::parse("module").unwrap(), l.as_ref());
+        assert_eq!(crate::runner::literal_anchor(&any, l.as_ref()), None);
+        assert_eq!(occurrences(b"tests mod tests", b"tests"), vec![0..5, 10..15]);
+        assert!(occurrences(b"test", b"tests").is_empty());
+        // The anchored search finds what a whole-tree search finds.
+        let src = b"// tests\nmod a { mod tests { fn t() {} } }\nfn tests() {}\nmod tests {}\n";
+        let tree = parse_rust(src).unwrap();
+        let s = Scope { lang: lang::for_name("rust").unwrap(), query: c.clone(), anchor: Some("tests".into()) };
+        let lines = |rows: Vec<crate::runner::MatchRow>| rows.iter().map(|r| r.line).collect::<Vec<_>>();
+        let whole = crate::runner::run_rows_on(&c, l.as_ref(), src, &tree, false).unwrap();
+        assert_eq!(lines(s.rows(src, Some(&tree))), lines(whole));
+        assert_eq!(lines(s.rows(src, None)), vec![2, 4]);
     }
 
     #[test]

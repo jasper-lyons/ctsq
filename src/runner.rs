@@ -94,6 +94,42 @@ pub fn run_rows_on(
     tree: &tree_sitter::Tree,
     body: bool,
 ) -> Result<Vec<MatchRow>, String> {
+    run_rows_on_at(compiled, lang, source, tree, body, None)
+}
+
+/// The literal a simple query's single `#eq?` predicate compares a capture
+/// with, when the query has one pattern and no other predicate. Every match of
+/// such a query holds those bytes, so `run_rows_on_at` can search only around
+/// where they occur, and a file without them has no match at all.
+pub fn literal_anchor(compiled: &CompiledQuery, lang: &dyn Lang) -> Option<String> {
+    let CompiledQuery::Simple(text) = compiled else { return None };
+    if text.matches("(#").count() != 1 || text.matches("(#eq? @").count() != 1 {
+        return None;
+    }
+    let q = cached_query(&lang.ts_language(), text).ok()?;
+    if q.pattern_count() != 1 {
+        return None;
+    }
+    let rest = &text[text.find("(#eq? @")? + 7..];
+    let lit = rest.split_once(" \"")?.1.split_once("\")")?.0;
+    if lit.is_empty() || lit.contains(['\\', '"']) {
+        return None;
+    }
+    Some(lit.to_string())
+}
+
+/// `run_rows_on` limited to matches that overlap one of `ranges` (byte ranges
+/// of the source), each searched with its own cursor so the walk skips every
+/// subtree outside it. None searches the whole tree. Scoped queries ignore
+/// the ranges and search the whole tree.
+pub fn run_rows_on_at(
+    compiled: &CompiledQuery,
+    lang: &dyn Lang,
+    source: &[u8],
+    tree: &tree_sitter::Tree,
+    body: bool,
+    ranges: Option<&[std::ops::Range<usize>]>,
+) -> Result<Vec<MatchRow>, String> {
     if compiled.is_empty() {
         return Ok(vec![]);
     }
@@ -165,10 +201,17 @@ pub fn run_rows_on(
     match compiled {
         CompiledQuery::Simple(ts_query) => {
             let query = cached_query(&ts_lang, ts_query).map_err(|e| format!("query error: {e}"))?;
-            let mut cursor = QueryCursor::new();
-            let mut matches = cursor.matches(&query, tree.root_node(), source_bytes);
-
             let capture_names = query.capture_names();
+            let spans: Vec<Option<std::ops::Range<usize>>> = match ranges {
+                Some(r) => r.iter().cloned().map(Some).collect(),
+                None => vec![None],
+            };
+            for span in spans {
+            let mut cursor = QueryCursor::new();
+            if let Some(r) = span {
+                cursor.set_byte_range(r);
+            }
+            let mut matches = cursor.matches(&query, tree.root_node(), source_bytes);
 
             while let Some(m) = matches.next() {
                 let mut parts: Vec<String> = Vec::new();
@@ -215,6 +258,7 @@ pub fn run_rows_on(
                     let primary = user_nodes[0].1;
                     results.push(make_row(parts.join(", "), primary, &user_nodes));
                 }
+            }
             }
         }
 
