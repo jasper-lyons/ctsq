@@ -30,17 +30,55 @@ impl Default for Options {
     }
 }
 
-pub fn run(symbol: &str, path: &str, lang_name: Option<&str>, opts: &Options, no_ignore: bool, hide: &files::HideOpts) {
-    let jobs = files::resolve_jobs(path, lang_name, no_ignore);
-    let mut hider = files::Hider::new(hide);
-    hider.add_jobs(path, &jobs);
-    let (text, found) = report_hiding(symbol, &jobs, opts, &mut hider);
-    print!("{}", text);
-    if !found {
+pub fn run(names: &[String], jobs: &[(String, &'static str)], mut hider: files::Hider, opts: &Options) {
+    let r = report_many(names, jobs, opts, &mut hider);
+    print!("{}", r.out);
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    eprint!("{}", r.err);
+    if r.code != 0 {
         // Nothing resolved, or everything was hidden: exit 1 like -q, def and refs.
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-        std::process::exit(1);
+        std::process::exit(r.code);
+    }
+}
+
+/// `report_hiding` for several names, in order, a blank line between. With one
+/// name the text is exactly `report_hiding`'s. With several, a name that
+/// resolved to nothing prints no block and goes on the `not found:` stderr
+/// line instead. The footer counts every name, once, at the end. The code is 0
+/// when any name showed a definition or a reference.
+pub fn report_many(
+    names: &[String],
+    jobs: &[(String, &'static str)],
+    opts: &Options,
+    hider: &mut files::Hider,
+) -> crate::resolve::NamesOut {
+    let mut hidden = Hidden::default();
+    let mut out = String::new();
+    let mut missing: Vec<String> = Vec::new();
+    let mut any = false;
+    for symbol in names {
+        let before = hidden.tests + hidden.excluded;
+        let (text, found) = body(symbol, jobs, opts, hider, &mut hidden);
+        if found {
+            any = true;
+        } else if hidden.tests + hidden.excluded == before {
+            missing.push(symbol.clone());
+            if names.len() > 1 {
+                continue;
+            }
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&text);
+    }
+    let shown = out.matches("\nDEFINITION ").count();
+    out.push_str(&footer(shown, "definition", &hidden));
+    crate::resolve::NamesOut {
+        out,
+        err: crate::resolve::not_found_line(&missing, jobs),
+        code: if any { 0 } else { 1 },
     }
 }
 
@@ -57,6 +95,7 @@ pub fn report(symbol: &str, jobs: &[(String, &'static str)], opts: &Options) -> 
 /// out, and the footer counting them at the end. The bool is whether it shows
 /// a definition or a reference row. The call graph is still built
 /// over every file, so hiding a test never changes how a call resolves.
+#[cfg(test)]
 pub fn report_hiding(
     symbol: &str,
     jobs: &[(String, &'static str)],

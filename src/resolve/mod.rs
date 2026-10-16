@@ -243,25 +243,71 @@ pub fn resolver_for(lang_name: &str) -> Box<dyn Resolver> {
 
 // ── `ctsq def` ────────────────────────────────────────────────────────────────
 
-/// Entry point for `ctsq def <name-or-expr> <path>`: print resolved
-/// definition locations for a name, qualified path, or method expression.
+/// What a command that takes several names produced: stdout text, stderr text
+/// and the exit code. Each is built as a string so tests can assert on it.
+pub struct NamesOut {
+    pub out: String,
+    pub err: String,
+    pub code: i32,
+}
+
+/// Add the counts in `more` to `into`. Only the test and exclude counts are
+/// summed, since no command that takes several names uses `--max`.
+pub fn merge_hidden(into: &mut crate::footer::Hidden, more: &crate::footer::Hidden) {
+    into.tests += more.tests;
+    into.excluded += more.excluded;
+}
+
+/// The nearest name to `name` among the definitions in `jobs`, as
+/// `x in path:line`, or None when nothing is close.
+pub fn similar_hint(name: &str, jobs: &[(String, &'static str)]) -> Option<String> {
+    let mut pool: Vec<(String, String, usize)> = Vec::new();
+    for (file, lang) in jobs {
+        for (kind, n, line) in crate::tree::collect_def_locs(file, lang) {
+            // A `mod x;` or an import line names a file, not something defined.
+            if !matches!(kind, "mod" | "import" | "use") {
+                pool.push((n, file.clone(), line));
+            }
+        }
+    }
+    let names: Vec<String> = pool.iter().map(|p| p.0.clone()).collect();
+    let near = similar_names(crate::explain::bare_name(name), &names);
+    let first = near.first()?;
+    let (n, file, line) = pool.iter().find(|p| &p.0 == first)?;
+    Some(format!("{} in {}:{}", n, file, line))
+}
+
+/// The one stderr line listing names that did not resolve, with the nearest
+/// name where there is one: `not found: A (similar: a in f.c:3), B`. Empty
+/// when every name resolved.
+pub fn not_found_line(missing: &[String], jobs: &[(String, &'static str)]) -> String {
+    if missing.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = missing
+        .iter()
+        .map(|m| match similar_hint(m, jobs) {
+            Some(h) => format!("{} (similar: {})", m, h),
+            None => m.clone(),
+        })
+        .collect();
+    format!("not found: {}\n", parts.join(", "))
+}
+
+/// Entry point for `ctsq def <name-or-expr>... [path]...`: print resolved
+/// definition locations for names, qualified paths, or method expressions.
 ///
 /// Resolution runs the two steps `explain` runs, in the same order: the
 /// call-graph definition index first, then the `tree` outline. The index only
 /// holds callable definitions, so without the outline step a struct, class,
 /// type alias or top-level variable resolved by `explain` reported nothing here.
 pub fn run_def(
-    expr: &str,
-    path: &str,
-    lang_name: Option<&str>,
-    no_ignore: bool,
-    hide: &crate::files::HideOpts,
+    names: &[String],
+    where_: &str,
+    jobs: &[(String, &'static str)],
+    mut hider: crate::files::Hider,
     scope: Option<crate::scope::Opts>,
 ) {
-    let jobs = crate::files::resolve_jobs(path, lang_name, no_ignore);
-    let mut all_names: Vec<String> = Vec::new();
-    let mut rows = def_rows(expr, &jobs, &mut all_names);
-    // A name that is a glossary term is also searched as each name it maps to.
     let glossary = match crate::config::glossary::load(&std::env::current_dir().unwrap_or_default()) {
         Ok(g) => g,
         Err(e) => {
@@ -269,62 +315,94 @@ pub fn run_def(
             std::process::exit(2);
         }
     };
-    let mut notes: Vec<String> = Vec::new();
-    if let Some(g) = &glossary {
-        for entry in g.lookup(expr, true) {
-            for r in mapped_rows(&entry.names, &jobs) {
-                if !rows.iter().any(|(f, l, _)| *f == r.0 && *l == r.1) {
-                    rows.push(r);
+    let r = def_report(names, where_, jobs, &mut hider, scope, glossary.as_ref());
+    print!("{}", r.out);
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    eprint!("{}", r.err);
+    if r.code != 0 {
+        std::process::exit(r.code);
+    }
+}
+
+/// `run_def` as text. With one name a miss keeps its stdout report. With
+/// several, a miss is only named on the `not found:` line, and the footer
+/// counts everything hidden across all names, once, at the end. The code is 0
+/// when any definition was shown, 1 otherwise.
+pub fn def_report(
+    names: &[String],
+    where_: &str,
+    jobs: &[(String, &'static str)],
+    hider: &mut crate::files::Hider,
+    scope: Option<crate::scope::Opts>,
+    glossary: Option<&crate::config::glossary::Glossary>,
+) -> NamesOut {
+    let mut out = String::new();
+    let mut hidden = crate::footer::Hidden::default();
+    let mut printer = scope.map(|o| crate::scope::Printer::new(o, jobs));
+    let mut shown = 0usize;
+    let mut missing: Vec<String> = Vec::new();
+    for expr in names {
+        let mut all_names: Vec<String> = Vec::new();
+        let mut rows = def_rows(expr, jobs, &mut all_names);
+        // A name that is a glossary term is also searched as each name it maps to.
+        let mut notes: Vec<String> = Vec::new();
+        if let Some(g) = glossary {
+            for entry in g.lookup(expr, true) {
+                for r in mapped_rows(&entry.names, jobs) {
+                    if !rows.iter().any(|(f, l, _)| *f == r.0 && *l == r.1) {
+                        rows.push(r);
+                    }
+                }
+                notes.push(entry.note(&g.file));
+            }
+        }
+        if rows.is_empty() {
+            missing.push(expr.clone());
+            if names.len() == 1 {
+                out.push_str(&format!(
+                    "no definition for '{}' in {} ({} {})\n",
+                    expr,
+                    where_,
+                    jobs.len(),
+                    if jobs.len() == 1 { "file" } else { "files" }
+                ));
+                let similar = similar_names(crate::explain::bare_name(expr), &all_names);
+                if !similar.is_empty() {
+                    out.push_str(&format!("similar names: {}\n", similar.join(", ")));
                 }
             }
-            notes.push(entry.note(&g.file));
+            for n in &notes {
+                out.push_str(&format!("{}\n", n));
+            }
+            continue;
         }
-    }
-    let found_any = !rows.is_empty();
-    let mut hider = crate::files::Hider::new(hide);
-    hider.add_jobs(path, &jobs);
-    let mut hidden = crate::footer::Hidden::default();
-    let rows = hider.keep(rows, |(f, l, _)| (f.clone(), *l), &mut hidden);
-
-    if !found_any {
-        println!(
-            "no definition for '{}' in {} ({} {})",
-            expr,
-            path,
-            jobs.len(),
-            if jobs.len() == 1 { "file" } else { "files" }
-        );
-        let similar = similar_names(crate::explain::bare_name(expr), &all_names);
-        if !similar.is_empty() {
-            println!("similar names: {}", similar.join(", "));
+        let rows = hider.keep(rows, |(f, l, _)| (f.clone(), *l), &mut hidden);
+        shown += rows.len();
+        for (file, line, conf) in rows {
+            let line_text = std::fs::read_to_string(&file)
+                .ok()
+                .and_then(|s| s.lines().nth(line.saturating_sub(1)).map(|l| l.trim().to_string()))
+                .unwrap_or_default();
+            let mark = if conf == Confidence::Guess { "  ?" } else { "" };
+            out.push_str(&format!("{}:{}: {}{}\n", file, line, line_text, mark));
+            if let Some(p) = printer.as_mut() {
+                out.push_str(&p.def_rows(&file, line, ""));
+            }
         }
+        // The glossary line comes last before the footer.
         for n in &notes {
-            println!("{}", n);
+            out.push_str(&format!("{}\n", n));
         }
-        std::process::exit(1);
-    }
-
-    let shown = rows.len();
-    let mut printer = scope.map(|o| crate::scope::Printer::new(o, &jobs));
-    for (file, line, conf) in rows {
-        let line_text = std::fs::read_to_string(&file)
-            .ok()
-            .and_then(|s| s.lines().nth(line.saturating_sub(1)).map(|l| l.trim().to_string()))
-            .unwrap_or_default();
-        let mark = if conf == Confidence::Guess { "  ?" } else { "" };
-        println!("{}:{}: {}{}", file, line, line_text, mark);
-        if let Some(p) = printer.as_mut() {
-            print!("{}", p.def_rows(&file, line, ""));
-        }
-    }
-    // The glossary line comes last before the footer.
-    for n in &notes {
-        println!("{}", n);
     }
     // Every definition hidden: the footer says where they are, and exit 1.
-    print!("{}", crate::footer::tail(shown, "definition", &hidden, scope.is_some()));
-    if shown == 0 {
-        std::process::exit(1);
+    if missing.len() < names.len() {
+        out.push_str(&crate::footer::tail(shown, "definition", &hidden, scope.is_some()));
+    }
+    NamesOut {
+        out,
+        err: not_found_line(&missing, jobs),
+        code: if shown == 0 { 1 } else { 0 },
     }
 }
 
@@ -544,7 +622,7 @@ pub fn similar_names(name: &str, pool: &[String]) -> Vec<String> {
         .filter(|n| {
             let low = n.to_lowercase();
             low.len() >= 3
-                && low != needle
+                && n.as_str() != name
                 && (low.contains(&needle) || needle.contains(&low))
         })
         .cloned()
@@ -771,5 +849,92 @@ mod tests {
     fn similar_names_skips_the_exact_name() {
         let pool = vec!["helper".to_string()];
         assert!(similar_names("helper", &pool).is_empty());
+    }
+}
+
+
+#[cfg(test)]
+mod multi_name_tests {
+    use super::*;
+    use crate::files::Hider;
+
+    fn jobs() -> Vec<(String, &'static str)> {
+        vec![(format!("{}/fixtures/example.go", env!("CARGO_MANIFEST_DIR")), "go")]
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn def_answers_each_name_in_order_and_lists_the_miss_on_stderr() {
+        let r = def_report(&names(&["NewServer", "Missing", "main"]), "x", &jobs(), &mut Hider::none(), None, None);
+        let rows: Vec<&str> = r.out.lines().collect();
+        assert_eq!(rows.len(), 2, "{}", r.out);
+        assert!(rows[0].contains("example.go:14:"), "{}", r.out);
+        assert!(rows[1].contains("example.go:18:"), "{}", r.out);
+        assert_eq!(r.err, "not found: Missing\n");
+        assert_eq!(r.code, 0);
+    }
+
+    #[test]
+    fn def_with_one_missing_name_keeps_its_report_and_exits_1() {
+        let r = def_report(&names(&["Missing"]), "somewhere", &jobs(), &mut Hider::none(), None, None);
+        assert!(r.out.starts_with("no definition for 'Missing' in somewhere (1 file)\n"), "{}", r.out);
+        assert_eq!(r.err, "not found: Missing\n");
+        assert_eq!(r.code, 1);
+    }
+
+    #[test]
+    fn def_with_several_misses_exits_1_and_prints_only_the_stderr_line() {
+        let r = def_report(&names(&["Nope", "Nada"]), "x", &jobs(), &mut Hider::none(), None, None);
+        assert_eq!(r.out, "");
+        assert_eq!(r.err, "not found: Nope, Nada\n");
+        assert_eq!(r.code, 1);
+    }
+
+    #[test]
+    fn a_near_name_is_offered_with_its_place() {
+        let hint = similar_hint("newserver", &jobs()).unwrap();
+        assert!(hint.starts_with("NewServer in "), "{}", hint);
+        assert!(hint.ends_with("example.go:14"), "{}", hint);
+        let line = not_found_line(&names(&["newserver", "Zed"]), &jobs());
+        assert!(line.starts_with("not found: newserver (similar: NewServer in "), "{}", line);
+        assert!(line.ends_with(", Zed\n"), "{}", line);
+        assert_eq!(not_found_line(&[], &jobs()), "");
+    }
+
+    #[test]
+    fn callers_report_many_skips_a_missing_name_and_still_exits_0() {
+        let up = crate::calltree::Direction::Up;
+        let r = crate::calltree::report_many(up, &names(&["NewServer", "Missing"]), &jobs(), 3, &mut Hider::none(), None);
+        assert!(r.out.starts_with("NewServer()\n"), "{}", r.out);
+        assert!(!r.out.contains("Missing"), "{}", r.out);
+        assert_eq!(r.err, "not found: Missing\n");
+        assert_eq!(r.code, 0);
+        let none = crate::calltree::report_many(up, &names(&["Missing"]), &jobs(), 3, &mut Hider::none(), None);
+        assert_eq!(none.out, "Missing()\n");
+        assert_eq!(none.code, 1);
+    }
+
+    #[test]
+    fn callers_report_many_separates_names_with_a_blank_line() {
+        let up = crate::calltree::Direction::Up;
+        let r = crate::calltree::report_many(up, &names(&["NewServer", "Start"]), &jobs(), 3, &mut Hider::none(), None);
+        assert!(r.out.contains("\n\nStart()"), "{}", r.out);
+        assert_eq!(r.err, "");
+    }
+
+    #[test]
+    fn explain_report_many_answers_each_name_and_names_the_miss() {
+        let opts = crate::explain::Options::default();
+        let r = crate::explain::report_many(&names(&["NewServer", "Missing"]), &jobs(), &opts, &mut Hider::none());
+        assert!(r.out.starts_with("SYMBOL NewServer (1 definition)\n"), "{}", r.out);
+        assert!(!r.out.contains("SYMBOL Missing"), "{}", r.out);
+        assert_eq!(r.err, "not found: Missing\n");
+        assert_eq!(r.code, 0);
+        let one = crate::explain::report_many(&names(&["Missing"]), &jobs(), &opts, &mut Hider::none());
+        assert!(one.out.starts_with("SYMBOL Missing (no definition resolved)\n"), "{}", one.out);
+        assert_eq!(one.code, 1);
     }
 }

@@ -231,11 +231,11 @@ fixtures/scope/Asset.tsx:11: const saveAssetNow = () => props.asset  ?
 
 ```
 ctsq -q 'id#hide_rows' --scope src/
-src/main.rs:961: hide_rows(&mut hider, file, &source, rows, true, &mut hidden)
-  in src/main.rs:613-1032  fn main() {
-src/main.rs:1037: fn hide_rows(
-src/main.rs:1200: for r in &hide_rows(&mut hider, file, &source, rows, false, &mut hidden) {
-  in src/main.rs:1162-1217  fn run_refs(
+src/main.rs:998: hide_rows(&mut hider, file, &source, rows, true, &mut hidden)
+  in src/main.rs:645-1069  fn main() {
+src/main.rs:1074: fn hide_rows(
+src/main.rs:1366: for r in &hide_rows(&mut hider, file, &source, rows, false, &mut name_hidden) {
+  in src/main.rs:1326-1391  fn run_refs(
 3 matches
 ```
 
@@ -350,21 +350,35 @@ src/pipeline.go:5: func Pipeline() error {
 .ctsq/glossary.toml:2: "pipeline page" also searched as Pipeline
 ```
 
+### 20. Several names in one call
+
+Question: where are `fmt_tokens` and `count_items` defined, and is `Nothingness` anywhere? One call answers each name in order. `def`, `refs`, `callers`, `callees` and `explain` take names first and then paths, like `git log NAME -- PATH`.
+
+```
+ctsq def fmt_tokens count_items Nothingness src/
+src/tree.rs:90: fn fmt_tokens(n: usize) -> String {
+src/tree.rs:98: fn count_items(items: &[Item]) -> usize {
+not found: Nothingness
+[exit 0]
+```
+
+The names that did not resolve are listed on one `not found:` line on stderr, with `(similar: x in path:line)` after a name when a near name exists. The exit is 0 when any name resolved and 1 when none did, so a chain of lookups no longer looks failed because one name missed. The test footer, if any, counts all names once at the end. An argument that exists on disk is a path, an argument with a `/` that does not exist prints `no such file: X (did you mean Y)` and is dropped, and `--` makes everything after it a path. A name that is also a file or directory here, such as `src`, is a usage error (exit 2) until you write `ctsq def src -- lib/`. For `-q` a regex name filter already covers several names: `*function#/^(A|B)$/`. Next: `ctsq explain fmt_tokens count_items src/`.
+
 ## Reference
 
 ## Subcommands
 
 ```
-ctsq explain <sym> [path]          what a symbol is and how it is used (start here)
+ctsq explain <sym>... [path]...    what a symbol is and how it is used (start here)
 ctsq -q '<query>' [FILE ...]       search (default)
 ctsq files -q A -q B <path>        files where every one of the queries matches
 ctsq example '<code>' -l <lang>    derive queries from an example snippet (query-by-example)
 ctsq tree <file>                   structural outline of a file
-ctsq callers <fn> <path>           who calls this function (walk up the call chain)
-ctsq callees <fn> <path>           what this function calls (walk down the call chain)
+ctsq callers <fn>... [path]...     who calls this function (walk up the call chain)
+ctsq callees <fn>... [path]...     what this function calls (walk down the call chain)
 ctsq callgraph <path>              full call graph (DOT; --format edges for plain pairs)
-ctsq def <name> <path>             resolve a name to its definition location(s)
-ctsq refs <name> <path>            all usage sites of a name (complement of def)
+ctsq def <name>... [path]...      resolve a name to its definition location(s)
+ctsq refs <name>... [path]...      all usage sites of a name (complement of def)
 ctsq scopeof <path:line> ...       the function or class holding each line, with its body (reverse of def)
 ctsq find [<query> [key]]          list the named queries (route, text, error ...) that apply here, or run one
 ctsq imports <file> <path>         what this file imports (forward dependency tree)
@@ -551,8 +565,8 @@ the scope's body follows.
 
 ```bash
 ctsq -q 'id#hide_rows' --scope src/
-# src/main.rs:961: hide_rows(&mut hider, file, &source, rows, true, &mut hidden)
-#   in src/main.rs:613-1032  fn main() {
+# src/main.rs:998: hide_rows(&mut hider, file, &source, rows, true, &mut hidden)
+#   in src/main.rs:645-1069  fn main() {
 ```
 
 ### --tests and --exclude

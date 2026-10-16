@@ -13,7 +13,7 @@
   - files where several names occur: `ctsq files -q 'id#A' -q 'id#B' src/`
   - where UI text, a label, a route or a logged error message lives: `ctsq find text 'Welcome back'`, `ctsq find label`, `ctsq find route /path` and `ctsq find error 'the message as logged'` name the component or function that holds it, and `find error` reads %s and %w in the code as wildcards. A repo `.ctsq/glossary.toml` maps product words to code names for `find`, `def` and misses
   - which component serves a route, or another framework question: `ctsq find` lists the named queries that apply in this directory, then `ctsq find route /path` prints each route's `path:LINE`, key, component and its definition. A miss names the query file, override it in `.ctsq/queries/`
-  - where is it defined: `ctsq def Name src/`. Functions that use a constant: `ctsq -q '(*function @f).body(id#CONST)' file.cpp`
+  - where is it defined: `ctsq def Name src/`, or several at once: `ctsq def A B C src/` (a miss is named on stderr, exit 0 if any resolved). Functions that use a constant: `ctsq -q '(*function @f).body(id#CONST)' file.cpp`
   - tests are hidden by default and counted on the last line, `hidden: N in tests (--tests)`. Before deleting or renaming a name, rerun with `--tests` to see every use. `--exclude GLOB` hides more paths
   - restrict by language with `-l cpp`. Unsure of the query syntax: `ctsq example '$X.send(msg)' -l js`
 - prefer mdq over cat/sed/grep for any markdown file (.md): run `mdq tree` first, then `mdq section` for the part you need, never read a markdown file whole to find one section:

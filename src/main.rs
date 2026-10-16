@@ -112,6 +112,9 @@ EXAMPLES (a question as a comment, the call, then the next call)
   # Who calls it? Which files mention both names?
   ctsq callers count_items src/
   ctsq files -q 'id#DefIndex' -q 'id#CallGraph' src/
+  # Several names in one call, names first, then paths. A miss is named on stderr.
+  ctsq def fmt_tokens count_items Missing src/
+  ctsq explain fmt_tokens -- src/
   # Which function or class holds each hit? --scope adds a row under it, --body the scope's body.
   ctsq -q 'id#hide_rows' --scope src/
   ctsq def saveAssetNow fixtures/scope --scope
@@ -155,6 +158,8 @@ SUBCOMMANDS
   ctsq callgraph src/ --format edges    full call graph as plain caller -> callee pairs
   ctsq def helper src/                  where is this function defined (file:line)
   ctsq def Foo::method src/             resolve a qualified path or method to its definition
+  ctsq def A B C src/                   def, refs, callers, callees and explain take <NAME>... [PATH]...
+                                        a name that is also a file needs --: ctsq def src -- lib/
   ctsq scopeof src/a.rs:40 src/b.rs:9   the reverse of def: the function or class holding each line, with its body
   ctsq files -q 'id#A' -q 'id#B' src/   files where every one of several queries matches
   ctsq find                             the named queries (route, ...) that apply in this directory
@@ -266,13 +271,21 @@ impl ScopeArgs {
 #[derive(Subcommand)]
 enum Commands {
     /// Everything about a symbol in one call: definition bodies, callers, callees, remaining references
-    #[command(after_help = "Answers \"what is this and how is it used\" without follow-up reads.
+    #[command(override_usage = "ctsq explain <NAME>... [PATH]... [OPTIONS]", after_help = "Answers \"what is this and how is it used\" without follow-up reads.
 Composes def, callers, callees and an id#Symbol scan into one report.
 
   ctsq explain NewServer fixtures/
   ctsq explain Server.Start src/ --depth 2
   ctsq explain BigFunction src/ --max-lines 20
   ctsq explain Config src/ --no-body
+  ctsq explain NewServer Config Missing src/
+  ctsq explain NewServer -- fixtures/
+
+Names come first, then paths (default: the current directory). An argument
+that exists on disk is a path. -- makes everything after it a path, and is
+needed when a name is also the name of a file or directory here. Each name is
+answered in order. Names that did not resolve are listed on stderr as one
+`not found:` line, and the exit is 0 when any name resolved.
 
 Sections, in order: DEFINITION (file:line plus the full body text),
 CALLERS, CALLEES (call site, the function on the other end, where it is
@@ -282,11 +295,9 @@ its own `sig:` line, and a truncated body keeps the signature as the first
 line it prints. When the symbol resolves to nothing, the plain id#Symbol
 matches are listed instead.")]
     Explain {
-        /// Symbol name, qualified path (a::b::f, Foo::method) or method expr (x.method)
-        symbol: String,
-        /// File or directory to search (default: current directory)
-        #[arg(default_value = ".")]
-        path: String,
+        /// Names (symbol, a::b::f, Foo::method or x.method) then files or directories to search (default: .)
+        #[arg(num_args(1..), required = true, value_name = "NAME_OR_PATH")]
+        args: Vec<String>,
         /// Levels of callers and callees to walk
         #[arg(long, default_value = "1")]
         depth: usize,
@@ -316,11 +327,16 @@ There is no --body: `tree` is the outline. For one entry's body use
         body: bool,
     },
     /// Show what calls a given function (walk up the call chain)
+    #[command(override_usage = "ctsq callers <NAME>... [PATH]... [OPTIONS]", after_help = "Several names are answered in order. Names come first, then paths (default:
+the current directory), and -- forces what follows to be paths. Names that did
+not resolve go on one `not found:` stderr line, and the exit is 0 when any did.
+
+  ctsq callers count_items src/
+  ctsq callers report_scoped hide_rows src/")]
     Callers {
-        /// Function name to trace
-        function: String,
-        /// File or directory to search
-        path: String,
+        /// Function names to trace, then files or directories to search (default: .)
+        #[arg(num_args(1..), required = true, value_name = "NAME_OR_PATH")]
+        args: Vec<String>,
         /// Maximum depth to traverse
         #[arg(long, default_value = "3")]
         depth: usize,
@@ -328,11 +344,16 @@ There is no --body: `tree` is the outline. For one entry's body use
         scope: ScopeArgs,
     },
     /// Show what a function calls (walk down the call chain)
+    #[command(override_usage = "ctsq callees <NAME>... [PATH]... [OPTIONS]", after_help = "Several names are answered in order. Names come first, then paths (default:
+the current directory), and -- forces what follows to be paths. Names that did
+not resolve go on one `not found:` stderr line, and the exit is 0 when any did.
+
+  ctsq callees count_items src/
+  ctsq callees report_scoped hide_rows src/")]
     Callees {
-        /// Function name to trace
-        function: String,
-        /// File or directory to search
-        path: String,
+        /// Function names to trace, then files or directories to search (default: .)
+        #[arg(num_args(1..), required = true, value_name = "NAME_OR_PATH")]
+        args: Vec<String>,
         /// Maximum depth to traverse
         #[arg(long, default_value = "3")]
         depth: usize,
@@ -365,15 +386,22 @@ in query order as the trailing column.
         scope: ScopeArgs,
     },
     /// Resolve a name to its definition location(s)
-    #[command(after_help = "With --scope each definition gets a row under it naming the scope that
+    #[command(override_usage = "ctsq def <NAME>... [PATH]... [OPTIONS]", after_help = "With --scope each definition gets a row under it naming the scope that
 holds it, so a name defined inside several components tells them apart:
 
-  ctsq def saveAssetNow src/ --scope")]
+  ctsq def saveAssetNow src/ --scope
+
+Several names are answered in order. Names come first, then paths (default:
+the current directory). An argument that exists on disk is a path, -- forces
+what follows to be paths, and a name that is also a file or directory here
+needs the --. Names that did not resolve go on one `not found:` stderr line,
+with the nearest name where there is one, and the exit is 0 when any did:
+
+  ctsq def fmt_tokens count_items Missing src/")]
     Def {
-        /// Name, qualified path (a::b::f, Foo::method) or method expr (x.method)
-        name_or_expr: String,
-        /// File or directory to search
-        path: String,
+        /// Names (a name, a::b::f, Foo::method or x.method) then files or directories to search (default: .)
+        #[arg(num_args(1..), required = true, value_name = "NAME_OR_PATH")]
+        args: Vec<String>,
         #[command(flatten)]
         scope: ScopeArgs,
     },
@@ -452,11 +480,15 @@ nothing did, 2 for an unknown query or a query file that does not compile.")]
         key: Option<String>,
     },
     /// Find all usage sites of a name (complement of def)
+    #[command(override_usage = "ctsq refs <NAME>... [PATH]... [OPTIONS]", after_help = "Several names are answered in order. Names come first, then paths (default:
+the current directory), and -- forces what follows to be paths. Names that did
+not resolve go on one `not found:` stderr line, and the exit is 0 when any did.
+
+  ctsq refs fmt_tokens count_items src/")]
     Refs {
-        /// Identifier name to find references to
-        name: String,
-        /// File or directory to search
-        path: String,
+        /// Identifier names to find references to, then files or directories to search (default: .)
+        #[arg(num_args(1..), required = true, value_name = "NAME_OR_PATH")]
+        args: Vec<String>,
         #[command(flatten)]
         scope: ScopeArgs,
     },
@@ -616,9 +648,10 @@ fn main() {
     let hide = files::HideOpts { tests: cli.tests, exclude: cli.exclude.clone() };
 
     match cli.command {
-        Some(Commands::Explain { symbol, path, depth, max_lines, no_body }) => {
+        Some(Commands::Explain { args, depth, max_lines, no_body }) => {
             let opts = explain::Options { depth, max_lines, no_body };
-            explain::run(&symbol, &path, cli.lang.as_deref(), &opts, cli.no_ignore, &hide);
+            let t = targets(&args, "explain", cli.lang.as_deref(), cli.no_ignore, &hide);
+            explain::run(&t.names, &t.jobs, t.hider, &opts);
             return;
         }
         Some(Commands::Tree { paths, body }) => {
@@ -659,12 +692,14 @@ fn main() {
             }
             return;
         }
-        Some(Commands::Callers { function, path, depth, scope }) => {
-            calltree::callers(&function, &path, cli.lang.as_deref(), depth, cli.no_ignore, &hide, scope.opts());
+        Some(Commands::Callers { args, depth, scope }) => {
+            let t = targets(&args, "callers", cli.lang.as_deref(), cli.no_ignore, &hide);
+            calltree::callers(&t.names, &t.jobs, t.hider, depth, scope.opts());
             return;
         }
-        Some(Commands::Callees { function, path, depth, scope }) => {
-            calltree::callees(&function, &path, cli.lang.as_deref(), depth, cli.no_ignore, &hide, scope.opts());
+        Some(Commands::Callees { args, depth, scope }) => {
+            let t = targets(&args, "callees", cli.lang.as_deref(), cli.no_ignore, &hide);
+            calltree::callees(&t.names, &t.jobs, t.hider, depth, scope.opts());
             return;
         }
         Some(Commands::Callgraph { path, format }) => {
@@ -675,8 +710,9 @@ fn main() {
             cooccur::run(&query, &path, cli.lang.as_deref(), cli.no_ignore, &hide, scope.opts());
             return;
         }
-        Some(Commands::Def { name_or_expr, path, scope }) => {
-            resolve::run_def(&name_or_expr, &path, cli.lang.as_deref(), cli.no_ignore, &hide, scope.opts());
+        Some(Commands::Def { args, scope }) => {
+            let t = targets(&args, "def", cli.lang.as_deref(), cli.no_ignore, &hide);
+            resolve::run_def(&t.names, &t.where_, &t.jobs, t.hider, scope.opts());
             return;
         }
         Some(Commands::Scopeof { coords, up, siblings, callers, block, budget }) => {
@@ -707,8 +743,9 @@ fn main() {
         Some(Commands::Find { query, key }) => {
             std::process::exit(find::run(query.as_deref(), key.as_deref(), cli.no_ignore, &hide));
         }
-        Some(Commands::Refs { name, path, scope }) => {
-            run_refs(&name, &path, cli.lang.as_deref(), cli.no_ignore, &hide, scope.opts());
+        Some(Commands::Refs { args, scope }) => {
+            let t = targets(&args, "refs", cli.lang.as_deref(), cli.no_ignore, &hide);
+            run_refs(&t.names, &t.jobs, t.hider, scope.opts());
             return;
         }
         Some(Commands::Imports { file, path, depth }) => {
@@ -1159,59 +1196,196 @@ fn with_path(display: &str, node_text: &str) -> String {
     }
 }
 
-fn run_refs(
-    name: &str,
-    path: &str,
+/// What `def`, `refs`, `callers`, `callees` and `explain` were asked about: the
+/// names, the files under the paths given, and a `Hider` that knows which
+/// search root each file came from.
+struct Targets {
+    names: Vec<String>,
+    /// The paths as typed, joined by spaces, for messages.
+    where_: String,
+    jobs: Vec<(String, &'static str)>,
+    hider: files::Hider,
+}
+
+/// The arguments split into names and paths. `dropped` holds the path-like
+/// arguments that do not exist.
+#[derive(Debug, PartialEq)]
+struct NamesAndPaths {
+    names: Vec<String>,
+    paths: Vec<String>,
+    dropped: Vec<String>,
+}
+
+/// A name a person would type as a symbol: segments of letters, digits, `_`
+/// and `$`, joined by `::`. A file such as `main.rs` is not one, so it is read
+/// as a path without question.
+fn identifier_like(s: &str) -> bool {
+    !s.is_empty()
+        && s.split("::").all(|seg| {
+            !seg.is_empty()
+                && !seg.starts_with(|c: char| c.is_ascii_digit())
+                && seg.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+        })
+}
+
+/// Git-style split of `NAME... [PATH]...`. `forced` is how many trailing
+/// arguments came after `--`.
+///
+/// Without `--`, an argument that exists on disk is a path, a missing one with
+/// a `/` is a path that is not there (dropped), and any other is a name. An
+/// argument that is both an identifier-like name and an existing path is
+/// ambiguous when it is the first argument, which is an error that points at
+/// `--`. With `--`, everything
+/// before it is a name and everything after it is a path, existing or not.
+fn split_names_paths(
+    cmd: &str,
+    args: &[String],
+    forced: usize,
+    exists: impl Fn(&str) -> bool,
+) -> Result<NamesAndPaths, String> {
+    let split = args.len().saturating_sub(forced);
+    let mut r = NamesAndPaths { names: vec![], paths: vec![], dropped: vec![] };
+    for (i, a) in args.iter().enumerate() {
+        if i >= split {
+            if exists(a) { r.paths.push(a.clone()) } else { r.dropped.push(a.clone()) }
+        } else if forced > 0 {
+            r.names.push(a.clone());
+        } else if exists(a) {
+            // The first argument is where a name goes, so one that is also a
+            // file or directory here could be either. Later ones are paths.
+            if i == 0 && identifier_like(a) {
+                return Err(format!(
+                    "{a} is both a name and a path here, put -- before the paths: ctsq {cmd} {a} -- PATH"
+                ));
+            }
+            r.paths.push(a.clone());
+        } else if a.contains('/') {
+            r.dropped.push(a.clone());
+        } else {
+            r.names.push(a.clone());
+        }
+    }
+    if r.names.is_empty() {
+        return Err(format!("{cmd} needs at least one name, usage: ctsq {cmd} <NAME>... [PATH]..."));
+    }
+    Ok(r)
+}
+
+/// How many arguments follow the first `--` on the command line. clap drops
+/// the `--` itself, so this is the only place that still sees it.
+fn args_after_double_dash() -> usize {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    match argv.iter().position(|a| a == "--") {
+        Some(i) => argv.len() - i - 1,
+        None => 0,
+    }
+}
+
+/// Split the arguments, report missing paths on stderr, and find the files.
+/// A usage error exits 2. When every path given was missing, exits 1.
+fn targets(
+    args: &[String],
+    cmd: &str,
     lang_override: Option<&str>,
     no_ignore: bool,
     hide: &files::HideOpts,
+) -> Targets {
+    let split = match split_names_paths(cmd, args, args_after_double_dash(), |p| std::path::Path::new(p).exists()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(2);
+        }
+    };
+    for d in &split.dropped {
+        eprintln!("{}", miss::no_such_file(d));
+    }
+    let paths = if split.paths.is_empty() {
+        if !split.dropped.is_empty() {
+            std::process::exit(1);
+        }
+        vec![".".to_string()]
+    } else {
+        split.paths
+    };
+    let mut hider = files::Hider::new(hide);
+    let mut jobs: Vec<(String, &'static str)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for p in &paths {
+        let found = files::resolve_jobs(p, lang_override, no_ignore);
+        hider.add_jobs(p, &found);
+        for j in found {
+            if seen.insert(j.0.clone()) {
+                jobs.push(j);
+            }
+        }
+    }
+    Targets { names: split.names, where_: paths.join(" "), jobs, hider }
+}
+
+fn run_refs(
+    names: &[String],
+    jobs: &[(String, &'static str)],
+    mut hider: files::Hider,
     scope_opts: Option<scope::Opts>,
 ) {
-    let mut scopes = scope::Scopes::new();
-    let query_str = format!("id#{}", name);
-    let ast = match query::parse(&query_str) {
-        Ok(q) => q,
-        Err(e) => { eprint!("{}", miss::query_error_report(&query_str, &e)); std::process::exit(2); }
-    };
-
-    let jobs = files::resolve_jobs(path, lang_override, no_ignore);
-    if jobs.is_empty() {
-        return;
+    let mut asts = Vec::new();
+    for name in names {
+        let query_str = format!("id#{}", name);
+        match query::parse(&query_str) {
+            Ok(q) => asts.push(q),
+            Err(e) => { eprint!("{}", miss::query_error_report(&query_str, &e)); std::process::exit(2); }
+        }
     }
-    let mut hider = files::Hider::new(hide);
-    hider.add_jobs(path, &jobs);
+    if jobs.is_empty() {
+        eprint!("{}", resolve::not_found_line(names, jobs));
+        std::process::exit(1);
+    }
+    let mut scopes = scope::Scopes::new();
     let mut hidden = footer::Hidden::default();
     let mut shown = 0usize;
-    let mut compiled_cache: HashMap<&'static str, (Box<dyn lang::Lang>, compiler::CompiledQuery)> =
-        HashMap::new();
+    let mut missing: Vec<String> = Vec::new();
 
-    for (file, lang_name) in &jobs {
-        let (lang_box, compiled) = compiled_cache.entry(lang_name).or_insert_with(|| {
-            let l = lang::for_name(lang_name).expect("lang_name always valid here");
-            let c = compiler::compile(&ast, l.as_ref());
-            (l, c)
-        });
-        let source = match std::fs::read(file) {
-            Ok(s) => s,
-            Err(e) => { eprintln!("Failed to read {}: {}", file, e); continue; }
-        };
-        match runner::run_rows(compiled, lang_box.as_ref(), &source, false) {
-            Ok(rows) => {
-                for r in &hide_rows(&mut hider, file, &source, rows, false, &mut hidden) {
-                    shown += 1;
-                    println!("{}", with_path(file, &r.node_text));
-                    if let Some(o) = scope_opts {
-                        if let Some(s) = scopes.hit(file, lang_name, &source, r.start_byte) {
-                            print!("{}", scope::render(&s, &source, o.body, ""));
+    for (name, ast) in names.iter().zip(&asts) {
+        let mut name_hidden = footer::Hidden::default();
+        let shown_before = shown;
+        let mut compiled_cache: HashMap<&'static str, (Box<dyn lang::Lang>, compiler::CompiledQuery)> =
+            HashMap::new();
+        for (file, lang_name) in jobs {
+            let (lang_box, compiled) = compiled_cache.entry(lang_name).or_insert_with(|| {
+                let l = lang::for_name(lang_name).expect("lang_name always valid here");
+                let c = compiler::compile(ast, l.as_ref());
+                (l, c)
+            });
+            let source = match std::fs::read(file) {
+                Ok(s) => s,
+                Err(e) => { eprintln!("Failed to read {}: {}", file, e); continue; }
+            };
+            match runner::run_rows(compiled, lang_box.as_ref(), &source, false) {
+                Ok(rows) => {
+                    for r in &hide_rows(&mut hider, file, &source, rows, false, &mut name_hidden) {
+                        shown += 1;
+                        println!("{}", with_path(file, &r.node_text));
+                        if let Some(o) = scope_opts {
+                            if let Some(s) = scopes.hit(file, lang_name, &source, r.start_byte) {
+                                print!("{}", scope::render(&s, &source, o.body, ""));
+                            }
                         }
                     }
                 }
+                Err(e) => eprintln!("Runner error in {}: {}", file, e),
             }
-            Err(e) => eprintln!("Runner error in {}: {}", file, e),
         }
+        if shown == shown_before && !name_hidden.any() {
+            missing.push(name.clone());
+        }
+        resolve::merge_hidden(&mut hidden, &name_hidden);
     }
     print!("{}", footer::tail(shown, "reference", &hidden, scope_opts.is_some()));
-    if shown == 0 && hidden.any() {
+    eprint!("{}", resolve::not_found_line(&missing, jobs));
+    if shown == 0 {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
         std::process::exit(1);
     }
 }
@@ -1313,5 +1487,80 @@ fn require_lang(name: &str) -> Box<dyn lang::Lang> {
             eprintln!("Unknown language: {}. Supported: c, cpp, javascript, python, ruby, rust, go", name);
             std::process::exit(1);
         }
+    }
+}
+
+
+#[cfg(test)]
+mod arg_tests {
+    use super::*;
+
+    fn v(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `src/` and `lib.rs` exist, nothing else does, and `src` is a directory name.
+    fn exists(p: &str) -> bool {
+        matches!(p, "src/" | "src" | "lib.rs" | "Makefile")
+    }
+
+    #[test]
+    fn names_then_paths() {
+        let r = split_names_paths("def", &v(&["A", "B", "src/"]), 0, exists).unwrap();
+        assert_eq!(r.names, v(&["A", "B"]));
+        assert_eq!(r.paths, v(&["src/"]));
+        assert!(r.dropped.is_empty());
+    }
+
+    #[test]
+    fn a_file_with_a_dot_is_a_path_not_an_ambiguity() {
+        let r = split_names_paths("def", &v(&["A", "lib.rs"]), 0, exists).unwrap();
+        assert_eq!(r.paths, v(&["lib.rs"]));
+    }
+
+    #[test]
+    fn a_name_that_is_also_a_path_is_an_error_naming_the_double_dash() {
+        let e = split_names_paths("def", &v(&["src", "x/"]), 0, exists).unwrap_err();
+        assert!(e.contains("--"), "{}", e);
+        let e = split_names_paths("def", &v(&["Makefile", "src/"]), 0, exists).unwrap_err();
+        assert!(e.contains("Makefile") && e.contains("--"), "{}", e);
+    }
+
+    #[test]
+    fn a_later_argument_that_exists_is_a_path_even_when_it_looks_like_a_name() {
+        let r = split_names_paths("callers", &v(&["A", "src"]), 0, exists).unwrap();
+        assert_eq!(r.names, v(&["A"]));
+        assert_eq!(r.paths, v(&["src"]));
+    }
+
+    #[test]
+    fn the_double_dash_makes_the_rest_paths_and_the_front_names() {
+        let r = split_names_paths("explain", &v(&["src", "lib.rs", "nope/"]), 2, exists).unwrap();
+        assert_eq!(r.names, v(&["src"]));
+        assert_eq!(r.paths, v(&["lib.rs"]));
+        assert_eq!(r.dropped, v(&["nope/"]));
+    }
+
+    #[test]
+    fn a_missing_argument_with_a_slash_is_dropped_and_one_without_is_a_name() {
+        let r = split_names_paths("refs", &v(&["A", "nope/x", "plain"]), 0, exists).unwrap();
+        assert_eq!(r.names, v(&["A", "plain"]));
+        assert_eq!(r.dropped, v(&["nope/x"]));
+    }
+
+    #[test]
+    fn no_name_is_a_usage_error() {
+        let e = split_names_paths("def", &v(&["src/"]), 0, exists).unwrap_err();
+        assert!(e.contains("needs at least one name"), "{}", e);
+    }
+
+    #[test]
+    fn identifier_like_takes_qualified_names_but_not_files() {
+        assert!(identifier_like("Foo"));
+        assert!(identifier_like("a::b::f"));
+        assert!(!identifier_like("main.rs"));
+        assert!(!identifier_like("src/"));
+        assert!(!identifier_like("9lives"));
+        assert!(!identifier_like(""));
     }
 }

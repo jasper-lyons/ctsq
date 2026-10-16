@@ -7,23 +7,22 @@ use std::collections::HashSet;
 
 // ── Public entry points ───────────────────────────────────────────────────────
 
-pub fn callees(function: &str, path: &str, lang_name: Option<&str>, max_depth: usize, no_ignore: bool, hide: &files::HideOpts, scope: Option<scope::Opts>) {
-    run(Direction::Down, function, path, lang_name, max_depth, no_ignore, hide, scope);
+pub fn callees(names: &[String], jobs: &[(String, &'static str)], hider: files::Hider, max_depth: usize, scope: Option<scope::Opts>) {
+    run(Direction::Down, names, jobs, hider, max_depth, scope);
 }
 
-pub fn callers(function: &str, path: &str, lang_name: Option<&str>, max_depth: usize, no_ignore: bool, hide: &files::HideOpts, scope: Option<scope::Opts>) {
-    run(Direction::Up, function, path, lang_name, max_depth, no_ignore, hide, scope);
+pub fn callers(names: &[String], jobs: &[(String, &'static str)], hider: files::Hider, max_depth: usize, scope: Option<scope::Opts>) {
+    run(Direction::Up, names, jobs, hider, max_depth, scope);
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run(dir: Direction, function: &str, path: &str, lang_name: Option<&str>, max_depth: usize, no_ignore: bool, hide: &files::HideOpts, scope: Option<scope::Opts>) {
-    let jobs = files::resolve_jobs(path, lang_name, no_ignore);
-    let mut hider = files::Hider::new(hide);
-    hider.add_jobs(path, &jobs);
-    let (text, code) = report_scoped(dir, function, &jobs, max_depth, &mut hider, scope);
-    print!("{}", text);
-    if code != 0 {
-        std::process::exit(code);
+fn run(dir: Direction, names: &[String], jobs: &[(String, &'static str)], mut hider: files::Hider, max_depth: usize, scope: Option<scope::Opts>) {
+    let r = report_many(dir, names, jobs, max_depth, &mut hider, scope);
+    print!("{}", r.out);
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    eprint!("{}", r.err);
+    if r.code != 0 {
+        std::process::exit(r.code);
     }
 }
 
@@ -66,6 +65,68 @@ pub fn report_scoped(
     let g = graph::build(jobs);
     let printer = scope.map(|o| scope::Printer::new(o, jobs));
     let mut w = Walk { g: &g, max_depth, out: String::new(), shown: 0, hider, hidden: Hidden::default(), scope: printer };
+    walk_name(&mut w, dir, function);
+    let noun = if dir == Direction::Up { "caller" } else { "callee" };
+    let code = if w.shown == 0 && w.hidden.any() { 1 } else { 0 };
+    let mut out = w.out;
+    out.push_str(&tail(w.shown, noun, &w.hidden, scope.is_some()));
+    (out, code)
+}
+
+/// `report_scoped` for several names. Each name's tree prints in order with a
+/// blank line between. A name that resolved to nothing keeps its bare
+/// `name()` line only when it is the one name asked for, and otherwise goes on
+/// the `not found:` stderr line. The footer counts across all names, once. The
+/// code is 0 when any name resolved to a definition or had a row to show.
+pub fn report_many(
+    dir: Direction,
+    names: &[String],
+    jobs: &[(String, &'static str)],
+    max_depth: usize,
+    hider: &mut files::Hider,
+    scope: Option<scope::Opts>,
+) -> crate::resolve::NamesOut {
+    let g = graph::build(jobs);
+    let printer = scope.map(|o| scope::Printer::new(o, jobs));
+    let mut w = Walk { g: &g, max_depth, out: String::new(), shown: 0, hider, hidden: Hidden::default(), scope: printer };
+    let mut missing: Vec<String> = Vec::new();
+    let mut resolved = false;
+    for name in names {
+        let sep = !w.out.is_empty();
+        if sep {
+            w.out.push('\n');
+        }
+        let start = w.out.len();
+        let shown_before = w.shown;
+        let hidden_before = w.hidden.tests + w.hidden.excluded;
+        let kept_root = walk_name(&mut w, dir, name);
+        let hid = w.hidden.tests + w.hidden.excluded > hidden_before;
+        if kept_root || w.shown > shown_before {
+            resolved = true;
+        } else if !hid {
+            missing.push(name.clone());
+            if names.len() > 1 {
+                w.out.truncate(start);
+                if sep {
+                    w.out.pop();
+                }
+            }
+        }
+    }
+    let noun = if dir == Direction::Up { "caller" } else { "callee" };
+    let mut out = w.out;
+    out.push_str(&tail(w.shown, noun, &w.hidden, scope.is_some()));
+    crate::resolve::NamesOut {
+        out,
+        err: crate::resolve::not_found_line(&missing, jobs),
+        code: if resolved { 0 } else { 1 },
+    }
+}
+
+/// One name's tree, appended to `w.out`. True when a definition of the name
+/// is left after hiding.
+fn walk_name(w: &mut Walk, dir: Direction, function: &str) -> bool {
+    let g = w.g;
     let all_roots = g.index.by_name.get(function).cloned().unwrap_or_default();
     let had_roots = !all_roots.is_empty();
     let roots = w.hider.keep(
@@ -100,11 +161,7 @@ pub fn report_scoped(
             Direction::Down => w.down(&key, 0, "", &mut visited),
         }
     }
-    let noun = if dir == Direction::Up { "caller" } else { "callee" };
-    let code = if w.shown == 0 && w.hidden.any() { 1 } else { 0 };
-    let mut out = w.out;
-    out.push_str(&tail(w.shown, noun, &w.hidden, scope.is_some()));
-    (out, code)
+    !roots.is_empty()
 }
 
 pub fn callgraph(path: &str, lang_name: Option<&str>, no_ignore: bool, format: &str) {

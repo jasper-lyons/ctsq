@@ -962,3 +962,119 @@ fn every_built_in_match_runs_as_a_plain_query() {
     }
     assert!(n >= 7, "every pack match was checked: {}", n);
 }
+
+
+#[test]
+fn several_names_then_paths_answer_each_and_a_miss_exits_0_when_any_resolved() {
+    let f = fixture("example.go");
+    let out = ctsq(&["def", "NewServer", "Missing", "main", &f]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{}{}", text, stderr(&out));
+    assert!(text.lines().next().unwrap().contains("example.go:14:"), "{}", text);
+    assert!(text.contains("example.go:18:"), "{}", text);
+    assert!(!text.contains("no definition for"), "{}", text);
+    assert_eq!(stderr(&out), "not found: Missing\n");
+}
+
+#[test]
+fn several_names_none_found_exits_1_with_one_stderr_line() {
+    let f = fixture("example.go");
+    for cmd in ["def", "refs", "callers", "callees", "explain"] {
+        let out = ctsq(&[cmd, "Nope", "Nada", &f]);
+        assert_eq!(out.status.code(), Some(1), "{}: {}{}", cmd, stdout(&out), stderr(&out));
+        assert!(stderr(&out).contains("not found: Nope, Nada\n"), "{}: {}", cmd, stderr(&out));
+    }
+}
+
+#[test]
+fn a_partial_miss_exits_0_for_every_command() {
+    let f = fixture("example.go");
+    for cmd in ["def", "refs", "callers", "callees", "explain"] {
+        let out = ctsq(&[cmd, "NewServer", "Nada", &f]);
+        assert_eq!(out.status.code(), Some(0), "{}: {}{}", cmd, stdout(&out), stderr(&out));
+        assert!(stderr(&out).contains("not found: Nada\n"), "{}: {}", cmd, stderr(&out));
+    }
+}
+
+#[test]
+fn one_name_and_one_path_print_what_they_always_did() {
+    let f = fixture("example.go");
+    let out = ctsq(&["def", "NewServer", &f]);
+    assert!(out.status.success());
+    assert_eq!(stdout(&out), format!("{}:14: func NewServer(host string, port int) *Server {{\n", f));
+    assert_eq!(stderr(&out), "");
+    let calls = ctsq(&["callers", "NewServer", &f]);
+    assert_eq!(stdout(&calls), "NewServer()\n└── main()  [example.go:18]\n");
+}
+
+#[test]
+fn the_search_root_defaults_to_the_current_directory() {
+    let out = Command::new(env!("CARGO_BIN_EXE_ctsq"))
+        .args(["def", "NewServer"])
+        .current_dir(fixture(""))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("example.go:14:"), "{}", stdout(&out));
+}
+
+#[test]
+fn a_name_that_is_also_a_path_needs_the_double_dash() {
+    let d = scratch_dir("ambiguous");
+    std::fs::write(d.join("a.go"), "package p\n\nfunc Thing() {}\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_ctsq"))
+        .args(["def", "Thing", "a.go", "Thing2"])
+        .current_dir(&d)
+        .output()
+        .unwrap();
+    // a.go is a path, Thing2 is a name: no ambiguity.
+    assert!(out.status.code() == Some(0), "{}{}", stdout(&out), stderr(&out));
+    std::fs::create_dir(d.join("Thing")).unwrap();
+    let amb = Command::new(env!("CARGO_BIN_EXE_ctsq"))
+        .args(["def", "Thing", "a.go"])
+        .current_dir(&d)
+        .output()
+        .unwrap();
+    assert_eq!(amb.status.code(), Some(2), "{}{}", stdout(&amb), stderr(&amb));
+    assert!(stderr(&amb).contains("--"), "{}", stderr(&amb));
+    let forced = Command::new(env!("CARGO_BIN_EXE_ctsq"))
+        .args(["def", "Thing", "--", "a.go"])
+        .current_dir(&d)
+        .output()
+        .unwrap();
+    assert_eq!(forced.status.code(), Some(0), "{}{}", stdout(&forced), stderr(&forced));
+    assert!(stdout(&forced).contains("a.go:3:"), "{}", stdout(&forced));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_missing_path_is_named_on_stderr_and_the_other_paths_still_run() {
+    let f = fixture("example.go");
+    let out = ctsq(&["def", "NewServer", "fixtures/nope/", &f]);
+    assert_eq!(out.status.code(), Some(0), "{}{}", stdout(&out), stderr(&out));
+    assert!(stderr(&out).contains("no such file: fixtures/nope/"), "{}", stderr(&out));
+    assert!(stdout(&out).contains("example.go:14:"), "{}", stdout(&out));
+    let only = ctsq(&["def", "NewServer", "fixtures/nope/"]);
+    assert_eq!(only.status.code(), Some(1), "{}{}", stdout(&only), stderr(&only));
+}
+
+#[test]
+fn explain_with_a_double_dash_and_no_name_is_a_usage_error() {
+    let ok = ctsq(&["explain", "NewServer", "--", &fixture("example.go")]);
+    assert!(ok.status.success(), "{}", stderr(&ok));
+    let none = ctsq(&["def", &fixture("example.go")]);
+    assert_eq!(none.status.code(), Some(2), "{}", stderr(&none));
+}
+
+#[test]
+fn the_footer_counts_every_name_once_at_the_end() {
+    let d = scratch_dir("multifooter");
+    std::fs::write(d.join("a.go"), "package p\n\nfunc One() {}\nfunc Two() {}\n").unwrap();
+    std::fs::write(d.join("a_test.go"), "package p\n\nfunc TestOne() { One(); Two() }\n").unwrap();
+    let dir = d.to_str().unwrap();
+    let out = ctsq(&["callers", "One", "Two", dir]);
+    let text = stdout(&out);
+    assert_eq!(text.matches("hidden:").count(), 1, "{}", text);
+    assert!(text.ends_with("hidden: 2 in tests (--tests)\n"), "{}", text);
+    let _ = std::fs::remove_dir_all(&d);
+}

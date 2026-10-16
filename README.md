@@ -75,7 +75,7 @@ helper()
 
 ## Commands
 
-### `explain SYMBOL [PATH]`: what a symbol is and how it is used
+### `explain NAME... [PATH]...`: what a symbol is and how it is used
 
 The first thing to reach for when the question is "what is this and what uses
 it". One call replaces the usual sequence of `def`, then reading the file, then
@@ -267,7 +267,7 @@ fixtures/example.go  21 lines  ~70 tokens  4 entries
 
 There is no `--body` here: `tree` is the outline. For one entry's body use `ctsq -q '*function#Name' --body FILE`.
 
-### `callers NAME PATH` — call chain (up)
+### `callers NAME... [PATH]...` — call chain (up)
 
 Show what calls a given function, walking up the call chain.
 
@@ -282,7 +282,7 @@ Start()
 └── main()  [example.go:18]
 ```
 
-### `callees NAME PATH` — call chain (down)
+### `callees NAME... [PATH]...` — call chain (down)
 
 Show what a function calls, walking down the call chain.
 
@@ -309,9 +309,13 @@ example.js:1 -> example.js:5
 …
 ```
 
-### `def NAME PATH` — definition lookup
+### `def NAME... [PATH]...` — definition lookup
 
-Resolve a name to its definition location(s).
+Resolve names to their definition location(s). `def`, `refs`, `callers`, `callees` and `explain` take one or more names, then zero or more paths (default `.`). An argument that exists on disk is a path, `--` makes everything after it a path, and a name that is also a file here needs the `--`. Each name is answered in order, names that did not resolve are listed on one `not found:` stderr line, and the exit is 0 when any resolved.
+
+```sh
+ctsq def fmt_tokens count_items Missing src/
+```
 
 ```sh
 ctsq def helper fixtures/
@@ -342,7 +346,7 @@ fixtures/scope/Asset.tsx:11: const saveAssetNow = () => props.asset  ?
 2 definitions
 ```
 
-### `refs NAME PATH`: usage sites
+### `refs NAME... [PATH]...`: usage sites
 
 Every place a name is used, the complement of `def`. It takes `--scope`, `--tests` and `--exclude` like the commands above.
 
