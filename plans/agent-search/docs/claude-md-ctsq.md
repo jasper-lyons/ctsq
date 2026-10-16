@@ -1,0 +1,33 @@
+# Code Search Tools
+- prefer semble (/semble) over grep for semantic code search
+- prefer ctsq over grep, sed, cat, head or tail for anything in source files (.c .cpp .h .py .js .ts .rs .go .rb). A PreToolUse hook denies those shell readers on source paths. Use Read only when you need a whole file:
+  - `ctsq explain Symbol src/`               — FIRST CHOICE for what a symbol is or does: definition with body, callers, callees, other refs, one call
+  - `ctsq tree file.cpp`                       structural outline, file size, each entry's signature and line span
+  - `ctsq -q '*function#Name' --body file.cpp` one function definition with its body
+  - `ctsq -q '*type#Name' --body file.go`      one type or Go struct with its body
+  - `ctsq -q '*variable#Name' --body file.ts`  one const or variable declaration with its initialiser (js, ts, go, rust). `*const#` is the same
+  - `ctsq files -q 'id#A' -q 'id#B' src/`      files where both occur, which grep cannot do in one call
+  - `ctsq -q '(&function#Name @c)' file.cpp`  — find call sites
+  - `ctsq -q '(*function @f).body(id#CONST)' file.cpp` — functions that reference a symbol/constant
+  - `ctsq callers|callees|callgraph FnName src/` — call chain up, down, or the whole graph (recursive, cycle-safe)
+  - `ctsq def Symbol src/`                     — resolve a name to its definition location(s), same resolver as explain
+  - `ctsq -q 'id#Symbol' file.cpp`             each occurrence printed with its source line, replaces `grep -n "Symbol" file.cpp`
+  - `ctsq -q 'id#Symbol' -C 5 file.cpp`        each occurrence with 5 lines either side, replaces `grep -n -C 5` and a windowed Read around a hit
+  - `ctsq -q 'id#/A|B|C/' file.cpp`           — replaces `grep -n "A\|B\|C" file.cpp`
+  - `ctsq -l cpp -q 'id#Symbol' src/`         — replaces `grep -rn "Symbol" src/ --include="*.cpp"`
+  - `ctsq example '$X.send(msg)' -l js`        — unsure of query syntax? derive it from example code ($UPPER = wildcard, unmarked stays literal)
+- prefer mdq over cat/sed/grep for any markdown file (.md): run `mdq tree` first, then `mdq section` for the part you need, never read a markdown file whole to find one section:
+  - `mdq tree file.md`                        replaces `cat file.md` / `head -100 file.md`
+  - `mdq toc file.md`                         replaces `grep -n '^#' file.md`
+  - `mdq section file.md 'Heading'`           replaces `grep -n '^## Heading' file.md` then `sed -n '42,180p' file.md`
+  - `mdq section file.md 'A' 'B' 'C'`         several sections in one call, use this instead of three calls
+  - `mdq section file.md 'Heading' --no-body` outline of one section, prose left out. A bare number is a line number
+  - `mdq grep docs/ 'A|B'`                    replaces `grep -rn 'A\|B' docs/`, each hit tagged with its section. Alternation is `A|B`, not `A\|B`
+  - `mdq tasks todo.md`                       replaces `grep -n '\- \[ \]' todo.md` (open items only by default)
+  - `mdq tasks Projects.md --section Doing --tag mavexa --all`  filter a kanban or todo list without reading it
+  - heading match ignores case, leading #s, emoji and trailing status text. A unique prefix or `/regex/` works. Several matches list candidates and exit 2, no match names the closest headings
+- Read tool:
+  - read a file whole when it is under about 1,000 lines, never in windows. Three windowed Reads cost three turns and save nothing
+  - over about 1,000 lines the Read tool caps the first call. If you are about to edit that file, page forward from where the cap stopped in contiguous windows, each starting at the previous end, never re-reading a range. If you are not editing it, do not page, use `ctsq -q 'id#X' -C 5` or `ctsq -q '*function#Name' --body` for the part you need
+  - never pass `limit` unless you actually want a slice, and never Read a window around a ctsq hit, add `-C N` to the ctsq call instead
+- prefer LSP over Read | Grep for code navigation

@@ -135,8 +135,8 @@ Inherited from path plan decision 06. Applies to `find`, `scopeof`, `--scope` ro
 - Exit codes: 0 when anything matched, 1 when nothing did, 2 for usage errors. Decision 07 extends this to multi-name calls.
 - Footer lines go through one shared function so every command words them the same way.
 - No em dashes and no semicolons in docs, help text or output.
-- `cargo test` passes and `make install` builds after every package.
-- After each package, re-run `measure/` over sessions started after the package was installed, and record the three goal measures in `DELIVERY.md`.
+- `cargo test` passes and `cargo build --release` builds after every package. The build runs in the cloud: never run `make install`. Jasper installs from the merged branch.
+- After merge, Jasper re-runs `measure/` locally over sessions started after the install and records the three goal measures in `DELIVERY.md`. The build itself cannot reach session logs.
 
 ## Schema
 
@@ -297,10 +297,11 @@ Build on branch `agent-search-build`, one or more commits per package, in this o
 ### docs-examples
 
 **Do.**
-- Run `measure/` over the last 30 days and record the baseline in `DELIVERY.md`.
-- Rewrite the ctsq skill (`control/.agents/skills/ctsq/SKILL.md`) around worked examples, one per goal: pull a named definition, pull several bodies at once with a regex name filter, find where a name is used, find where some text appears (`literal#`), outline a file then pull one body, who calls something, files where several names occur, what a symbol is (`explain`). Each shows the call, a trimmed real output and the next call.
+- Record the baseline in `DELIVERY.md` from the Evidence section of this plan.
+- Rewrite the ctsq skill, `plans/agent-search/docs/SKILL.md` (a copy of the live skill, which Jasper copies back into the control repo after merge), around worked examples, one per goal: pull a named definition, pull several bodies at once with a regex name filter, find where a name is used, find where some text appears (`literal#`), outline a file then pull one body, who calls something, files where several names occur, what a symbol is (`explain`). Each shows the call, a trimmed real output from this repo and the next call.
 - Rewrite the EXAMPLES section of `ctsq --help` the same way, with fewer examples and the same shape.
-- Draft the matching change to the ctsq block of `~/.claude/CLAUDE.md` and give it to Jasper for approval. Do not edit that file directly.
+- Rewrite `plans/agent-search/docs/claude-md-ctsq.md` (a copy of the ctsq block of Jasper's global CLAUDE.md) to match. Jasper approves and applies it.
+- After later packages land, update both docs files and the help text for the new flags and commands. The final review checks they agree.
 
 **Acceptance.** Every example in the skill and help runs against this repo or a fixture and produces the shown output. `measure/` re-run after a week of use, recorded in `DELIVERY.md`.
 
