@@ -958,9 +958,9 @@ mod tests {
         assert!(compile_str("while", "ruby").contains("until"), "Ruby has until");
         assert!(compile_str("switch", "go").contains("expression_switch_statement"));
         assert!(compile_str("switch", "go").contains("type_switch_statement"));
-        // call is now a known-absent no-op in all languages
-        assert!(compile_str("call", "c").is_empty());
-        assert!(compile_str("call", "javascript").is_empty());
+        // call maps to each language's call node (it used to be an empty no-op)
+        assert!(compile_str("call", "c").contains("call_expression"));
+        assert!(compile_str("call", "javascript").contains("call_expression"));
     }
 
     #[test]

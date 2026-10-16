@@ -7,6 +7,7 @@
   - where does some text appear: `ctsq -q 'literal#/some text/' src/`. `id#` only matches identifiers, so a string needs `literal#`
   - what is in a file: `ctsq tree file.rs` for the outline and size, then `ctsq -q '*function#name' --body file.rs` for one body
   - who calls it: `ctsq callers Name src/`, then `ctsq explain` on a caller. Also `callees` and `callgraph`
+  - where is a method called: `ctsq -q 'call#Name' src/` matches the last segment, so `pkg.Name(...)` and `x.Name(...)` both hit. `comment#/text/` finds comments. Scripts with no extension are read by their shebang, no `--lang` needed
   - files where several names occur: `ctsq files -q 'id#A' -q 'id#B' src/`
   - where is it defined: `ctsq def Name src/`. Functions that use a constant: `ctsq -q '(*function @f).body(id#CONST)' file.cpp`
   - restrict by language with `-l cpp`. Unsure of the query syntax: `ctsq example '$X.send(msg)' -l js`

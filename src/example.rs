@@ -337,6 +337,11 @@ fn shape_key(v: &TsVariant) -> ShapeKey {
 fn build_index(lang: &dyn Lang) -> Vec<InvEntry> {
     let mut entries = Vec::new();
     for (priority, &atype) in ABSTRACT_TYPES.iter().enumerate() {
+        // Aliases map to the same nodes as `function` and `literal`, so they
+        // add no rung of their own.
+        if matches!(atype, "method" | "string") {
+            continue;
+        }
         let defs = lang.resolve(atype, Some(&Sigil::Def)).unwrap_or_default();
         let refs = lang.resolve(atype, Some(&Sigil::Ref)).unwrap_or_default();
         let ref_keys: Vec<ShapeKey> = refs.iter().map(shape_key).collect();

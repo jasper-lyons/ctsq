@@ -1,0 +1,6 @@
+#!/usr/bin/env node
+// tool: a Node script with no extension
+
+function runTool(arg) {
+  return arg;
+}

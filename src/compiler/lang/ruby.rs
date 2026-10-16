@@ -64,6 +64,7 @@ impl Lang for RubyLang {
                 Some(Sigil::Def) => vec![field_at("assignment", "left", "instance_variable", &[])],
                 _ => vec![simple("instance_variable")],
             }),
+            "comment" => Some(vec![simple("comment")]),
             "op" => Some(vec![]),
             _ => None,
         }

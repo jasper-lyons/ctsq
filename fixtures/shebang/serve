@@ -1,0 +1,5 @@
+#!/usr/bin/python3
+# serve: a Python script with no extension
+
+def serve_forever(port):
+    return port

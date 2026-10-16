@@ -1,0 +1,3 @@
+#!/bin/bash
+# deploy: a shell script, which ctsq has no grammar for
+echo deploying

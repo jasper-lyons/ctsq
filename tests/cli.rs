@@ -220,3 +220,94 @@ fn an_unknown_kind_names_the_valid_ones() {
     assert!(err.contains("variable"), "{}", err);
     assert_eq!(out.status.code(), Some(1));
 }
+
+#[test]
+fn a_const_arrow_component_in_a_tsx_file_is_a_function() {
+    // Regression: the name lives in the binding, and the .tsx suffix alone picks the grammar.
+    let f = fixture("tsx/Topbar.tsx");
+    let out = ctsq(&["-q", "*function#Topbar", "--body", &f]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(text.starts_with(&format!("{}:3-6: ", f)), "{}", text);
+    assert!(text.contains("const label = title;"), "expected the whole body: {}", text);
+}
+
+#[test]
+fn lang_ts_walks_tsx_files_and_parses_each_with_its_own_grammar() {
+    let dir = fixture("tsx");
+    let out = ctsq(&["-l", "ts", "-q", "*function", &dir]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{}{}", text, stderr(&out));
+    assert!(text.contains("Topbar.tsx:3:"),"the TSX file is walked and parsed as TSX: {}", text);
+    assert!(text.contains("util.ts:1:"), "the plain .ts file still matches: {}", text);
+    let named = ctsq(&["-l", "typescript", "-q", "*function#Topbar", &fixture("tsx/Topbar.tsx")]);
+    assert!(named.status.success(), "{}", stderr(&named));
+}
+
+#[test]
+fn a_script_with_no_extension_is_read_by_its_shebang() {
+    // No --lang: the `#!/usr/bin/env ruby` line has to pick the language.
+    let f = fixture("shebang/brief");
+    let out = ctsq(&["tree", &f]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(text.contains("def run_brief(name)"), "{}", text);
+    let q = ctsq(&["-q", "*function#run_brief", &f]);
+    assert!(q.status.success(), "{}", stderr(&q));
+    assert!(stdout(&q).contains(&format!("{}:4: def run_brief(name)", f)), "{}", stdout(&q));
+}
+
+#[test]
+fn a_directory_walk_includes_shebang_scripts_in_each_language() {
+    let dir = fixture("shebang");
+    let out = ctsq(&["-q", "*function", &dir]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(text.contains("brief:4: def run_brief(name)"), "ruby via env: {}", text);
+    assert!(text.contains("serve:4: def serve_forever(port):"), "python3 by direct path: {}", text);
+    assert!(text.contains("tool:4: function runTool(arg) {"), "node via env: {}", text);
+    assert!(!text.contains("deploy"), "a bash script has no grammar, so it is skipped: {}", text);
+    // --lang narrows the walk to the scripts of that language.
+    let ruby = stdout(&ctsq(&["-l", "ruby", "-q", "*function", &dir]));
+    assert!(ruby.contains("brief:") && !ruby.contains("serve:") && !ruby.contains("tool:"), "{}", ruby);
+}
+
+#[test]
+fn naming_a_shell_script_says_why_there_is_no_language() {
+    let out = ctsq(&["-q", "*function", &fixture("shebang/deploy")]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("shell scripts have no grammar"), "{}", stderr(&out));
+}
+
+#[test]
+fn naming_a_file_with_no_extension_and_no_shebang_asks_for_lang() {
+    let out = ctsq(&["-q", "*function", &fixture("../Makefile")]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("use --lang"), "{}", stderr(&out));
+}
+
+#[test]
+fn an_unknown_language_is_rejected_for_a_directory_too() {
+    let out = ctsq(&["-l", "cobol", "-q", "id#x", &fixture("shebang")]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).starts_with("Unknown language: cobol"), "{}", stderr(&out));
+}
+
+#[test]
+fn call_matches_member_calls_by_their_last_segment() {
+    let out = ctsq(&["-q", "call#Println", &fixture("example.go")]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert!(stdout(&out).contains("fmt.Println(\"starting\")"), "{}", stdout(&out));
+}
+
+#[test]
+fn the_types_table_lists_the_new_aliases() {
+    let text = stdout(&ctsq(&["types", "go"]));
+    for kind in ["method", "string", "comment", "call"] {
+        assert!(text.lines().any(|l| l.trim_start().starts_with(kind)), "{} missing: {}", kind, text);
+    }
+    assert!(text.contains("method_declaration"), "method maps to function nodes: {}", text);
+    assert!(text.contains("interpreted_string_literal"), "{}", text);
+    let call = text.lines().find(|l| l.trim_start().starts_with("call ")).unwrap();
+    assert!(call.contains("call_expression"), "call is mapped, not empty: {}", call);
+}

@@ -26,9 +26,14 @@ use std::io::{BufRead, IsTerminal, Read};
     after_help = "QUERY SYNTAX
   Abstract types  id        any identifier — replaces grep -n \"Symbol\" (see examples below)
                   function  class  var  variable  const  param  type  import
-                  literal  block  if  for  while  switch
+                  literal  block  if  for  while  switch  call  comment
+                  method (alias of function)  string (the string literals)
                   variable (alias const) is a variable declaration: *variable#X
                   reaches the whole `const X = …` statement, &variable#X the uses.
+                  call#name matches the last segment of a member call, so
+                  call#Println finds fmt.Println(...) and call#toBe finds a.toBe().
+                  function includes arrow functions bound to a const, let or var.
+                  id includes property, field and JSX attribute names.
                   Unknown identifiers pass through as raw tree-sitter node types;
                   anything else is rejected with the valid kinds for the language.
 
@@ -77,6 +82,9 @@ EXAMPLES (a question as a comment, the call, then the next call)
   # Outline a file, then pull one body.
   ctsq tree src/tree.rs
   ctsq -q '*function#count_items' --body src/tree.rs
+  # Find calls by the last segment of the callee, comments by text.
+  ctsq -q 'call#Println' fixtures/example.go
+  ctsq -q 'comment#/shebang/' src/files.rs
   # Who calls it? Which files mention both names?
   ctsq callers count_items src/
   ctsq files -q 'id#DefIndex' -q 'id#CallGraph' src/
@@ -140,7 +148,9 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Target language (c, cpp, javascript, python, rust, go); inferred from extension if omitted
+    /// Target language (c, cpp, javascript, typescript, python, ruby, rust, go); inferred from the
+    /// extension, or the shebang line of a file with no extension, if omitted.
+    /// ts includes .tsx and js includes .jsx, each parsed with its own grammar
     #[arg(long, short, global = true)]
     lang: Option<String>,
 
@@ -624,58 +634,11 @@ fn main() {
             continue;
         }
 
-        let meta = match std::fs::metadata(path) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("Failed to access {}: {}", path, e);
-                std::process::exit(1);
-            }
-        };
-        if meta.is_dir() && files_from_stdin {
+        // A directory named among paths piped on stdin is not walked.
+        if files_from_stdin && std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false) {
             continue;
-        } else if meta.is_dir() {
-            let exts = cli.lang.as_deref()
-                .map(lang::extensions_for_name)
-                .unwrap_or_else(lang::all_known_extensions);
-            let dir_jobs = files::collect_files(path, exts, cli.no_ignore)
-                .into_iter()
-                .filter_map(|f| {
-                    let ext = std::path::Path::new(&f)
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("");
-                    let lang_name = if let Some(ln) = &cli.lang {
-                        lang::lang_for_name_canonical(ln)
-                    } else {
-                        lang::lang_for_extension(ext)
-                    }?;
-                    Some((f, lang_name))
-                });
-            jobs.extend(dir_jobs);
-        } else {
-            let lang_name = if let Some(ln) = &cli.lang {
-                match lang::lang_for_name_canonical(ln) {
-                    Some(n) => n,
-                    None => {
-                        eprintln!("Unknown language: {}. Supported: c, cpp, javascript, python, ruby, rust, go", ln);
-                        std::process::exit(1);
-                    }
-                }
-            } else {
-                let ext = std::path::Path::new(path)
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("");
-                match lang::lang_for_extension(ext) {
-                    Some(n) => n,
-                    None => {
-                        eprintln!("Cannot detect language from extension .{}; use --lang", ext);
-                        std::process::exit(1);
-                    }
-                }
-            };
-            jobs.push((path.clone(), lang_name));
         }
+        jobs.extend(files::resolve_jobs(path, cli.lang.as_deref(), cli.no_ignore));
     }
 
     let multiple = jobs.len() > 1;

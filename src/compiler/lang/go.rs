@@ -93,7 +93,10 @@ impl Lang for GoLang {
                     field_at("selector_expression", "field", "field_identifier", &[]),
                 ],
             }),
-            "call" | "module" | "while" | "op" => Some(vec![]),
+            // `Run()` and `pkg.Func()`: the name filter reads the last segment.
+            "call" => Some(vec![call_ident(), call_selector()]),
+            "comment" => Some(vec![simple("comment")]),
+            "module" | "while" | "op" => Some(vec![]),
             _ => None,
         }
     }

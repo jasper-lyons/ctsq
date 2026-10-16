@@ -12,6 +12,8 @@ pub const ABSTRACT_TYPES: &[&str] = &[
     "id", "function", "call", "class", "module", "type", "var", "variable",
     "const", "param", "import", "literal", "block", "if", "for", "while",
     "switch", "op", "field", "template_action",
+    // Aliases and wider names, appended so `example` classifies by the earlier ones first.
+    "method", "string", "comment",
 ];
 
 /// Every language, in canonical form (tsx included — it adds JSX call forms).

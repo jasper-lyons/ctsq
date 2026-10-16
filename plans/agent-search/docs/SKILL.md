@@ -149,6 +149,29 @@ CALLERS (1 level)
 
 One call returns the body, callers, callees and the remaining references. Start here whenever the question is what something is or does. Next: follow a caller or callee with another `explain`.
 
+### 9. Find calls to a method
+
+Question: where is `strip_prefix` called, whatever it is called on?
+
+```
+ctsq -q 'call#strip_prefix' src/compiler
+src/compiler/lang/mod.rs:197: let rest = first_line.strip_prefix("#!")?.trim();
+```
+
+`call#name` matches the last segment of the callee, so `x.strip_prefix(...)`, `a::b::f(...)` and `pkg.Func(...)` are all found by `f`, `Func` or `strip_prefix` alone. `method` is another name for `function`, `string` matches string literals and `comment#/text/` matches comments, in every language. Next: pull the caller around the hit with `--body`.
+
+### 10. Read a script with no extension
+
+Question: what is in `fixtures/shebang/brief`?
+
+```
+ctsq tree fixtures/shebang/brief
+fixtures/shebang/brief  6 lines  ~23 tokens  1 entry
+└── def run_brief(name)  :4
+```
+
+A file with no extension takes its language from the `#!` line (`ruby`, `python`, `python3`, `node`, directly or through `env`), so no `--lang` is needed, and a directory walk includes such files too. A shell script has no grammar, so `bash` and `sh` files are skipped. `-l ts` also takes `.tsx` files and `-l js` takes `.jsx`. Next: pull one body with `ctsq -q '*function#run_brief' --body fixtures/shebang/brief`.
+
 ## Reference
 
 ## Subcommands
@@ -398,7 +421,15 @@ module    namespace (C++), mod (Rust) — supports .body() scoping
 variable  a variable declaration, with const as another name for it
 function  class  var  param  type  import  literal  block
 if  for  while  switch
+call      a call, matched by the last segment of the callee (call#Println finds fmt.Println)
+method    another name for function, in every language
+string    the string literals only (literal also takes numbers)
+comment   a comment, in every language
 ```
+
+`function` also covers arrow functions and function expressions bound to a
+`const`, `let` or `var`, and `id` also matches property, field and JSX attribute
+names.
 
 Unknown identifiers pass through as raw tree-sitter node types (e.g. `translation_unit`).
 An identifier that is neither an abstract type nor a real node type in the

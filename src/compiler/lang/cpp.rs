@@ -115,7 +115,14 @@ impl Lang for CppLang {
                     v
                 }
             }),
-            "call" => Some(vec![]),
+            // `f(x)`, `obj.f(x)`, `obj->f(x)` and `ns::f(x)`: the name filter
+            // reads the last segment.
+            "call" => {
+                let mut v = call_variants();
+                v.push(TsVariant { name_path: &[("qualified_identifier", "name")], ..call_variants().remove(0) });
+                Some(v)
+            }
+            "comment" => Some(vec![simple("comment")]),
             _ => None,
         }
     }

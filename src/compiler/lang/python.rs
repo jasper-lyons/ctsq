@@ -45,7 +45,8 @@ impl Lang for PyLang {
             "if" => Some(vec![simple("if_statement")]),
             "for" => Some(vec![simple("for_statement")]),
             "while" => Some(vec![simple("while_statement")]),
-            "call" => Some(vec![simple("call")]),
+            "call" => Some(call_variants()),
+            "comment" => Some(vec![simple("comment")]),
             // `self.x = …` declares an instance field. Every `a.b` is an access.
             "field" => Some(match sigil {
                 Some(Sigil::Def) => vec![field_at("assignment", "left", "identifier", &[("attribute", "attribute")])],

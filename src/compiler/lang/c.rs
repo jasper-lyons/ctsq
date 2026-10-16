@@ -72,7 +72,13 @@ impl Lang for CLang {
                     v
                 }
             }),
-            "call" | "class" | "module" | "op" => Some(vec![]),
+            // `f(x)` and a call through a struct member, `s->f(x)`.
+            "call" => Some(vec![
+                call_variant(),
+                TsVariant { name_node: "field_identifier", name_path: &[("field_expression", "field")], ..call_variant() },
+            ]),
+            "comment" => Some(vec![simple("comment")]),
+            "class" | "module" | "op" => Some(vec![]),
             _ => None,
         }
     }

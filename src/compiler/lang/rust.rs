@@ -42,7 +42,7 @@ impl Lang for RustLang {
                 always_constraint: None,
                 parent_name_wrap: None, always_callee_eq: None,
             }]),
-            "id" => Some(vec![identifier()]),
+            "id" => Some(vec![identifier(), simple("field_identifier")]),
             "var" => Some(vec![TsVariant {
                 node: "let_declaration",
                 name_field: Some("pattern"),
@@ -102,7 +102,14 @@ impl Lang for RustLang {
                     v
                 }
             }),
-            "call" | "op" => Some(vec![]),
+            // `f()`, `x.f()` and `a::b::f()`: the name filter reads the last segment.
+            "call" => Some(vec![
+                call_variant(),
+                TsVariant { name_field: Some("function"), name_node: "field_identifier", name_path: &[("field_expression", "field")], ..call_variant() },
+                TsVariant { name_field: Some("function"), name_node: "identifier", name_path: &[("scoped_identifier", "name")], ..call_variant() },
+            ]),
+            "comment" => Some(vec![simple("line_comment"), simple("block_comment")]),
+            "op" => Some(vec![]),
             _ => None,
         }
     }

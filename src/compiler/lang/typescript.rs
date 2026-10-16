@@ -108,7 +108,8 @@ fn ts_resolve(abstract_type: &str, sigil: Option<&Sigil>) -> Option<Vec<TsVarian
                 v
             }
         }),
-        "id" => Some(vec![identifier(), simple("type_identifier")]),
+        // Property names and JSX attribute names are `property_identifier`.
+        "id" => Some(vec![identifier(), simple("type_identifier"), simple("property_identifier")]),
         "var" => Some(vec![identifier()]),
         // `*variable#X` reaches the whole `const X = …` statement, so --body
         // prints it. `&variable#X` stays on the uses. `const` is an alias.
@@ -150,7 +151,10 @@ fn ts_resolve(abstract_type: &str, sigil: Option<&Sigil>) -> Option<Vec<TsVarian
                     v
                 }
             }),
-        "call" | "module" => Some(vec![]),
+        // `f(x)`, `obj.f(x)` and `it(...)`: the name filter reads the last segment.
+        "call" => Some(call_variants()),
+        "comment" => Some(vec![simple("comment")]),
+        "module" => Some(vec![]),
         _ => None,
     }
 }
@@ -185,6 +189,26 @@ fn def_variants() -> Vec<TsVariant> {
         },
         TsVariant {
             node: "arrow_function",
+            name_field: None,
+            name_node: "identifier",
+            params_field: Some("parameters"),
+            params_container: Some("formal_parameters"),
+            body_field: Some("body"),
+            body_container: Some("statement_block"),
+            name_path: &[],
+            params_needs_bridge: false,
+            always_constraint: None,
+            parent_name_wrap: Some(super::ParentNameWrap {
+                parent: "variable_declarator",
+                name_field: "name",
+                name_node: "identifier",
+                self_field: "value",
+            }),
+            always_callee_eq: None,
+        },
+        // `let inner = function () {}`: the name lives in the binding, as for arrows.
+        TsVariant {
+            node: "function_expression",
             name_field: None,
             name_node: "identifier",
             params_field: Some("parameters"),

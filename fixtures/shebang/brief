@@ -1,0 +1,6 @@
+#!/usr/bin/env ruby
+# brief: a Ruby script with no extension
+
+def run_brief(name)
+  name
+end
