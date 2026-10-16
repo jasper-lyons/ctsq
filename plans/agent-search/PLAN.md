@@ -135,8 +135,8 @@ Inherited from path plan decision 06. Applies to `find`, `scopeof`, `--scope` ro
 - Exit codes: 0 when anything matched, 1 when nothing did, 2 for usage errors. Decision 07 extends this to multi-name calls.
 - Footer lines go through one shared function so every command words them the same way.
 - No em dashes and no semicolons in docs, help text or output.
-- `cargo test` passes and `cargo build --release` builds after every package. The build runs in the cloud: never run `make install`. Jasper installs from the merged branch.
-- After merge, Jasper re-runs `measure/` locally over sessions started after the install and records the three goal measures in `DELIVERY.md`. The build itself cannot reach session logs.
+- `cargo test` passes and `cargo build --release` builds after every package. Never run `make install` during the build: it replaces the ctsq every session uses. Jasper installs from the merged branch.
+- After merge, Jasper re-runs `measure/` locally over sessions started after the install and records the three goal measures in `DELIVERY.md`. The build does not re-measure.
 
 ## Schema
 
@@ -290,11 +290,23 @@ src/load.go:96: func LoadUnits3(r io.Reader) ([]Unit, error) {
 not found: GameKeyCheck (similar: gameKeyCheck in src/input.c:220)
 ```
 
-## Packages, in build order
+## Work packages
+
+| Order | Package | Decisions | Depends on |
+|---|---|---|---|
+| 1 | docs-examples | 01 | none |
+| 2 | kinds | 08 | none |
+| 3 | misses | 04, 07 | kinds |
+| 4 | tests-and-footers | 02, 03 | misses (shared footer and exit codes) |
+| 5 | scope | 05, 06 | tests-and-footers |
+| 6 | named-queries | 09 to 14 | misses, tests-and-footers |
+
+Files owned per package are for the orchestrator to cut from the Do lists. Every package after docs-examples also updates `docs/SKILL.md`, `docs/claude-md-ctsq.md` and the help text for what it adds.
+
 
 Build on branch `agent-search-build`, one or more commits per package, in this order. Merging to `main` is Jasper's call. Docs come first so their effect can be measured alone.
 
-### docs-examples
+## Package: docs-examples
 
 **Do.**
 - Record the baseline in `DELIVERY.md` from the Evidence section of this plan.
@@ -305,7 +317,7 @@ Build on branch `agent-search-build`, one or more commits per package, in this o
 
 **Acceptance.** Every example in the skill and help runs against this repo or a fixture and produces the shown output. `measure/` re-run after a week of use, recorded in `DELIVERY.md`.
 
-### kinds
+## Package: kinds
 
 **Do.**
 - One failing test per bullet in decision 08, using inline sources, then the change in `src/compiler/lang/*` and `types::ABSTRACT_TYPES`.
@@ -314,7 +326,7 @@ Build on branch `agent-search-build`, one or more commits per package, in this o
 
 **Acceptance.** Tests pass. `ctsq -q '*function#Topbar' --body` finds a const arrow component in a TSX fixture. `ctsq tree scripts/brief` in the control repo outlines the Ruby script with no `--lang`.
 
-### misses
+## Package: misses
 
 **Do.**
 - The miss fallback (decision 04): on zero matches for `id#`, rerun the name filter as `literal` and `comment` over the same files and print the found-as block. On zero matches for a definition query, check the other definition kinds for the same name.
@@ -326,7 +338,7 @@ Build on branch `agent-search-build`, one or more commits per package, in this o
 
 **Acceptance.** Report tests for each output in the Output format section. A query with a `/` inside a regex compiles. `ctsq def A B Missing` exits 0 and lists `Missing`.
 
-### tests-and-footers
+## Package: tests-and-footers
 
 **Do.**
 - `[tests]` table in the language mechanics schema (`src/config/mechanics.rs`), with the defaults above in the built-in files.
@@ -337,7 +349,7 @@ Build on branch `agent-search-build`, one or more commits per package, in this o
 
 **Acceptance.** `ctsq tree src/` on this repo no longer lists `mod tests` blocks and prints the hidden count. `ctsq refs X` on a fixture with test callers prints the hidden count, and `--tests` shows them.
 
-### scope
+## Package: scope
 
 **Do.**
 - A nearest-named-scope resolver: given a file and a byte offset, walk up the tree to the first node that is a `function`, `class`, `type` or a const bound to a function, using the language's abstract mappings. Shared by `--scope` and `scopeof`.
@@ -347,7 +359,7 @@ Build on branch `agent-search-build`, one or more commits per package, in this o
 
 **Acceptance.** `scopeof` on a line inside a nested closure returns the closure's named parent. `--up 1` from a method returns its class. Over budget prints the window. `def X --scope` on a name defined inside two components prints both parents.
 
-### named-queries
+## Package: named-queries
 
 **Do.**
 - Generalised field access in `query/ast.rs` and `compiler/mod.rs`: any tree-sitter field name, not only `body` and `params`. Captures allowed on both sides of `~` and `+`.
