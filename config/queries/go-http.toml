@@ -1,0 +1,19 @@
+# Routes registered on a net/http mux: mux.HandleFunc("/x", h), http.Handle(...)
+# and the Go 1.22 form mux.HandleFunc("GET /x", h), whose key keeps the method.
+# The key is the pattern string, the target is the handler, resolved with def.
+# A method value h.Method gives Method. A wrapper call such as
+# h.authed(h.logout) gives the handler inside it.
+framework = "net-http"
+langs     = ["go"]
+detect    = { import = ["net/http"] }
+
+[route]
+match = [
+  # mux.HandleFunc("GET /x", h.handler)
+  "(call_expression.function(selector_expression.field(field_identifier#/^(HandleFunc|Handle)$/)) > (argument_list > (interpreted_string_literal @key) + (selector_expression.field(@target))))",
+  # http.HandleFunc("/x", handler)
+  "(call_expression.function(selector_expression.field(field_identifier#/^(HandleFunc|Handle)$/)) > (argument_list > (interpreted_string_literal @key) + (identifier @target)))",
+  # mux.HandleFunc("GET /x", h.authed(h.handler))
+  "(call_expression.function(selector_expression.field(field_identifier#/^(HandleFunc|Handle)$/)) > (argument_list > (interpreted_string_literal @key) + (call_expression > (argument_list > (selector_expression.field(@target))))))",
+]
+target = "def"

@@ -1,0 +1,19 @@
+# Rails config/routes.rb: get/post/put/patch/delete "/path", to: "ctrl#action"
+# and resources :name. A resources line is one row (key /name, target
+# NameController), it is not expanded to the seven REST routes. The target
+# text "static#about" is rewritten to StaticController#about, then resolved with
+# def on the controller and the action inside it. A name nothing defines prints ?.
+framework = "rails-routes"
+langs     = ["ruby"]
+detect    = { file = ["config/routes.rb"] }
+
+[route]
+match = [
+  # get '/about', to: 'static#about'
+  "(call.method(identifier#/^(get|post|put|patch|delete)$/) > (argument_list > (string @key) + (pair.key(hash_key_symbol#to).value(string @target))))",
+  # resources :gigs
+  "(call.method(identifier#resources) > (argument_list > (simple_symbol @key)))",
+]
+target      = "def"
+rewrite     = ["^:?(\\w+)(?:#(\\w+))?$", "${1:pascal}Controller#$2"]
+key_rewrite = ["^:(\\w+)$", "/$1"]

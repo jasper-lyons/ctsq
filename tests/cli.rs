@@ -831,7 +831,7 @@ fn find_with_no_arguments_lists_what_applies_and_exits_0() {
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(
         stdout(&out),
-        "built-in queries/solid-routes.toml:9: route  solid-routes  (import @solidjs/router in src/App.tsx)\nnot detected here: route (react-router)\n"
+        "built-in queries/solid-routes.toml:9: route  solid-routes  (import @solidjs/router in src/App.tsx)\nnot detected here: route (chi), route (net-http), route (next-app), route (rails-routes), route (react-router)\n"
     );
 }
 
@@ -868,10 +868,10 @@ fn find_hides_tests_and_tests_shows_them() {
 fn a_broken_repo_query_file_is_an_error_naming_the_file() {
     let d = scratch_dir("findbroken");
     std::fs::create_dir_all(d.join(".ctsq/queries")).unwrap();
-    std::fs::write(d.join(".ctsq/queries/x.toml"), "framework = \"x\"\nlangs = [\"ts\"]\n[route]\nmatch = \"id\"\ntarget = \"def\"\nrewrite = [\"a\", \"b\"]\n").unwrap();
+    std::fs::write(d.join(".ctsq/queries/x.toml"), "framework = \"x\"\nlangs = [\"ts\"]\n[route]\nmatch = \"id\"\ntarget = \"def\"\nrewrite = [\"a\"]\n").unwrap();
     let out = ctsq_in(d.to_str().unwrap(), &["find"]);
     assert_eq!(out.status.code(), Some(2));
-    assert!(stderr(&out).contains(".ctsq/queries/x.toml:3: [route] `rewrite` is not supported yet"), "{}", stderr(&out));
+    assert!(stderr(&out).contains(".ctsq/queries/x.toml:3: [route] `rewrite` is [\"<regex>\", \"<replacement>\"]"), "{}", stderr(&out));
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -882,7 +882,7 @@ fn config_path_lists_a_queries_directory_per_layer() {
     let text = stdout(&out);
     assert!(text.contains("\nqueries:\n1. repo      "), "{}", text);
     assert!(text.contains("solid-mavexa/.ctsq/queries\n"), "{}", text);
-    assert!(text.contains("4. built-in  react-router.toml, solid-routes.toml\n"), "{}", text);
+    assert!(text.contains("4. built-in  go-chi.toml, go-http.toml, next-app.toml, rails-routes.toml, react-router.toml, solid-routes.toml\n"), "{}", text);
 }
 
 /// Every `match` of every built-in pack also runs as a plain -q query and
@@ -902,9 +902,13 @@ fn every_built_in_match_runs_as_a_plain_query() {
                 toml::Value::Array(a) => a.iter().map(|x| x.as_str().unwrap().to_string()).collect(),
                 other => panic!("{:?}", other),
             };
+            // A match using JSX node kinds runs under tsx, since the plain
+            // typescript grammar has none. Other packs run in their first language.
+            let first = table["langs"].as_array().unwrap()[0].as_str().unwrap();
+            let first = if first == "tsx" || first == "ts" { "ts" } else { first };
             for m in matches {
                 n += 1;
-                let ts = ctsq(&["-l", "ts", "-q", &m, &fixture("queries")]);
+                let ts = ctsq(&["-l", first, "-q", &m, &fixture("queries")]);
                 let ok = ts.status.success()
                     || (stderr(&ts).starts_with("unknown kind")
                         && ctsq(&["-l", "tsx", "-q", &m, &fixture("queries")]).status.success());

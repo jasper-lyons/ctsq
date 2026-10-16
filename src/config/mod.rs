@@ -134,6 +134,10 @@ const BUILTIN_LANGUAGES: &[(&str, &str)] = &[
 
 /// Built-in named queries, `queries/<file>` beside `languages/`.
 const BUILTIN_QUERIES: &[(&str, &str)] = &[
+    ("go-chi.toml", include_str!("../../config/queries/go-chi.toml")),
+    ("go-http.toml", include_str!("../../config/queries/go-http.toml")),
+    ("next-app.toml", include_str!("../../config/queries/next-app.toml")),
+    ("rails-routes.toml", include_str!("../../config/queries/rails-routes.toml")),
     ("react-router.toml", include_str!("../../config/queries/react-router.toml")),
     ("solid-routes.toml", include_str!("../../config/queries/solid-routes.toml")),
 ];

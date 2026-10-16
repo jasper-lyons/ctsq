@@ -10,7 +10,7 @@
 //! assert on it directly: `list_report` and `report`.
 
 use crate::compiler::{self, lang};
-use crate::config::queries::{Detect, NamedQuery, Target};
+use crate::config::queries::{self, Detect, NamedQuery, Target};
 use crate::files;
 use crate::footer;
 use crate::resolve::DefLookup;
@@ -350,11 +350,15 @@ fn run_query(
     hider: &mut files::Hider,
     hidden: &mut footer::Hidden,
 ) -> Result<Vec<Hit>, Report> {
+    if q.paths.is_some() {
+        return run_paths(q, scan, filter, hider, hidden);
+    }
     let compiled = compile_all(q)?;
     let jobs = scan.jobs_for(&q.langs);
     let prefix = scan.prefix.clone();
     let shown = |p: &str| shown(&prefix, p).to_string();
     let mut lookup: Option<DefLookup> = None;
+    let mut specs: Option<crate::resolve::imports::JsSpecResolver> = None;
     let mut hits = Vec::new();
     let mut seen = HashSet::new();
     for (file, lang_name) in &jobs {
@@ -382,6 +386,10 @@ fn run_query(
                     Some(k) => unquote(&k.text).to_string(),
                     None => r.src_line.clone().unwrap_or_default(),
                 };
+                let key = match &q.key_rewrite {
+                    Some(rw) => queries::apply_rewrite(rw, &key),
+                    None => key,
+                };
                 if !filter.matches(&key) {
                     continue;
                 }
@@ -393,20 +401,34 @@ fn run_query(
                 let tcap = cap("target");
                 let (target, target_loc) = match q.target {
                     Target::Def => {
-                        let text = tcap.map(|t| t.text.as_str()).unwrap_or("");
-                        let name = target_name(text);
+                        // No @target: the @key node names the target too (`resources :gigs`).
+                        let text = tcap.or_else(|| cap("key")).map(|t| t.text.as_str()).unwrap_or("");
+                        let name = match &q.rewrite {
+                            Some(rw) => queries::apply_rewrite(rw, unquote(text)).trim_end_matches('#').to_string(),
+                            None => target_name(text),
+                        };
                         let l = lookup.get_or_insert_with(|| DefLookup::new(&jobs));
-                        let defs = l.find(&name);
-                        // Several candidates: a shown one before a hidden one, then
-                        // the one nearest the route's file (longest shared directory).
-                        let pick = defs.iter().min_by_key(|(f, line, _)| {
-                            (hider.site(f, *line).is_some(), std::cmp::Reverse(shared_dirs(file, f)))
-                        });
+                        let pick = pick_def(l, &name, file, hider);
                         let loc = match pick {
-                            Some((f, line, _)) => format!("{}:{}", shown(f), line),
+                            Some((f, line)) => format!("{}:{}", shown(&f), line),
                             None => "?".to_string(),
                         };
                         (name, loc)
+                    }
+                    Target::DefaultExport => {
+                        let spec = {
+                            let t = tcap.map(|t| t.text.as_str()).unwrap_or("");
+                            let t = unquote(t.lines().next().unwrap_or(""));
+                            match &q.rewrite {
+                                Some(rw) => queries::apply_rewrite(rw, t),
+                                None => t.to_string(),
+                            }
+                        };
+                        let r = specs.get_or_insert_with(|| crate::resolve::imports::JsSpecResolver::new(&jobs));
+                        match nearest(r.resolve(file, &spec), file) {
+                            Some(target_file) => export_of(&target_file, &jobs, &prefix, &spec),
+                            None => (spec, "?".to_string()),
+                        }
                     }
                     Target::Enclosing => {
                         let byte = tcap.map(|t| t.start_byte).unwrap_or(r.start_byte);
@@ -430,6 +452,169 @@ fn run_query(
         }
     }
     hits.sort_by(|a, b| (&a.file, a.line, &a.key).cmp(&(&b.file, b.line, &b.key)));
+    Ok(hits)
+}
+
+/// The file nearest `from` (longest shared directory), then the first by name.
+fn nearest(mut files: Vec<String>, from: &str) -> Option<String> {
+    files.sort();
+    files.into_iter().rev().max_by_key(|f| shared_dirs(from, f))
+}
+
+/// The definition `name` points at, nearest `from`, a shown one before a hidden
+/// one. `Ctrl#action` (a Rails target) finds the controller, then the action
+/// inside the controller's file, and falls back to the controller.
+fn pick_def(l: &mut DefLookup, name: &str, from: &str, hider: &mut files::Hider) -> Option<(String, usize)> {
+    let mut best = |defs: Vec<(String, usize, crate::resolve::Confidence)>| -> Option<(String, usize)> {
+        defs.iter()
+            .min_by_key(|(f, line, _)| (hider.site(f, *line).is_some(), std::cmp::Reverse(shared_dirs(from, f))))
+            .map(|(f, line, _)| (f.clone(), *line))
+    };
+    let Some((class, action)) = name.split_once('#') else {
+        return best(l.find(name));
+    };
+    let (cf, cl) = best(l.find(class))?;
+    if !action.is_empty() {
+        let in_file: Vec<_> = l.find(action).into_iter().filter(|(f, _, _)| *f == cf).collect();
+        if let Some(found) = best(in_file) {
+            return Some(found);
+        }
+    }
+    Some((cf, cl))
+}
+
+/// The name and `path:LINE` of the default export of `file`.
+fn export_of(file: &str, jobs: &[(String, &'static str)], prefix: &str, spec: &str) -> (String, String) {
+    let lang_name = jobs.iter().find(|(f, _)| f == file).map(|(_, l)| *l).unwrap_or("typescript");
+    let stem = Path::new(file).file_stem().and_then(|s| s.to_str()).unwrap_or(spec).to_string();
+    match default_export(file, lang_name) {
+        Some((name, line)) => (name.unwrap_or(stem), format!("{}:{}", shown(prefix, file), line)),
+        None => (stem, format!("{}:1", shown(prefix, file))),
+    }
+}
+
+/// The default export of a JS or TS file: its name (None when anonymous) and
+/// line. `export default function X`, `export default X` (the line of X's
+/// declaration when it is in the file) and `export { X as default }` name X.
+fn default_export(file: &str, lang_name: &str) -> Option<(Option<String>, usize)> {
+    let source = std::fs::read(file).ok()?;
+    let lb = lang::for_name(lang_name)?;
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&lb.ts_language()).ok()?;
+    let tree = parser.parse(&source, None)?;
+    let root = tree.root_node();
+    let text = |n: tree_sitter::Node| String::from_utf8_lossy(&source[n.byte_range()]).to_string();
+    // The line a top-level declaration of `name` starts on.
+    let declared = |name: &str| -> Option<usize> {
+        let mut c = root.walk();
+        for top in root.children(&mut c) {
+            let d = if top.kind() == "export_statement" {
+                match top.child_by_field_name("declaration") {
+                    Some(d) => d,
+                    None => continue,
+                }
+            } else {
+                top
+            };
+            let named = match d.kind() {
+                "function_declaration" | "class_declaration" | "generator_function_declaration" => {
+                    d.child_by_field_name("name").is_some_and(|n| text(n) == name)
+                }
+                "lexical_declaration" | "variable_declaration" => {
+                    let mut c2 = d.walk();
+                    let found = d.children(&mut c2).any(|v| {
+                        v.kind() == "variable_declarator" && v.child_by_field_name("name").is_some_and(|n| text(n) == name)
+                    });
+                    found
+                }
+                _ => false,
+            };
+            if named {
+                return Some(top.start_position().row + 1);
+            }
+        }
+        None
+    };
+    let mut c = root.walk();
+    for top in root.children(&mut c) {
+        if top.kind() != "export_statement" {
+            continue;
+        }
+        let line = top.start_position().row + 1;
+        let mut c2 = top.walk();
+        let is_default = top.children(&mut c2).any(|k| k.kind() == "default");
+        if is_default {
+            if let Some(d) = top.child_by_field_name("declaration") {
+                let name = d.child_by_field_name("name").map(text);
+                return Some((name, line));
+            }
+            if let Some(v) = top.child_by_field_name("value") {
+                if v.kind() == "identifier" {
+                    let n = text(v);
+                    let l = declared(&n).unwrap_or(line);
+                    return Some((Some(n), l));
+                }
+                return Some((None, line));
+            }
+        }
+        let mut c3 = top.walk();
+        for clause in top.children(&mut c3).filter(|k| k.kind() == "export_clause") {
+            let mut c4 = clause.walk();
+            for sp in clause.children(&mut c4).filter(|k| k.kind() == "export_specifier") {
+                if sp.child_by_field_name("alias").is_some_and(|a| text(a) == "default") {
+                    let n = sp.child_by_field_name("name").map(text)?;
+                    let l = declared(&n).unwrap_or(line);
+                    return Some((Some(n), l));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// A `paths` query: each file under the search root matching the glob is a
+/// match. The key comes from `key_from_path`, the target is the file's
+/// default export. Route groups, directories written `(name)`, are not part
+/// of a URL and are dropped from the key.
+fn run_paths(
+    q: &NamedQuery,
+    scan: &mut Scan,
+    filter: &KeyFilter,
+    hider: &mut files::Hider,
+    hidden: &mut footer::Hidden,
+) -> Result<Vec<Hit>, Report> {
+    let bad = |why: String| Report { out: format!("{}:{}: [{}] {}\n", q.source, q.line, q.name, why), code: 2 };
+    let glob = q.paths.as_deref().unwrap_or("");
+    let mut ob = ignore::overrides::OverrideBuilder::new(&scan.root);
+    ob.add(glob).map_err(|e| bad(format!("paths `{}`: {}", glob, e)))?;
+    let ov = ob.build().map_err(|e| bad(format!("paths `{}`: {}", glob, e)))?;
+    let re = regex::Regex::new(q.key_from_path.as_deref().unwrap_or("")).map_err(|e| bad(format!("key_from_path: {}", e)))?;
+    let jobs = scan.jobs_for(&q.langs);
+    let prefix = scan.prefix.clone();
+    let mut hits = Vec::new();
+    for (file, _) in &jobs {
+        let rel = shown(&prefix, file);
+        if !ov.matched(rel, false).is_whitelist() {
+            continue;
+        }
+        let Some(caps) = re.captures(rel) else { continue };
+        let raw = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let segs: Vec<&str> = raw.split('/').filter(|s| !s.is_empty() && !(s.starts_with('(') && s.ends_with(')'))).collect();
+        let mut key = if segs.is_empty() { "/".to_string() } else { format!("/{}", segs.join("/")) };
+        if let Some(rw) = &q.key_rewrite {
+            key = queries::apply_rewrite(rw, &key);
+        }
+        if !filter.matches(&key) {
+            continue;
+        }
+        if let Some(h) = hider.site(file, 1) {
+            hidden.count(h, 1);
+            continue;
+        }
+        let (target, target_loc) = export_of(file, &jobs, &prefix, rel);
+        hits.push(Hit { file: file.clone(), line: 1, key, target, target_loc });
+    }
+    hits.sort_by(|a, b| (&a.key, &a.file).cmp(&(&b.key, &b.file)));
     Ok(hits)
 }
 
@@ -614,10 +799,87 @@ mod tests {
         assert_eq!(r.code, 0, "{}", r.out);
         assert_eq!(
             r.out,
-            "frontend/src/routesConfig.ts:16  /library      ~/routes/library       frontend/src/routesConfig.ts:16\n\
-             frontend/src/routesConfig.ts:17  /library/:id  ~/routes/library/[id]  frontend/src/routesConfig.ts:17\n\
+            "frontend/src/routesConfig.ts:16  /library      Library  frontend/src/routes/library.tsx:3\n\
+             frontend/src/routesConfig.ts:17  /library/:id  Asset    frontend/src/routes/library/[id].tsx:1\n\
              2 routes (solid-routes, from .ctsq/queries/solid-routes.toml)\n"
         );
+    }
+
+    #[test]
+    fn go_net_http_routes_resolve_their_handlers_and_keep_the_method() {
+        let r = run("go-http", None, &hide());
+        assert_eq!(
+            r.out,
+            "main.go:20  GET /api/healthz       healthz  main.go:9\n\
+             main.go:21  POST /api/auth/login   login    main.go:11\n\
+             main.go:22  POST /api/auth/logout  logout   main.go:13\n\
+             main.go:30  /                      index    main.go:17\n\
+             4 routes (net-http, from built-in queries/go-http.toml)\n"
+        );
+    }
+
+    #[test]
+    fn chi_routes_resolve_functions_and_method_values() {
+        let r = run("go-chi", None, &hide());
+        assert_eq!(
+            r.out,
+            "main.go:20  /users       listUsers   main.go:9\n\
+             main.go:21  /users       createUser  main.go:11\n\
+             main.go:22  /users/{id}  Show        main.go:15\n\
+             main.go:24  /users/{id}  createUser  main.go:11\n\
+             4 routes (chi, from built-in queries/go-chi.toml)\n"
+        );
+    }
+
+    #[test]
+    fn rails_routes_rewrite_to_a_controller_and_action_and_print_a_question_mark_when_missing() {
+        let r = run("rails", None, &hide());
+        assert_eq!(
+            r.out,
+            "config/routes.rb:2  /about    StaticController#about     app/controllers/static_controller.rb:2\n\
+             config/routes.rb:3  /contact  StaticController#contact   app/controllers/static_controller.rb:5\n\
+             config/routes.rb:4  /login    SessionsController#create  app/controllers/sessions_controller.rb:3\n\
+             config/routes.rb:5  /missing  GhostsController#boo       ?\n\
+             config/routes.rb:6  /gigs     GigsController             app/controllers/gigs_controller.rb:1\n\
+             5 routes (rails-routes, from built-in queries/rails-routes.toml)\n"
+        );
+    }
+
+    #[test]
+    fn next_app_files_are_routes_keyed_by_directory_with_groups_dropped() {
+        let r = run("next-app", None, &hide());
+        assert_eq!(
+            r.out,
+            "app/page.tsx:1                      /             Home      app/page.tsx:1\n\
+             app/about/page.tsx:1                /about        About     app/about/page.tsx:1\n\
+             app/blog/[slug]/page.tsx:1          /blog/[slug]  BlogPost  app/blog/[slug]/page.tsx:1\n\
+             app/(marketing)/pricing/page.tsx:1  /pricing      page      app/(marketing)/pricing/page.tsx:1\n\
+             4 routes (next-app, from built-in queries/next-app.toml)\n"
+        );
+        let r = run("next-app", Some("/blog"), &hide());
+        assert!(r.out.starts_with("app/blog/[slug]/page.tsx:1  /blog/[slug]  BlogPost  "), "{}", r.out);
+    }
+
+    #[test]
+    fn default_exports_are_named_by_declaration_local_or_file_stem() {
+        let d = std::env::temp_dir().join(format!("ctsq-find-defexp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let cases = [
+            ("a.tsx", "export default function A() {}\n", Some("A")),
+            ("b.tsx", "const x = 1;\nconst B = () => 1;\nexport default B;\n", Some("B")),
+            ("c.tsx", "export default () => 1;\n", None),
+            ("d.tsx", "function D() {}\nexport { D as default };\n", Some("D")),
+        ];
+        for (f, src, want) in cases {
+            std::fs::write(d.join(f), src).unwrap();
+            let got = default_export(d.join(f).to_str().unwrap(), "tsx").map(|(n, _)| n);
+            assert_eq!(got, Some(want.map(str::to_string)), "{}", f);
+        }
+        assert_eq!(default_export(d.join("b.tsx").to_str().unwrap(), "tsx").unwrap().1, 2, "the local's line");
+        std::fs::write(d.join("e.tsx"), "export const e = 1;\n").unwrap();
+        assert_eq!(default_export(d.join("e.tsx").to_str().unwrap(), "tsx"), None);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -629,7 +891,7 @@ mod tests {
         assert_eq!(
             r.out,
             "no route matches /library here (tried solid-routes from built-in queries/solid-routes.toml)\n\
-             not detected here: react-router (built-in queries/react-router.toml)\n"
+             not detected here: chi (built-in queries/go-chi.toml), net-http (built-in queries/go-http.toml), next-app (built-in queries/next-app.toml), rails-routes (built-in queries/rails-routes.toml), react-router (built-in queries/react-router.toml)\n"
         );
     }
 
@@ -641,7 +903,7 @@ mod tests {
         assert_eq!(
             r.out,
             "built-in queries/solid-routes.toml:9: route  solid-routes  (import @solidjs/router in src/App.tsx)\n\
-             not detected here: route (react-router)\n"
+             not detected here: route (chi), route (net-http), route (next-app), route (rails-routes), route (react-router)\n"
         );
         let dir = fixture("solid-mavexa");
         let r = list_report(&queries_in(&dir), &mut Scan::new(&dir, false));
@@ -729,7 +991,7 @@ mod tests {
 
     #[test]
     fn output_has_no_semicolons_or_em_dashes() {
-        for name in ["solid", "react-router", "solid-mavexa"] {
+        for name in ["solid", "react-router", "solid-mavexa", "go-http", "go-chi", "rails", "next-app"] {
             let r = run(name, None, &hide());
             assert!(!r.out.contains(';') && !r.out.contains('\u{2014}'), "{}", r.out);
         }

@@ -254,15 +254,37 @@ mod tests {
 36 importgraph/ruby/app.rb:6 dump@9 -> -
 37 importgraph/ruby/helpers.rb:3 new@4 -> -
 38 importgraph/ts-alias/src/app.ts:5 helper@5 -> -
-39 typescript/example.ts:26 log@34 -> -
-40 typescript/example.ts:27 log@28 -> -
-41 typescript/example.ts:33 log@34 -> -
-42 typescript/example.tsx:8 <button onClick={onClick}>@9 -> -
-43 typescript/example.tsx:12 <span>@12 -> -
-44 typescript/example.tsx:14 log@15 -> -
-45 typescript/example.tsx:14 <div>@17 -> -
-46 typescript/example.tsx:14 <Button label=\"Click me\" onClick={handleClick} />@18 -> -
-47 typescript/example.tsx:14 <Icon />@19 -> -
+39 queries/go-chi/main.go:17 NewRouter@18 -> -
+40 queries/go-chi/main.go:17 Get@20 -> -
+41 queries/go-chi/main.go:17 Post@21 -> -
+42 queries/go-chi/main.go:17 Route@23 -> -
+43 queries/go-chi/main.go:17 Delete@24 -> -
+44 queries/go-chi/main.go:17 ListenAndServe@26 -> -
+45 queries/go-http/main.go:19 HandleFunc@20 -> -
+46 queries/go-http/main.go:19 authed@22 -> queries/go-http/main.go:15 Exact
+47 queries/go-http/main.go:19 Handle@23 -> -
+48 queries/go-http/main.go:19 NotFoundHandler@23 -> -
+49 queries/go-http/main.go:26 NewServeMux@28 -> -
+50 queries/go-http/main.go:26 Routes@29 -> queries/go-http/main.go:19 Exact
+51 queries/go-http/main.go:26 HandleFunc@30 -> -
+52 queries/go-http/main.go:26 ListenAndServe@31 -> -
+53 queries/next-app/app/about/page.tsx:1 <p>@1 -> -
+54 queries/next-app/app/blog/[slug]/page.tsx:1 <p>@1 -> -
+55 queries/next-app/app/page.tsx:1 <h1>@1 -> -
+56 queries/solid-mavexa/frontend/src/routes/library.tsx:3 createSignal@4 -> -
+57 queries/solid-mavexa/frontend/src/routes/library.tsx:3 <div>@5 -> -
+58 queries/solid-mavexa/frontend/src/routes/library.tsx:3 String@5 -> -
+59 queries/solid-mavexa/frontend/src/routes/library.tsx:3 open@5 -> -
+60 queries/solid-mavexa/frontend/src/routes/library/[id].tsx:1 <div>@2 -> -
+61 typescript/example.ts:26 log@34 -> -
+62 typescript/example.ts:27 log@28 -> -
+63 typescript/example.ts:33 log@34 -> -
+64 typescript/example.tsx:8 <button onClick={onClick}>@9 -> -
+65 typescript/example.tsx:12 <span>@12 -> -
+66 typescript/example.tsx:14 log@15 -> -
+67 typescript/example.tsx:14 <div>@17 -> -
+68 typescript/example.tsx:14 <Button label=\"Click me\" onClick={handleClick} />@18 -> -
+69 typescript/example.tsx:14 <Icon />@19 -> -
 fwd attrs/logs.go:17 [0, 1]
 fwd attrs/paths.py:11 [4, 5]
 fwd attrs/paths.py:6 [2, 3]
@@ -286,26 +308,48 @@ fwd importgraph/py/util/geo.py:5 [33]
 fwd importgraph/ruby/app.rb:6 [35, 34, 36]
 fwd importgraph/ruby/helpers.rb:3 [37]
 fwd importgraph/ts-alias/src/app.ts:5 [38]
-fwd typescript/example.ts:26 [39]
-fwd typescript/example.ts:27 [40]
-fwd typescript/example.ts:33 [41]
-fwd typescript/example.tsx:12 [43]
-fwd typescript/example.tsx:14 [44, 45, 46, 47]
-fwd typescript/example.tsx:8 [42]
+fwd queries/go-chi/main.go:17 [39, 40, 41, 42, 43, 44]
+fwd queries/go-http/main.go:19 [45, 46, 47, 48]
+fwd queries/go-http/main.go:26 [49, 50, 51, 52]
+fwd queries/next-app/app/about/page.tsx:1 [53]
+fwd queries/next-app/app/blog/[slug]/page.tsx:1 [54]
+fwd queries/next-app/app/page.tsx:1 [55]
+fwd queries/solid-mavexa/frontend/src/routes/library.tsx:3 [56, 57, 58, 59]
+fwd queries/solid-mavexa/frontend/src/routes/library/[id].tsx:1 [60]
+fwd typescript/example.ts:26 [61]
+fwd typescript/example.ts:27 [62]
+fwd typescript/example.ts:33 [63]
+fwd typescript/example.tsx:12 [65]
+fwd typescript/example.tsx:14 [66, 67, 68, 69]
+fwd typescript/example.tsx:8 [64]
 rev example.go:10 [13]
 rev example.go:14 [12]
-rev ext <Button label=\"Click me\" onClick={handleClick} /> [46]
-rev ext <Icon /> [47]
-rev ext <button onClick={onClick}> [42]
-rev ext <div> [45]
-rev ext <span> [43]
+rev ext <Button label=\"Click me\" onClick={handleClick} /> [68]
+rev ext <Icon /> [69]
+rev ext <button onClick={onClick}> [64]
+rev ext <div> [60, 57, 67]
+rev ext <h1> [55]
+rev ext <p> [53, 54]
+rev ext <span> [65]
+rev ext Delete [43]
 rev ext Geo [32, 28]
+rev ext Get [40]
+rev ext Handle [47]
+rev ext HandleFunc [45, 51]
 rev ext Info [1]
+rev ext ListenAndServe [44, 52]
+rev ext NewRouter [39]
+rev ext NewServeMux [49]
+rev ext NotFoundHandler [48]
+rev ext Post [41]
 rev ext Printf [0]
 rev ext Println [11, 23]
+rev ext Route [42]
 rev ext Sprintf [25]
+rev ext String [58]
 rev ext add [21]
 rev ext allocate_buffer [19]
+rev ext createSignal [56]
 rev ext do_thing [33, 29]
 rev ext dump [36]
 rev ext free [7]
@@ -313,14 +357,17 @@ rev ext getpid [31]
 rev ext helper [38, 26, 15, 17]
 rev ext info [3, 5]
 rev ext join [2, 4]
-rev ext log [14, 16, 27, 44, 40, 39, 41]
+rev ext log [14, 16, 27, 66, 62, 61, 63]
 rev ext malloc [18, 6, 9]
 rev ext new [37, 35]
+rev ext open [59]
 rev ext ping [34]
 rev ext print [30]
 rev ext printf [20]
 rev ext process [8, 10]
 rev importgraph/go/util/format.go:5 [24]
 rev importgraph/go/util/geo.go:3 [22]
+rev queries/go-http/main.go:15 [46]
+rev queries/go-http/main.go:19 [50]
 "#;
 }

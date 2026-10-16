@@ -1,0 +1,17 @@
+# Routes registered on a chi router: r.Get("/x", h), r.Post, r.Put, r.Patch,
+# r.Delete, r.Head, r.Options, r.Handle, r.HandleFunc, r.Route and r.Mount.
+# The key is the path as written at the call, so a route inside r.Route("/a", ...)
+# shows without its "/a" prefix. The target is the handler, resolved with def.
+# A method value h.Method gives Method.
+framework = "chi"
+langs     = ["go"]
+detect    = { import = ["github.com/go-chi/chi"] }
+
+[route]
+match = [
+  # r.Get("/x", h.handler)
+  "(call_expression.function(selector_expression.field(field_identifier#/^(Get|Post|Put|Patch|Delete|Head|Options|Handle|HandleFunc|Route|Mount)$/)) > (argument_list > (interpreted_string_literal @key) + (selector_expression.field(@target))))",
+  # r.Get("/x", handler)
+  "(call_expression.function(selector_expression.field(field_identifier#/^(Get|Post|Put|Patch|Delete|Head|Options|Handle|HandleFunc|Route|Mount)$/)) > (argument_list > (interpreted_string_literal @key) + (identifier @target)))",
+]
+target = "def"

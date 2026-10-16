@@ -15,9 +15,14 @@
 //! target = "def"                          # def, enclosing or self
 //! ```
 //!
-//! `rewrite`, `paths` and `key_from_path` (query keys) and the `default-export`
-//! target are recognised and rejected as not supported yet, so a file written
-//! for a later ctsq says what is missing rather than failing on an unknown key.
+//! Further keys of a query table:
+//!
+//! ```toml
+//! rewrite       = ["(\\w+)#(\\w+)", "${1:pascal}Controller#$2"]  # the @target text, before resolution
+//! paths         = "app/**/page.{tsx,jsx,ts,js}"   # file routes: each matching file is a match
+//! key_from_path = "^app(/.*)?/page\\.\\w+$"          # the key is group 1, or / when empty
+//! target        = "default-export"                # the module's default export
+//! ```
 
 use super::{ConfigError, Roots, BUILTIN_QUERIES};
 use std::collections::BTreeMap;
@@ -32,6 +37,9 @@ pub enum Target {
     Enclosing,
     /// The match itself (its `@target` capture when it has one).
     Match,
+    /// Resolve the `@target` (a module specifier, or the file itself for a
+    /// `paths` query) to a file and name that file's default export.
+    DefaultExport,
 }
 
 /// When a framework's queries apply. Empty lists mean no rule of that kind.
@@ -57,15 +65,20 @@ pub struct NamedQuery {
     /// Selectors, each run on its own. A row from any of them is a match.
     pub matches: Vec<String>,
     pub target: Target,
+    /// `[regex, replacement]` applied to the `@target` text before `def` runs.
+    pub rewrite: Option<(String, String)>,
+    /// `[regex, replacement]` applied to the key (after its quotes are dropped).
+    pub key_rewrite: Option<(String, String)>,
+    /// A glob, relative to the search root: each matching file is a match.
+    pub paths: Option<String>,
+    /// With `paths`: a regex over the relative path, the key is group 1.
+    pub key_from_path: Option<String>,
     /// The file as printed: a path for a file on disk, or
     /// `built-in queries/<file>.toml`.
     pub source: String,
     /// 1-based line of the query's `[name]` table in the file.
     pub line: usize,
 }
-
-/// Keys a query table may hold that a later ctsq fills in.
-const NOT_YET: &[&str] = &["rewrite", "paths", "key_from_path"];
 
 fn err(label: &str, line: Option<usize>, key: Option<&str>, msg: &str) -> ConfigError {
     ConfigError::new(label, line, key.map(str::to_string), msg)
@@ -98,6 +111,10 @@ fn table_line(text: &str, name: &str) -> usize {
         })
         .map(|i| i + 1)
         .unwrap_or(1)
+}
+
+fn single(label: &str, line: usize, name: &str, key: &str, v: &toml::Value) -> Result<String, ConfigError> {
+    v.as_str().map(str::to_string).ok_or_else(|| err(label, Some(line), Some(name), &format!("`{}` is a string", key)))
 }
 
 fn canonical_lang(name: &str) -> Option<&'static str> {
@@ -174,6 +191,10 @@ pub fn parse_file(label: &str, text: &str) -> Result<Vec<NamedQuery>, ConfigErro
         };
         let mut matches = Vec::new();
         let mut target = None;
+        let mut rewrite = None;
+        let mut key_rewrite = None;
+        let mut paths = None;
+        let mut key_from_path = None;
         for (k, v) in q {
             match k.as_str() {
                 "match" => matches = strings(label, name, v)?,
@@ -182,16 +203,51 @@ pub fn parse_file(label: &str, text: &str) -> Result<Vec<NamedQuery>, ConfigErro
                         Some("def") => Target::Def,
                         Some("enclosing") => Target::Enclosing,
                         Some("self") => Target::Match,
-                        Some("default-export") => {
-                            return Err(err(label, Some(line), Some(name), "target \"default-export\" is not supported yet"))
-                        }
+                        Some("default-export") => Target::DefaultExport,
                         _ => {
-                            return Err(err(label, Some(line), Some(name), "target must be \"def\", \"enclosing\" or \"self\""))
+                            return Err(err(
+                                label,
+                                Some(line),
+                                Some(name),
+                                "target must be \"def\", \"enclosing\", \"self\" or \"default-export\"",
+                            ))
                         }
                     })
                 }
-                k if NOT_YET.contains(&k) => {
-                    return Err(err(label, Some(line), Some(name), &format!("`{}` is not supported yet", k)))
+                "rewrite" => {
+                    let pair = strings(label, name, v)?;
+                    if pair.len() != 2 {
+                        return Err(err(label, Some(line), Some(name), "`rewrite` is [\"<regex>\", \"<replacement>\"]"));
+                    }
+                    if let Err(e) = regex::Regex::new(&pair[0]) {
+                        return Err(err(
+                            label,
+                            Some(line),
+                            Some(name),
+                            &format!("`rewrite` regex does not compile: {}", e.to_string().lines().last().unwrap_or("").trim()),
+                        ));
+                    }
+                    rewrite = Some((pair[0].clone(), pair[1].clone()));
+                }
+                "key_rewrite" => {
+                    let pair = strings(label, name, v)?;
+                    if pair.len() != 2 || regex::Regex::new(&pair[0]).is_err() {
+                        return Err(err(label, Some(line), Some(name), "`key_rewrite` is [\"<regex>\", \"<replacement>\"]"));
+                    }
+                    key_rewrite = Some((pair[0].clone(), pair[1].clone()));
+                }
+                "paths" => paths = Some(single(label, line, name, "paths", v)?),
+                "key_from_path" => {
+                    let re = single(label, line, name, "key_from_path", v)?;
+                    if let Err(e) = regex::Regex::new(&re) {
+                        return Err(err(
+                            label,
+                            Some(line),
+                            Some(name),
+                            &format!("`key_from_path` regex does not compile: {}", e.to_string().lines().last().unwrap_or("").trim()),
+                        ));
+                    }
+                    key_from_path = Some(re);
                 }
                 other => {
                     return Err(err(
@@ -203,8 +259,11 @@ pub fn parse_file(label: &str, text: &str) -> Result<Vec<NamedQuery>, ConfigErro
                 }
             }
         }
-        if matches.is_empty() {
+        if matches.is_empty() && paths.is_none() {
             return Err(err(label, Some(line), Some(name), "missing `match = \"<selector>\"`"));
+        }
+        if paths.is_some() != key_from_path.is_some() {
+            return Err(err(label, Some(line), Some(name), "`paths` and `key_from_path` go together"));
         }
         for m in &matches {
             if let Err(e) = crate::query::parse(m) {
@@ -221,11 +280,93 @@ pub fn parse_file(label: &str, text: &str) -> Result<Vec<NamedQuery>, ConfigErro
             detect: detect.clone(),
             matches,
             target,
+            rewrite,
+            key_rewrite,
+            paths,
+            key_from_path,
             source: label.to_string(),
             line,
         });
     }
     Ok(out)
+}
+
+/// `Pascal` case of `text`: words split at anything not a letter or digit, each
+/// starting upper case (`user_profiles` gives `UserProfiles`).
+fn pascal(text: &str) -> String {
+    let mut out = String::new();
+    for w in text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()) {
+        let mut cs = w.chars();
+        if let Some(f) = cs.next() {
+            out.extend(f.to_uppercase());
+            out.push_str(cs.as_str());
+        }
+    }
+    out
+}
+
+fn camel(text: &str) -> String {
+    let p = pascal(text);
+    let mut cs = p.chars();
+    match cs.next() {
+        Some(f) => f.to_lowercase().chain(cs).collect(),
+        None => p,
+    }
+}
+
+/// Expand `$1`, `${1}`, `${1:pascal}` and `${1:camel}` against `caps`.
+fn expand(caps: &regex::Captures, repl: &str) -> String {
+    let mut out = String::new();
+    let cs: Vec<char> = repl.chars().collect();
+    let mut i = 0;
+    while i < cs.len() {
+        if cs[i] != '$' || i + 1 >= cs.len() {
+            out.push(cs[i]);
+            i += 1;
+            continue;
+        }
+        let (spec, next) = if cs[i + 1] == '{' {
+            match cs[i + 2..].iter().position(|&c| c == '}') {
+                Some(end) => (cs[i + 2..i + 2 + end].iter().collect::<String>(), i + 3 + end),
+                None => {
+                    out.push('$');
+                    i += 1;
+                    continue;
+                }
+            }
+        } else {
+            let digits: String = cs[i + 1..].iter().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.is_empty() {
+                out.push('$');
+                i += 1;
+                continue;
+            }
+            let n = digits.len();
+            (digits, i + 1 + n)
+        };
+        let (num, filter) = spec.split_once(':').unwrap_or((&spec, ""));
+        let group = num.parse::<usize>().ok().and_then(|n| caps.get(n)).map(|m| m.as_str()).unwrap_or("");
+        out.push_str(&match filter {
+            "pascal" => pascal(group),
+            "camel" => camel(group),
+            _ => group.to_string(),
+        });
+        i = next;
+    }
+    out
+}
+
+/// Replace the first match of the rewrite's regex in `text` with its
+/// replacement. Text the regex does not match is returned as it is.
+pub fn apply_rewrite(rw: &(String, String), text: &str) -> String {
+    let Ok(re) = regex::Regex::new(&rw.0) else { return text.to_string() };
+    match re.captures(text) {
+        Some(c) => {
+            let m = c.get(0).unwrap();
+            format!("{}{}{}", &text[..m.start()], expand(&c, &rw.1), &text[m.end()..])
+        }
+        None => text.to_string(),
+    }
 }
 
 /// The `queries/` directory of each on-disk layer, highest priority first.
@@ -318,15 +459,39 @@ mod tests {
     }
 
     #[test]
-    fn later_fields_are_named_as_not_supported_yet() {
-        for key in ["rewrite = [\"a\", \"b\"]", "paths = \"app/**\"", "key_from_path = \"x\""] {
-            let text = format!("framework = \"f\"\nlangs = [\"ts\"]\n[route]\nmatch = \"(id @key)\"\ntarget = \"def\"\n{}\n", key);
+    fn rewrite_paths_and_the_default_export_target_parse() {
+        let text = "framework = \"f\"\nlangs = [\"ts\"]\n[route]\nmatch = \"(id @key)\"\ntarget = \"def\"\nrewrite = [\"(\\\\w+)#(\\\\w+)\", \"${1:pascal}#$2\"]\n\n[file]\npaths = \"app/**/page.tsx\"\nkey_from_path = \"^app(/.*)?/page\\\\.\\\\w+$\"\ntarget = \"default-export\"\n";
+        let qs = parse_file("f.toml", text).unwrap();
+        let route = qs.iter().find(|q| q.name == "route").unwrap();
+        assert_eq!(route.rewrite.as_ref().unwrap().1, "${1:pascal}#$2");
+        let file = qs.iter().find(|q| q.name == "file").unwrap();
+        assert_eq!(file.target, Target::DefaultExport);
+        assert!(file.matches.is_empty() && file.paths.as_deref() == Some("app/**/page.tsx"));
+        assert!(file.key_from_path.is_some());
+    }
+
+    #[test]
+    fn rewrite_expands_groups_and_case_filters() {
+        let rw = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(apply_rewrite(&rw("(\\w+)#(\\w+)", "${1:pascal}Controller#$2"), "library#index"), "LibraryController#index");
+        assert_eq!(apply_rewrite(&rw("(\\w+)#(\\w+)", "${1:pascal}Controller#$2"), "user_profiles#show"), "UserProfilesController#show");
+        assert_eq!(apply_rewrite(&rw("^(\\w+)$", "${1:camel}!"), "User_profiles"), "userProfiles!");
+        assert_eq!(apply_rewrite(&rw("a(b)", "<$1${1}>"), "xabz"), "x<bb>z");
+        assert_eq!(apply_rewrite(&rw("^q$", "r"), "other"), "other", "no match leaves the text");
+    }
+
+    #[test]
+    fn bad_rewrite_and_lone_paths_are_errors() {
+        for (extra, want) in [
+            ("rewrite = [\"a\"]", "rewrite"),
+            ("rewrite = [\"(\", \"b\"]", "does not compile"),
+            ("paths = \"app/**\"", "go together"),
+        ] {
+            let text = format!("framework = \"f\"\nlangs = [\"ts\"]\n[route]\nmatch = \"(id @key)\"\ntarget = \"def\"\n{}\n", extra);
             let e = parse_file("f.toml", &text).unwrap_err();
-            assert!(e.message.contains("not supported yet"), "{}: {}", key, e);
+            assert!(e.message.contains(want), "{}: {}", extra, e);
             assert_eq!(e.line, Some(3), "{}", e);
         }
-        let e = parse_file("f.toml", "framework = \"f\"\nlangs = [\"ts\"]\n[route]\nmatch = \"id\"\ntarget = \"default-export\"\n").unwrap_err();
-        assert!(e.message.contains("not supported yet"), "{}", e);
     }
 
     #[test]
@@ -377,7 +542,7 @@ mod tests {
         let roots = Roots::from_vars(&d, Some(d.join("home").to_str().unwrap()), None, None);
         let qs = load_with(&roots, &d).unwrap();
         let frameworks: Vec<&str> = qs.iter().filter(|q| q.name == "route").map(|q| q.framework.as_str()).collect();
-        assert_eq!(frameworks, vec!["react-router", "solid-routes"]);
+        assert_eq!(frameworks, vec!["chi", "net-http", "next-app", "rails-routes", "react-router", "solid-routes"]);
         assert!(qs.iter().all(|q| q.source.starts_with("built-in queries/")), "{:?}", qs);
         std::fs::remove_dir_all(&d).ok();
     }

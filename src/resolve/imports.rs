@@ -230,6 +230,49 @@ pub fn build(jobs: &[(String, &'static str)]) -> ImportGraph {
     ImportGraph { files, packages, by_canonical, imports, fwd, rev }
 }
 
+/// Resolves a JS/TS module specifier (`./pages/Home`, `~/routes/library`) to
+/// the scanned files it can name, with the same rules the import graph uses:
+/// relative probing with the usual extensions and `index.*`, then tsconfig
+/// aliases, then the suffix match.
+pub struct JsSpecResolver {
+    known: HashSet<String>,
+    display_of: HashMap<String, String>,
+    tsconf: super::tsconfig::TsConfig,
+}
+
+impl JsSpecResolver {
+    pub fn new(jobs: &[(String, &'static str)]) -> JsSpecResolver {
+        let mut files: Vec<FileInfo> = Vec::new();
+        let mut known = HashSet::new();
+        let mut display_of = HashMap::new();
+        for (path, lang) in jobs {
+            if path == "-" { continue; }
+            let canonical = canonical_path(path);
+            if !known.insert(canonical.clone()) { continue; }
+            display_of.insert(canonical.clone(), path.clone());
+            files.push(FileInfo { display: path.clone(), canonical, lang });
+        }
+        let tsconf = super::tsconfig::TsConfig::build(&files);
+        JsSpecResolver { known, display_of, tsconf }
+    }
+
+    /// The scanned files (as listed in the jobs) `spec` names from `importer`.
+    pub fn resolve(&self, importer: &str, spec: &str) -> Vec<String> {
+        let imp = canonical_path(importer);
+        let importer = Path::new(&imp);
+        let raw = RawImport::new(spec, classify_js(spec), 0);
+        let resolver = JsTsImports { lang: "typescript" };
+        let hits = if raw.kind == ImportKind::Relative {
+            resolver.resolve(&raw, importer, &self.known)
+        } else {
+            self.tsconf
+                .resolve(importer, spec, &self.known)
+                .unwrap_or_else(|| resolver.resolve(&raw, importer, &self.known))
+        };
+        hits.into_iter().filter_map(|h| self.display_of.get(&h).cloned()).collect()
+    }
+}
+
 /// Turn resolved target paths into edges: 0 → External, 1 → Exact File,
 /// >1 → one Guess File edge per candidate. Deduped per (importer, target-node).
 fn push_edges(

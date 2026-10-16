@@ -1,0 +1,12 @@
+# Next.js app router: every app/**/page file is a route. The key comes from the
+# directory path (route groups written (name) are not part of the URL and are
+# dropped, [id] segments stay as written). The target is the page's default
+# export, or the file name when that export is anonymous.
+framework = "next-app"
+langs     = ["tsx", "ts", "jsx", "js"]
+detect    = { file = ["app/layout.tsx", "app/layout.jsx", "app/layout.ts", "app/layout.js"] }
+
+[route]
+paths         = "app/**/page.{tsx,jsx,ts,js}"
+key_from_path = "^app(/.*)?/page\\.\\w+$"
+target        = "default-export"
