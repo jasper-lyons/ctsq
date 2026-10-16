@@ -99,3 +99,4 @@ Minor findings from the mid-build adversarial review, not fixed in this build:
 - An `--exclude` glob with a slash is matched relative to the search root, so the path as ctsq prints it (`th/ts/**`) excludes nothing, silently.
 - `string` and `literal` do not cover JS/TS template strings, so the id# miss fallback misses them too.
 - Test-scope detection still costs time: `tree src/` takes 0.27s against 0.10s before this build (0.41s before the fix). Next step: cache compiled scope queries across files.
+- `scopeof --siblings` on a top-level Rust item also lists the functions inside `mod tests`, because `mod_item` is not a scope and the walk descends into it.
