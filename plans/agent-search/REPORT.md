@@ -70,3 +70,15 @@ From the build worktree, after `cargo build --release`, with `C=./target/release
 - In JS and TS, a `def` target that is a quoted module path resolves to that module's default export. That is how the Solid lazy-import shape works.
 - `string` matches only string literals, never numbers. `bash`/`sh` shebangs are recognised, but those files are skipped because there is no shell grammar.
 - The Rails `resources :x` row has key `/x` and target `XController`, through a new `key_rewrite` field.
+
+## Follow-up round (2026-10-16), after Jasper's answers
+
+This round supersedes the "Left undone" items above about the held questions and the footer shape.
+
+- **Several names per call:** `def`, `refs`, `callers`, `callees` and `explain` take names, then paths. An argument that exists on disk is a path, `--` forces paths, the search root defaults to `.`, and the names that missed are listed on stderr as `not found: X (similar: ...)`. The exit is 0 if any name resolved.
+- **Limits:** `--max-matches N` on every command that returns hits. `path --max` is renamed `--max-depth`, and `callers`/`callees` `--depth` is renamed `--max-depth`, with `--depth` still accepted.
+- **Footer:** one `hidden:` line per reason.
+- **Errors on stderr:** every miss report goes to stderr with exit 1, and so does the everything-hidden report (`no reference to X outside tests in P (N files)`).
+- **`find` listing:** the columns line up.
+- **Performance:** `plans/agent-search/measure/bench.sh` compares the new binary with the pre-build one (5f867dc). The tables are in DELIVERY.md. On Mavexa, `explain` went from 33s to 7.6s and `callers` from 29s to 4.8s. Two calls are still slower than before: `-q id#` on this repo at 1.17x and `callers` at 1.09x. Both are the cost of hiding tests, and both match the old binary with `--tests`.
+- **Docs and install:** the docs drafts were re-copied to `~/.claude/CLAUDE.md`, `~/.claude/skills/ctsq/SKILL.md` and `control/.agents/skills/ctsq/SKILL.md`, and `make install` was run from this branch.
