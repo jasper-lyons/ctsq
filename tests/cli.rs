@@ -798,3 +798,119 @@ fn scopeof_missing_file_is_named_on_stderr_and_exits_one() {
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).contains("no such file: no/such/file.rs"), "{}", stderr(&out));
 }
+
+// ── find ─────────────────────────────────────────────────────────────────────
+
+/// ctsq run in `dir` with no user config or cache layer, so only the repo
+/// `.ctsq/` and the built-in queries count.
+fn ctsq_in(dir: &str, args: &[&str]) -> Output {
+    let empty = std::env::temp_dir().join(format!("ctsq-cli-xdg-{}", std::process::id()));
+    std::fs::create_dir_all(&empty).unwrap();
+    Command::new(env!("CARGO_BIN_EXE_ctsq"))
+        .args(args)
+        .current_dir(dir)
+        .env("XDG_CONFIG_HOME", &empty)
+        .env("XDG_CACHE_HOME", &empty)
+        .output()
+        .expect("failed to run ctsq")
+}
+
+#[test]
+fn find_route_with_a_key_prints_columns_and_the_count_line() {
+    let out = ctsq_in(&fixture("queries/react-router"), &["find", "route", "/about"]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        "src/main.tsx:6  /about  About  src/pages.tsx:5\n1 route (react-router, from built-in queries/react-router.toml)\n"
+    );
+}
+
+#[test]
+fn find_with_no_arguments_lists_what_applies_and_exits_0() {
+    let out = ctsq_in(&fixture("queries/solid"), &["find"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        stdout(&out),
+        "built-in queries/solid-routes.toml:9: route  solid-routes  (import @solidjs/router in src/App.tsx)\nnot detected here: route (react-router)\n"
+    );
+}
+
+#[test]
+fn find_uses_a_repo_override_and_names_it() {
+    let out = ctsq_in(&fixture("queries/solid-mavexa"), &["find", "route", "/library"]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert!(stdout(&out).ends_with("2 routes (solid-routes, from .ctsq/queries/solid-routes.toml)\n"), "{}", stdout(&out));
+}
+
+#[test]
+fn find_misses_exit_1_and_an_unknown_query_exits_2() {
+    let out = ctsq_in(&fixture("queries/solid"), &["find", "route", "/nowhere"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stdout(&out).starts_with("no route matches /nowhere here (tried solid-routes from built-in queries/solid-routes.toml)\n"), "{}", stdout(&out));
+    let out = ctsq_in(&fixture("queries/solid"), &["find", "nope"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).starts_with("no named query 'nope'"), "{}", stderr(&out));
+    assert!(stdout(&out).is_empty());
+}
+
+#[test]
+fn find_hides_tests_and_tests_shows_them() {
+    let dir = fixture("queries/solid");
+    let out = ctsq_in(&dir, &["find", "route", "test-only"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stdout(&out), "0 routes\nhidden: 1 in tests (--tests)\n");
+    let out = ctsq_in(&dir, &["find", "route", "test-only", "--tests"]);
+    assert!(out.status.success(), "{}", stdout(&out));
+    assert!(stdout(&out).starts_with("src/routes.test.ts:3  /about/test-only"), "{}", stdout(&out));
+}
+
+#[test]
+fn a_broken_repo_query_file_is_an_error_naming_the_file() {
+    let d = scratch_dir("findbroken");
+    std::fs::create_dir_all(d.join(".ctsq/queries")).unwrap();
+    std::fs::write(d.join(".ctsq/queries/x.toml"), "framework = \"x\"\nlangs = [\"ts\"]\n[route]\nmatch = \"id\"\ntarget = \"def\"\nrewrite = [\"a\", \"b\"]\n").unwrap();
+    let out = ctsq_in(d.to_str().unwrap(), &["find"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains(".ctsq/queries/x.toml:3: [route] `rewrite` is not supported yet"), "{}", stderr(&out));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn config_path_lists_a_queries_directory_per_layer() {
+    let out = ctsq_in(&fixture("queries/solid-mavexa"), &["config", "path"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("\nqueries:\n1. repo      "), "{}", text);
+    assert!(text.contains("solid-mavexa/.ctsq/queries\n"), "{}", text);
+    assert!(text.contains("4. built-in  react-router.toml, solid-routes.toml\n"), "{}", text);
+}
+
+/// Every `match` of every built-in pack also runs as a plain -q query and
+/// finds something in the pack fixtures. A match using JSX node kinds runs
+/// under -l tsx, since the plain typescript grammar has none.
+#[test]
+fn every_built_in_match_runs_as_a_plain_query() {
+    let dir = format!("{}/config/queries", env!("CARGO_MANIFEST_DIR"));
+    let mut n = 0;
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        let table: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        for (name, v) in &table {
+            let Some(m) = v.as_table().and_then(|q| q.get("match")) else { continue };
+            let matches: Vec<String> = match m {
+                toml::Value::String(s) => vec![s.clone()],
+                toml::Value::Array(a) => a.iter().map(|x| x.as_str().unwrap().to_string()).collect(),
+                other => panic!("{:?}", other),
+            };
+            for m in matches {
+                n += 1;
+                let ts = ctsq(&["-l", "ts", "-q", &m, &fixture("queries")]);
+                let ok = ts.status.success()
+                    || (stderr(&ts).starts_with("unknown kind")
+                        && ctsq(&["-l", "tsx", "-q", &m, &fixture("queries")]).status.success());
+                assert!(ok, "{} [{}] {}: {}{}", path.display(), name, m, stdout(&ts), stderr(&ts));
+            }
+        }
+    }
+    assert!(n >= 7, "every pack match was checked: {}", n);
+}
