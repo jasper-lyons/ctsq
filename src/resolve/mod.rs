@@ -503,12 +503,25 @@ fn nested_def_sites(name: &str, jobs: &[(String, &'static str)]) -> Vec<(String,
         .filter_map(|k| crate::query::parse(&format!("*{}#\"{}\"", k, name)).ok())
         .collect();
     let mut found: Vec<(String, usize)> = Vec::new();
+    // Compiled queries per language, built once.
+    let mut compiled_by_lang: HashMap<&'static str, Vec<crate::compiler::CompiledQuery>> = HashMap::new();
     for (file, lang_name) in jobs {
-        let Some(lang) = crate::compiler::lang::for_name(lang_name) else { continue };
         let Ok(source) = std::fs::read(file) else { continue };
-        for ast in &queries {
-            let compiled = crate::compiler::compile(ast, lang.as_ref());
-            let rows = crate::runner::run_rows(&compiled, lang.as_ref(), &source, false).unwrap_or_default();
+        // A definition of the name has the name's bytes in its file.
+        if !holds(&source, name) {
+            continue;
+        }
+        let Some(lang) = crate::compiler::lang::for_name(lang_name) else { continue };
+        let compiled = compiled_by_lang
+            .entry(lang_name)
+            .or_insert_with(|| queries.iter().map(|ast| crate::compiler::compile(ast, lang.as_ref())).collect());
+        let mut parser = tree_sitter::Parser::new();
+        if parser.set_language(&lang.ts_language()).is_err() {
+            continue;
+        }
+        let Some(tree) = parser.parse(&source, None) else { continue };
+        for c in compiled.iter() {
+            let rows = crate::runner::run_rows_on(c, lang.as_ref(), &source, &tree, false).unwrap_or_default();
             found.extend(rows.into_iter().map(|r| (file.clone(), r.line)));
         }
     }
@@ -731,6 +744,26 @@ mod tests {
         assert!(similar_names("ab", &pool).is_empty(), "a two-letter needle matches everything");
         let hits = similar_names("abc", &pool);
         assert_eq!(hits, vec!["abcdef".to_string()], "{:?}", hits);
+    }
+
+    #[test]
+    fn nested_def_sites_find_each_kind_in_files_holding_the_name_and_skip_the_rest() {
+        let d = std::env::temp_dir().join(format!("ctsq-nested-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let a = d.join("a.ts");
+        let b = d.join("b.ts");
+        std::fs::write(&a, "function outer() {\n  const deepName = () => 1;\n  function deepFn() {}\n}\n").unwrap();
+        std::fs::write(&b, "function other() {\n  const x = 1;\n}\n").unwrap();
+        let jobs = vec![
+            (a.to_string_lossy().to_string(), "typescript"),
+            (b.to_string_lossy().to_string(), "typescript"),
+        ];
+        let v = nested_def_sites("deepName", &jobs);
+        assert_eq!(v, vec![(a.to_string_lossy().to_string(), 2)], "{:?}", v);
+        let f = nested_def_sites("deepFn", &jobs);
+        assert_eq!(f, vec![(a.to_string_lossy().to_string(), 3)], "{:?}", f);
+        assert!(nested_def_sites("zzzqq", &jobs).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

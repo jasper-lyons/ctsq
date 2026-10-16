@@ -268,6 +268,17 @@ impl Hider {
     /// Test scopes in `file` as inclusive 1-based line ranges, cached per file.
     /// `source` saves a read when the caller already holds the bytes.
     pub fn scope_lines(&mut self, file: &str, source: Option<&[u8]>) -> Vec<(usize, usize)> {
+        self.scope_lines_in(file, source, None)
+    }
+
+    /// `scope_lines` with a tree the caller already parsed from the file with
+    /// its grammar, so a Rust file is not parsed a second time.
+    pub fn scope_lines_in(
+        &mut self,
+        file: &str,
+        source: Option<&[u8]>,
+        tree: Option<&tree_sitter::Tree>,
+    ) -> Vec<(usize, usize)> {
         if !self.has_scopes(file) {
             return vec![];
         }
@@ -297,13 +308,21 @@ impl Hider {
             // A Rust file with neither `mod test` nor `cfg(` has no test scope,
             // so it is not parsed. Otherwise one parse serves every scope.
             if contains(source, b"mod test") || contains(source, b"cfg(") {
-                if let Some(tree) = parse_rust(source) {
+                let parsed;
+                let tree = match tree {
+                    Some(t) => Some(t),
+                    None => {
+                        parsed = parse_rust(source);
+                        parsed.as_ref()
+                    }
+                };
+                if let Some(tree) = tree {
                     for (l, c) in &t.scopes {
-                        if let Ok(rows) = crate::runner::run_rows_on(c, l.as_ref(), source, &tree, false) {
+                        if let Ok(rows) = crate::runner::run_rows_on(c, l.as_ref(), source, tree, false) {
                             add_rows(rows);
                         }
                     }
-                    ranges.extend(rust_cfg_test_ranges(&tree, source));
+                    ranges.extend(rust_cfg_test_ranges(tree, source));
                 }
             }
         } else {
@@ -414,7 +433,7 @@ pub fn glob_regex(glob: &str) -> regex::Regex {
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|w| w == needle)
+    crate::resolve::holds(haystack, std::str::from_utf8(needle).unwrap_or(""))
 }
 
 fn parse_rust(source: &[u8]) -> Option<tree_sitter::Tree> {
@@ -429,24 +448,36 @@ fn parse_rust(source: &[u8]) -> Option<tree_sitter::Tree> {
 /// attribute" (BUILD.md A09).
 fn rust_cfg_test_ranges(tree: &tree_sitter::Tree, source: &[u8]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
-    let mut stack = vec![tree.root_node()];
-    while let Some(node) = stack.pop() {
-        let mut cursor = node.walk();
-        let children: Vec<tree_sitter::Node> = node.named_children(&mut cursor).collect();
-        for (i, child) in children.iter().enumerate() {
-            if child.kind() == "attribute_item" {
-                let text: String = child.utf8_text(source).unwrap_or("").chars().filter(|c| !c.is_whitespace()).collect();
-                if text == "#[cfg(test)]" {
-                    let item = children[i + 1..]
-                        .iter()
-                        .find(|n| !matches!(n.kind(), "attribute_item" | "line_comment" | "block_comment"));
-                    if let Some(item) = item {
-                        out.push((child.start_position().row + 1, item.end_position().row + 1));
-                    }
-                }
-            } else if child.child_count() > 0 {
-                stack.push(*child);
+    let root = tree.root_node();
+    // An attribute that names `cfg` has those bytes, so look the attribute up
+    // from each occurrence instead of walking every node of the tree.
+    let text = String::from_utf8_lossy(source);
+    let mut seen: Vec<usize> = Vec::new();
+    for (at, _) in text.match_indices("cfg") {
+        let Some(mut node) = root.descendant_for_byte_range(at, at + 3) else { continue };
+        while node.kind() != "attribute_item" {
+            match node.parent() {
+                Some(p) => node = p,
+                None => break,
             }
+        }
+        if node.kind() != "attribute_item" || seen.contains(&node.start_byte()) {
+            continue;
+        }
+        seen.push(node.start_byte());
+        let attr: String = node.utf8_text(source).unwrap_or("").chars().filter(|c| !c.is_whitespace()).collect();
+        if attr != "#[cfg(test)]" {
+            continue;
+        }
+        let mut item = node.next_named_sibling();
+        while let Some(n) = item {
+            if !matches!(n.kind(), "attribute_item" | "line_comment" | "block_comment") {
+                break;
+            }
+            item = n.next_named_sibling();
+        }
+        if let Some(item) = item {
+            out.push((node.start_position().row + 1, item.end_position().row + 1));
         }
     }
     out
@@ -636,6 +667,21 @@ mod tests {
         assert!(glob_regex("test_?.py").is_match("test_a.py"));
         assert!(glob_regex("[ab].go").is_match("b.go") && !glob_regex("[ab].go").is_match("c.go"));
         assert!(glob_regex("a.b").is_match("a.b") && !glob_regex("a.b").is_match("axb"));
+    }
+
+    #[test]
+    fn a_tree_the_caller_parsed_gives_the_same_scopes_and_cfg_in_strings_is_not_a_scope() {
+        let d = scratch("scopes-tree");
+        let src = "const S: &str = \"#[cfg(test)]\";\n// #[cfg(test)]\n#[cfg( test )]\n#[allow(dead_code)]\nfn helper() {\n}\n\nmod m {\n    #[cfg(test)]\n    fn inner() {}\n}\n";
+        fs::write(d.join("lib.rs"), src).unwrap();
+        let (mut h, jobs) = hider_over(&d, &HideOpts::default());
+        let f = &jobs[0].0;
+        let tree = parse_rust(src.as_bytes()).unwrap();
+        let with_tree = h.scope_lines_in(f, Some(src.as_bytes()), Some(&tree));
+        assert_eq!(with_tree, vec![(3, 6), (9, 10)]);
+        let (mut h2, _) = hider_over(&d, &HideOpts::default());
+        assert_eq!(h2.scope_lines(f, None), with_tree);
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]

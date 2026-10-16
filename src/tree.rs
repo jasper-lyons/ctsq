@@ -49,7 +49,7 @@ pub fn report(path: &str, lang_name: Option<&str>, hider: &mut crate::files::Hid
         hidden.count(why, count_items(&items));
         return Outline { text: String::new(), entries: 0, hidden };
     }
-    let scopes = hider.scope_lines(path, Some(&source));
+    let scopes = hider.scope_lines_in(path, Some(&source), Some(&tree));
     if !scopes.is_empty() {
         hidden.tests += drop_scoped(&mut items, &scopes);
     }
