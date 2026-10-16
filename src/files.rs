@@ -95,9 +95,9 @@ pub fn resolve_jobs(path: &str, lang_name: Option<&str>, no_ignore: bool) -> Vec
                 match std::path::Path::new(path).extension().and_then(|e| e.to_str()) {
                     Some(ext) => eprintln!("Cannot detect language from extension .{}; use --lang", ext),
                     None if lang::shebang_is_shell(&lang::first_line_of(path)) => {
-                        eprintln!("Cannot detect language for {}: shell scripts have no grammar here; use --lang to force one", path)
+                        eprintln!("Cannot detect language for {}: shell scripts have no grammar here. Use --lang to force one", path)
                     }
-                    None => eprintln!("Cannot detect language for {}: no extension and no recognised shebang; use --lang", path),
+                    None => eprintln!("Cannot detect language for {}: no extension and no recognised shebang. Use --lang", path),
                 }
                 std::process::exit(1);
             }

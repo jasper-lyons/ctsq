@@ -288,23 +288,27 @@ mod tests {
 70 queries/jsx/src/Card.tsx:14 <footer>@14 -> -
 71 queries/jsx/src/Card.tsx:16 <div>@18 -> -
 72 queries/jsx/src/Card.tsx:21 <Divider />@21 -> -
-73 queries/next-app/app/about/page.tsx:1 <p>@1 -> -
-74 queries/next-app/app/blog/[slug]/page.tsx:1 <p>@1 -> -
-75 queries/next-app/app/page.tsx:1 <h1>@1 -> -
-76 queries/solid-mavexa/frontend/src/routes/library.tsx:3 createSignal@4 -> -
-77 queries/solid-mavexa/frontend/src/routes/library.tsx:3 <div>@5 -> -
-78 queries/solid-mavexa/frontend/src/routes/library.tsx:3 String@5 -> -
-79 queries/solid-mavexa/frontend/src/routes/library.tsx:3 open@5 -> -
-80 queries/solid-mavexa/frontend/src/routes/library/[id].tsx:1 <div>@2 -> -
-81 typescript/example.ts:26 log@34 -> -
-82 typescript/example.ts:27 log@28 -> -
-83 typescript/example.ts:33 log@34 -> -
-84 typescript/example.tsx:8 <button onClick={onClick}>@9 -> -
-85 typescript/example.tsx:12 <span>@12 -> -
-86 typescript/example.tsx:14 log@15 -> -
-87 typescript/example.tsx:14 <div>@17 -> -
-88 typescript/example.tsx:14 <Button label=\"Click me\" onClick={handleClick} />@18 -> -
-89 typescript/example.tsx:14 <Icon />@19 -> -
+73 queries/jsx/src/Live.tsx:1 <div className=\"Not text\">@3 -> -
+74 queries/jsx/src/Live.tsx:1 <b>@4 -> -
+75 queries/jsx/src/Live.tsx:1 <i>@5 -> -
+76 queries/jsx/src/Live.tsx:1 <u>@7 -> -
+77 queries/next-app/app/about/page.tsx:1 <p>@1 -> -
+78 queries/next-app/app/blog/[slug]/page.tsx:1 <p>@1 -> -
+79 queries/next-app/app/page.tsx:1 <h1>@1 -> -
+80 queries/solid-mavexa/frontend/src/routes/library.tsx:3 createSignal@4 -> -
+81 queries/solid-mavexa/frontend/src/routes/library.tsx:3 <div>@5 -> -
+82 queries/solid-mavexa/frontend/src/routes/library.tsx:3 String@5 -> -
+83 queries/solid-mavexa/frontend/src/routes/library.tsx:3 open@5 -> -
+84 queries/solid-mavexa/frontend/src/routes/library/[id].tsx:1 <div>@2 -> -
+85 typescript/example.ts:26 log@34 -> -
+86 typescript/example.ts:27 log@28 -> -
+87 typescript/example.ts:33 log@34 -> -
+88 typescript/example.tsx:8 <button onClick={onClick}>@9 -> -
+89 typescript/example.tsx:12 <span>@12 -> -
+90 typescript/example.tsx:14 log@15 -> -
+91 typescript/example.tsx:14 <div>@17 -> -
+92 typescript/example.tsx:14 <Button label=\"Click me\" onClick={handleClick} />@18 -> -
+93 typescript/example.tsx:14 <Icon />@19 -> -
 fwd attrs/logs.go:17 [0, 1]
 fwd attrs/paths.py:11 [4, 5]
 fwd attrs/paths.py:6 [2, 3]
@@ -344,32 +348,37 @@ fwd queries/jsx/src/Card.tsx:14 [70]
 fwd queries/jsx/src/Card.tsx:16 [71]
 fwd queries/jsx/src/Card.tsx:21 [72]
 fwd queries/jsx/src/Card.tsx:3 [65, 66, 67, 68, 69]
-fwd queries/next-app/app/about/page.tsx:1 [73]
-fwd queries/next-app/app/blog/[slug]/page.tsx:1 [74]
-fwd queries/next-app/app/page.tsx:1 [75]
-fwd queries/solid-mavexa/frontend/src/routes/library.tsx:3 [76, 77, 78, 79]
-fwd queries/solid-mavexa/frontend/src/routes/library/[id].tsx:1 [80]
-fwd typescript/example.ts:26 [81]
-fwd typescript/example.ts:27 [82]
-fwd typescript/example.ts:33 [83]
-fwd typescript/example.tsx:12 [85]
-fwd typescript/example.tsx:14 [86, 87, 88, 89]
-fwd typescript/example.tsx:8 [84]
+fwd queries/jsx/src/Live.tsx:1 [73, 74, 75, 76]
+fwd queries/next-app/app/about/page.tsx:1 [77]
+fwd queries/next-app/app/blog/[slug]/page.tsx:1 [78]
+fwd queries/next-app/app/page.tsx:1 [79]
+fwd queries/solid-mavexa/frontend/src/routes/library.tsx:3 [80, 81, 82, 83]
+fwd queries/solid-mavexa/frontend/src/routes/library/[id].tsx:1 [84]
+fwd typescript/example.ts:26 [85]
+fwd typescript/example.ts:27 [86]
+fwd typescript/example.ts:33 [87]
+fwd typescript/example.tsx:12 [89]
+fwd typescript/example.tsx:14 [90, 91, 92, 93]
+fwd typescript/example.tsx:8 [88]
 rev example.go:10 [13]
 rev example.go:14 [12]
-rev ext <Button label=\"Click me\" onClick={handleClick} /> [88]
+rev ext <Button label=\"Click me\" onClick={handleClick} /> [92]
 rev ext <Button label=\"Save changes\" tooltip=\"Stores the card\" /> [69]
 rev ext <Divider /> [72]
-rev ext <Icon /> [89]
-rev ext <button onClick={onClick}> [84]
-rev ext <div> [80, 77, 87, 71]
+rev ext <Icon /> [93]
+rev ext <b> [74]
+rev ext <button onClick={onClick}> [88]
+rev ext <div className=\"Not text\"> [73]
+rev ext <div> [84, 81, 91, 71]
 rev ext <footer> [70]
-rev ext <h1> [75]
+rev ext <h1> [79]
 rev ext <h2> [66]
+rev ext <i> [75]
 rev ext <input placeholder=\"Search people\" aria-label={\"Find a person\"} /> [67]
-rev ext <p> [73, 74]
+rev ext <p> [77, 78]
 rev ext <section title=\"Profile card\"> [65]
-rev ext <span> [85]
+rev ext <span> [89]
+rev ext <u> [76]
 rev ext Delete [55]
 rev ext Errorf [43, 45, 47]
 rev ext Geo [36, 32]
@@ -387,10 +396,10 @@ rev ext Printf [0]
 rev ext Println [11, 27]
 rev ext Route [54]
 rev ext Sprintf [29]
-rev ext String [78]
+rev ext String [82]
 rev ext add [25]
 rev ext allocate_buffer [19]
-rev ext createSignal [76]
+rev ext createSignal [80]
 rev ext do_thing [37, 33]
 rev ext dump [40]
 rev ext free [7]
@@ -398,12 +407,12 @@ rev ext getpid [35]
 rev ext helper [42, 30, 15, 17]
 rev ext info [3, 5]
 rev ext join [2, 4]
-rev ext log [14, 16, 31, 86, 82, 81, 83]
+rev ext log [14, 16, 31, 90, 86, 85, 87]
 rev ext malloc [18, 6, 9]
 rev ext name} /> [68]
 rev ext new [41, 39]
 rev ext nil? [49]
-rev ext open [79]
+rev ext open [83]
 rev ext ping [38]
 rev ext print [34]
 rev ext printf [24]

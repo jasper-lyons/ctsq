@@ -288,10 +288,11 @@ pub fn run_def(
 
     if !found_any {
         println!(
-            "no definition for '{}' in {} ({} files scanned)",
+            "no definition for '{}' in {} ({} {})",
             expr,
             path,
-            jobs.len()
+            jobs.len(),
+            if jobs.len() == 1 { "file" } else { "files" }
         );
         let similar = similar_names(crate::explain::bare_name(expr), &all_names);
         if !similar.is_empty() {

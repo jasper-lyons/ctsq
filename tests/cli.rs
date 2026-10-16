@@ -214,7 +214,7 @@ fn def_resolves_a_type_and_reports_a_miss_on_stdout() {
     let miss = ctsq(&["def", "NewServe", &dir]);
     let text = stdout(&miss);
     assert!(text.starts_with("no definition for 'NewServe' in "), "{}", text);
-    assert!(text.contains("files scanned)"), "{}", text);
+    assert!(text.contains(" files)") && !text.contains("scanned"), "{}", text);
     assert!(text.contains("similar names: NewServer"), "{}", text);
     assert_eq!(miss.status.code(), Some(1));
 }
@@ -391,17 +391,26 @@ fn a_directory_walk_includes_shebang_scripts_in_each_language() {
 }
 
 #[test]
+fn a_def_miss_over_one_file_says_1_file() {
+    let out = ctsq(&["def", "zzzqq", &fixture("example.go")]);
+    assert!(stdout(&out).contains("(1 file)"), "{}", stdout(&out));
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
 fn naming_a_shell_script_says_why_there_is_no_language() {
     let out = ctsq(&["-q", "*function", &fixture("shebang/deploy")]);
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).contains("shell scripts have no grammar"), "{}", stderr(&out));
+    assert!(!stderr(&out).contains(';') && stderr(&out).contains(". Use --lang"), "{}", stderr(&out));
 }
 
 #[test]
 fn naming_a_file_with_no_extension_and_no_shebang_asks_for_lang() {
     let out = ctsq(&["-q", "*function", &fixture("../Makefile")]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(stderr(&out).contains("use --lang"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("Use --lang"), "{}", stderr(&out));
+    assert!(!stderr(&out).contains(';') && stderr(&out).contains(". Use --lang"), "{}", stderr(&out));
 }
 
 #[test]
@@ -845,7 +854,7 @@ fn find_text_and_error_name_the_function_that_renders_or_emits_them() {
     let out = ctsq_in(&fixture("queries/jsx"), &["find", "text", "welcome"]);
     assert_eq!(stdout(&out), "src/Card.tsx:6  Welcome back  Card  src/Card.tsx:3\n1 text (jsx-text, from built-in queries/jsx-text.toml)\n");
     let out = ctsq_in(&fixture("queries/errors"), &["find", "error", "failed to load pipeline 12: open x: no such file"]);
-    assert_eq!(stdout(&out), "go/load.go:14  failed to load pipeline %s: %w  Load  go/load.go:10\n1 error (go-error, from built-in queries/error-go.toml)\n");
+    assert_eq!(stdout(&out), "go/load.go:14  failed to load pipeline %s: %w  Load  go/load.go:10\n1 error (go-error, from built-in queries/error-go.toml)\n0 errors (js-error, from built-in queries/error-js.toml)\n0 errors (ruby-error, from built-in queries/error-ruby.toml)\n");
 }
 
 #[test]

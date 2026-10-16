@@ -140,6 +140,25 @@ fn verdicts(queries: &[NamedQuery], scan: &mut Scan) -> Vec<Option<String>> {
 }
 
 /// Rows padded into columns two spaces apart. The last column is not padded.
+/// Whether a def target's text is a quoted JS/TS module specifier, as in
+/// `lazy(() => import("~/routes/x"))`, which names a file, not a definition.
+fn is_module_specifier(lang_name: &str, text: Option<&str>) -> bool {
+    matches!(lang_name, "javascript" | "typescript" | "tsx")
+        && text.is_some_and(|t| t.starts_with(['\'', '"', '`']) && t.contains('/'))
+}
+
+/// Longest key shown in the padded key column.
+const KEY_MAX: usize = 40;
+
+/// A key cut to `KEY_MAX` characters with `...` at the end, for display only.
+fn cap_key(key: &str) -> String {
+    if key.chars().count() <= KEY_MAX {
+        return key.to_string();
+    }
+    let head: String = key.chars().take(KEY_MAX - 3).collect();
+    format!("{}...", head)
+}
+
 fn columns(rows: &[Vec<String>]) -> String {
     let n = rows.iter().map(|r| r.len()).max().unwrap_or(0);
     let mut widths = vec![0usize; n];
@@ -491,7 +510,10 @@ fn run_query(
                 }
                 let tcap = cap("target");
                 let (target, target_loc) = match q.target {
-                    Target::Def => {
+                    // A def target whose text is a quoted module specifier (a lazy
+                    // import) is resolved like default-export: the module's
+                    // default export serves the route.
+                    Target::Def if !is_module_specifier(lang_name, tcap.map(|t| t.text.as_str())) => {
                         // No @target: the @key node names the target too (`resources :gigs`).
                         let text = tcap.or_else(|| cap("key")).map(|t| t.text.as_str()).unwrap_or("");
                         let name = match &q.rewrite {
@@ -506,7 +528,7 @@ fn run_query(
                         };
                         (name, loc)
                     }
-                    Target::DefaultExport => {
+                    Target::Def | Target::DefaultExport => {
                         let spec = {
                             let t = tcap.map(|t| t.text.as_str()).unwrap_or("");
                             let t = unquote(t.lines().next().unwrap_or(""));
@@ -784,7 +806,7 @@ pub fn report_with(
     let mut tried: Vec<(String, String)> = Vec::new();
     let mut not_detected: Vec<(String, String)> = Vec::new();
     let mut rows: Vec<Vec<String>> = Vec::new();
-    let mut counts: Vec<String> = Vec::new();
+    let mut counts: Vec<(usize, String)> = Vec::new();
     let mut printed: HashSet<(String, usize, String, String)> = HashSet::new();
     for (q, w) in owned.iter().zip(&why) {
         if w.is_none() {
@@ -802,17 +824,18 @@ pub fn report_with(
             .filter(|h| printed.insert((h.file.clone(), h.line, h.key.clone(), h.target.clone())))
             .collect();
         if hits.is_empty() {
+            counts.push((0, format!("0 {} ({}, from {})", footer::plural(name, 0), q.framework, q.source)));
             continue;
         }
-        counts.push(format!(
+        counts.push((hits.len(), format!(
             "{} {} ({}, from {})",
             hits.len(),
             footer::plural(name, hits.len()),
             q.framework,
             q.source
-        ));
+        )));
         for h in hits {
-            rows.push(vec![format!("{}:{}", shown(&scan.prefix, &h.file), h.line), h.key, h.target, h.target_loc]);
+            rows.push(vec![format!("{}:{}", shown(&scan.prefix, &h.file), h.line), cap_key(&h.key), h.target, h.target_loc]);
         }
     }
 
@@ -826,7 +849,13 @@ pub fn report_with(
         return Report { out, code: 1 };
     }
     let mut out = columns(&rows);
-    for c in &counts {
+    // Frameworks that matched nothing are listed too, but only beside one that
+    // matched, so the reader sees they were tried.
+    let any_matched = counts.iter().any(|(n, _)| *n > 0);
+    for (n, c) in &counts {
+        if *n == 0 && !any_matched {
+            continue;
+        }
         out.push_str(c);
         out.push('\n');
     }
@@ -989,7 +1018,8 @@ mod tests {
              main.go:21  /users       createUser  main.go:11\n\
              main.go:22  /users/{id}  Show        main.go:15\n\
              main.go:24  /users/{id}  createUser  main.go:11\n\
-             4 routes (chi, from built-in queries/go-chi.toml)\n"
+             4 routes (chi, from built-in queries/go-chi.toml)\n\
+             0 routes (net-http, from built-in queries/go-http.toml)\n"
         );
     }
 
@@ -1045,16 +1075,43 @@ mod tests {
     }
 
     #[test]
-    fn the_built_in_solid_query_misses_the_lazy_shape_and_says_what_it_tried() {
+    fn the_built_in_solid_query_resolves_the_lazy_import_shape_through_default_export() {
         let dir = fixture("solid-mavexa");
         let qs = queries::load_with(&Roots { repo: None, config: None, cache: None }, &dir).unwrap();
         let r = report(&qs, "route", Some("/library"), &mut Scan::new(&dir, false), &hide());
-        assert_eq!(r.code, 1);
-        assert_eq!(
-            r.out,
-            "no route matches /library here (tried solid-routes from built-in queries/solid-routes.toml)\n\
-             not detected here: chi (built-in queries/go-chi.toml), net-http (built-in queries/go-http.toml), next-app (built-in queries/next-app.toml), rails-routes (built-in queries/rails-routes.toml), react-router (built-in queries/react-router.toml)\n"
+        assert_eq!(r.code, 0, "{}", r.out);
+        assert!(
+            r.out.contains("/library      Library  frontend/src/routes/library.tsx:3\n"),
+            "{}",
+            r.out
         );
+        assert!(r.out.contains("(solid-routes, from built-in queries/solid-routes.toml)"), "{}", r.out);
+    }
+
+    #[test]
+    fn a_framework_that_matched_nothing_still_gets_a_zero_count_line_beside_one_that_did() {
+        let d = std::env::temp_dir().join(format!("ctsq-find-zero-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join(".ctsq/queries")).unwrap();
+        std::fs::write(d.join("a.go"), "package a\nimport \"errors\"\nfunc F() error { return errors.New(\"same thing\") }\n").unwrap();
+        let copy = std::fs::read_to_string(format!("{}/config/queries/error-go.toml", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let copy = copy.replace("go-error", "zz-copy").replace("errors.New", "errors.Nothing");
+        std::fs::write(d.join(".ctsq/queries/zz-copy.toml"), copy).unwrap();
+        let r = run_named_in(&d, "error", None);
+        assert!(r.out.contains("1 error (go-error,"), "{}", r.out);
+        assert!(r.out.contains("0 errors (zz-copy, from "), "{}", r.out);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_long_key_is_cut_to_forty_characters_with_three_dots_for_display_only() {
+        assert_eq!(cap_key("short"), "short");
+        let long = "GET /api/workspaces/{workspaceID}/library/items/{itemID}";
+        let cut = cap_key(long);
+        assert_eq!(cut.chars().count(), 40, "{}", cut);
+        assert!(cut.ends_with("...") && !cut.contains('\u{2026}'), "{}", cut);
+        assert!(long.starts_with(&cut[..37]));
+        assert_eq!(cap_key(&"x".repeat(40)), "x".repeat(40));
     }
 
     #[test]
@@ -1099,11 +1156,21 @@ mod tests {
         let r = run_named("jsx", "text", None);
         assert_eq!(
             r.out,
-            "src/Card.tsx:6    Welcome back         Card    src/Card.tsx:3\n\
-             src/Card.tsx:14   All rights reserved  Footer  src/Card.tsx:14\n\
-             src/Card.tsx:18   Panel                Panel   src/Card.tsx:16\n\
-             src/Legacy.jsx:2  Old page             Legacy  src/Legacy.jsx:1\n\
-             4 texts (jsx-text, from built-in queries/jsx-text.toml)\n"
+            "src/Card.tsx:6    Welcome back         Card          src/Card.tsx:3\n\
+             src/Card.tsx:14   All rights reserved  Footer        src/Card.tsx:14\n\
+             src/Card.tsx:18   Panel                Panel         src/Card.tsx:16\n\
+             src/Legacy.jsx:2  Old page             Legacy        src/Legacy.jsx:1\n\
+             src/Live.tsx:4    Live preview         renderStatus  src/Live.tsx:1\n\
+             src/Live.tsx:4    Offline              renderStatus  src/Live.tsx:1\n\
+             src/Live.tsx:5    Streaming now        renderStatus  src/Live.tsx:1\n\
+             src/Live.tsx:8    Plain literal        renderStatus  src/Live.tsx:1\n\
+             src/Live.tsx:9    Plain template       renderStatus  src/Live.tsx:1\n\
+             src/Live.tsx:10   Nested string        renderStatus  src/Live.tsx:1\n\
+             src/Live.tsx:10   Nested template      renderStatus  src/Live.tsx:1\n\
+             src/Live.tsx:10   Template branch      renderStatus  src/Live.tsx:1\n\
+             src/Live.tsx:11   Binary string        renderStatus  src/Live.tsx:1\n\
+             src/Live.tsx:12   Binary template      renderStatus  src/Live.tsx:1\n\
+             14 texts (jsx-text, from built-in queries/jsx-text.toml)\n"
         );
         let r = run_named("jsx", "label", Some("person"));
         assert_eq!(
@@ -1128,7 +1195,7 @@ mod tests {
     #[test]
     fn an_error_key_matches_through_placeholders_in_each_language() {
         let go = run_named("errors", "error", Some("failed to load pipeline abc-1: open x: no such file"));
-        assert_eq!(go.out, "go/load.go:14  failed to load pipeline %s: %w  Load  go/load.go:10\n1 error (go-error, from built-in queries/error-go.toml)\n");
+        assert_eq!(go.out, "go/load.go:14  failed to load pipeline %s: %w  Load  go/load.go:10\n1 error (go-error, from built-in queries/error-go.toml)\n0 errors (js-error, from built-in queries/error-js.toml)\n0 errors (ruby-error, from built-in queries/error-ruby.toml)\n");
         let go = run_named("errors", "error", Some("render 3 blocks ({1 2})"));
         assert!(go.out.starts_with("go/load.go:18  render %d blocks (%+v)  Render  go/load.go:17\n"), "{}", go.out);
         let ts = run_named("errors", "error", Some("bad field 7"));
@@ -1196,7 +1263,8 @@ mod tests {
         let r = run_named_in(&dir, "error", None);
         assert_eq!(r.out.lines().filter(|l| l.starts_with("a.go:3")).count(), 1, "{}", r.out);
         assert!(r.out.contains("1 error (go-error,"), "{}", r.out);
-        assert!(!r.out.contains("zz-copy"), "the second framework found nothing new: {}", r.out);
+        assert!(!r.out.contains("1 error (zz-copy"), "the second framework found nothing new: {}", r.out);
+        assert!(r.out.contains("0 errors (zz-copy, from "), "{}", r.out);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -5,5 +5,18 @@ framework = "jsx-text"
 langs     = ["tsx", "js"]
 
 [text]
-match  = "(jsx_text#/\\S/ @key)"
+# Also string literals and template strings with no substitution inside a
+# {expression} between tags: directly, as a ternary branch or as an operand of a
+# binary expression. Strings in attributes are not here, `label` finds those.
+match  = [
+  "(jsx_text#/\\S/ @key)",
+  "(jsx_element > (jsx_expression > (string @key)))",
+  "(jsx_element > (jsx_expression > (template_string#/^`[^$]*`$/ @key)))",
+  "(jsx_element > (jsx_expression > (ternary_expression > (string @key))))",
+  "(jsx_element > (jsx_expression > (ternary_expression > (template_string#/^`[^$]*`$/ @key))))",
+  "(jsx_element > (jsx_expression > (ternary_expression > (ternary_expression > (string @key)))))",
+  "(jsx_element > (jsx_expression > (ternary_expression > (ternary_expression > (template_string#/^`[^$]*`$/ @key)))))",
+  "(jsx_element > (jsx_expression > (binary_expression > (string @key))))",
+  "(jsx_element > (jsx_expression > (binary_expression > (template_string#/^`[^$]*`$/ @key))))",
+]
 target = "enclosing"
