@@ -713,6 +713,37 @@ fn collect_selector_atoms<'q>(sel: &'q Selector, out: &mut Vec<&'q Atom>, fields
     }
 }
 
+/// Reject a field name (`.nope(...)`) that is neither `body`/`params`, which the
+/// compiler handles itself, nor a field of any grammar in `langs`. In a walk over
+/// several languages a field is valid when at least one of them defines it, so
+/// `pair.key(...)` still runs over a directory that also holds C. The error puts
+/// the caret under the field name and lists a few real field names.
+pub fn check_fields(query: &Query, langs: &[&dyn Lang], src: &str) -> Result<(), QueryError> {
+    if langs.is_empty() {
+        return Ok(());
+    }
+    let mut atoms = Vec::new();
+    let mut fields = Vec::new();
+    collect_atoms(query, &mut atoms, &mut fields);
+    let ts_langs:Vec<tree_sitter::Language> = langs.iter().map(|l| l.ts_language()).collect();
+    for f in fields {
+        if f == "body" || f == "params" || ts_langs.iter().any(|t| t.field_id_for_name(f).is_some()) {
+            continue;
+        }
+        let mut names: Vec<&str> = ts_langs
+            .iter()
+            .flat_map(|t| (1..=t.field_count() as u16).filter_map(|i| t.field_name_for_id(i)))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        let sample: Vec<&str> = names.into_iter().take(8).collect();
+        let pos = src.find(&format!(".{}(", f)).map(|p| p + 1).unwrap_or(0);
+        return Err(QueryError::new(format!("unknown field '{}'", f), pos)
+            .with_hint(format!("valid fields include: body, params, {}", sample.join(", "))));
+    }
+    Ok(())
+}
+
 /// Compile the query for `lang` and make tree-sitter parse the result, so a
 /// pattern it rejects (a regex that does not compile, a field the node lacks) is
 /// reported against the part of the query that caused it, before any file is read.

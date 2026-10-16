@@ -618,6 +618,10 @@ fn main() {
                 eprint!("{}", miss::query_error_report(query_str, &e));
                 std::process::exit(2);
             }
+            if let Err(e) = compiler::check_fields(&ast, &[lang.as_ref()], query_str) {
+                eprint!("{}", miss::query_error_report(query_str, &e));
+                std::process::exit(2);
+            }
             let compiled = compiler::compile(&ast, lang.as_ref());
             println!("=== Compiled S-expression ({}) ===", lang_name);
             if compiled.is_empty() {
@@ -726,6 +730,14 @@ fn main() {
         }
         if let Err(msg) = semantic::attrs::check_lang(&attrs, lang_name) {
             eprintln!("{}", msg);
+            std::process::exit(2);
+        }
+    }
+    {
+        let boxed: Vec<Box<dyn lang::Lang>> = checked.iter().filter_map(|n| lang::for_name(n)).collect();
+        let refs: Vec<&dyn lang::Lang> = boxed.iter().map(|b| b.as_ref()).collect();
+        if let Err(e) = compiler::check_fields(&ast, &refs, query_str) {
+            eprint!("{}", miss::query_error_report(query_str, &e));
             std::process::exit(2);
         }
     }

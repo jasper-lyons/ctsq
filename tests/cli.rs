@@ -536,7 +536,7 @@ fn callers_and_explain_hide_a_caller_written_in_a_test() {
     assert!(all.contains("TestAdd()") && !all.contains("hidden:"), "{}", all);
     let explain = stdout(&ctsq(&["explain", "Add", dir]));
     assert!(!explain.contains("TestAdd"), "{}", explain);
-    assert!(explain.ends_with("1 definition\nhidden: 2 in tests (--tests)\n"), "{}", explain);
+    assert!(explain.ends_with("1 definition\nhidden: 1 in tests (--tests)\n"), "{}", explain);
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -547,4 +547,102 @@ fn config_dump_takes_the_lang_aliases_and_shows_tests() {
     let text = stdout(&out);
     assert!(text.starts_with("language: typescript\n"), "{}", text);
     assert!(text.contains("[tests]\nfiles = [\"*.test.*\", \"*.spec.*\"]\n"), "{}", text);
+}
+
+// ── Review fixes ──────────────────────────────────────────────────────────────
+
+fn scratch_dir(name: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("ctsq-cli-{}-{}", name, std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+#[test]
+fn every_try_line_runs_on_the_same_paths_in_a_mixed_language_dir() {
+    let d = scratch_dir("trymixed");
+    std::fs::write(d.join("Chat.tsx"), "export const Chat = () => <p>Still reading your files</p>;\n").unwrap();
+    std::fs::write(d.join("a.c"), "int main(void) { return 0; }\n").unwrap();
+    std::fs::write(d.join("b.go"), "package main\n\nfunc main() {}\n").unwrap();
+    let dir = d.to_str().unwrap();
+    let out = ctsq(&["-q", "id#/Still reading/", dir]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{}", text);
+    assert!(text.contains("found as JSX text:"), "{}", text);
+    let tries: Vec<&str> = text.lines().filter(|l| l.starts_with("try: ctsq ")).collect();
+    assert!(!tries.is_empty(), "{}", text);
+    for t in tries {
+        let cmd = t.replacen("try: ctsq", &format!("'{}'", env!("CARGO_BIN_EXE_ctsq")), 1);
+        let run = Command::new("sh").args(["-c", &cmd]).output().unwrap();
+        assert!(run.status.success(), "{} failed: {}{}", t, stdout(&run), stderr(&run));
+        assert!(stdout(&run).contains("Chat.tsx:1:"), "{} found nothing: {}", t, stdout(&run));
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_hidden_test_caller_is_counted_once_and_matches_the_extra_rows_of_tests() {
+    let d = scratch_dir("hiddenonce");
+    std::fs::write(d.join("contest.go"), "package p\n\nfunc Helper() int { return 1 }\n").unwrap();
+    std::fs::write(d.join("x_test.go"), "package p\n\nfunc TestX() { Helper() }\n").unwrap();
+    let dir = d.to_str().unwrap();
+    let text = stdout(&ctsq(&["explain", "Helper", dir]));
+    assert!(text.ends_with("1 definition\nhidden: 1 in tests (--tests)\n"), "{}", text);
+    let rows = |t: &str| t.lines().filter(|l| l.contains("x_test.go")).count();
+    assert_eq!(rows(&text), 0, "{}", text);
+    let all = stdout(&ctsq(&["explain", "Helper", dir, "--tests"]));
+    assert_eq!(rows(&all), 1, "--tests adds exactly one row: {}", all);
+    assert!(!all.contains("hidden:"), "{}", all);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn explain_exits_1_when_nothing_resolves_or_everything_is_hidden() {
+    let miss = ctsq(&["explain", "no_such_symbol_anywhere", &fixture("example.c")]);
+    assert_eq!(miss.status.code(), Some(1), "{}", stdout(&miss));
+    assert!(stdout(&miss).contains("no definition resolved"), "{}", stdout(&miss));
+
+    let d = scratch_dir("explainhidden");
+    std::fs::write(d.join("a.go"), "package p\n\nfunc Other() {}\n").unwrap();
+    std::fs::write(d.join("a_test.go"), "package p\n\nfunc OnlyInTests() {}\n").unwrap();
+    let dir = d.to_str().unwrap();
+    let hidden = ctsq(&["explain", "OnlyInTests", dir]);
+    assert_eq!(hidden.status.code(), Some(1), "{}", stdout(&hidden));
+    assert!(stdout(&hidden).contains("hidden: "), "the footer still prints: {}", stdout(&hidden));
+    let shown = ctsq(&["explain", "OnlyInTests", dir, "--tests"]);
+    assert!(shown.status.success(), "{}", stdout(&shown));
+    let _ = std::fs::remove_dir_all(&d);
+
+    assert!(ctsq(&["explain", "NewServer", &fixture("example.go")]).status.success());
+}
+
+#[test]
+fn an_unknown_field_is_a_query_error_with_the_caret_under_it() {
+    let out = ctsq(&["-q", "*function.nope(id)", &fixture("example.go")]);
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(2), "{}{}", stdout(&out), err);
+    assert!(err.starts_with("query error: unknown field 'nope' at position 10\n  *function.nope(id)\n"), "{}", err);
+    assert!(err.contains("\n            ^\n"), "caret under the n of nope: {}", err);
+    assert!(err.contains("valid fields include: body, params, "), "{}", err);
+    assert!(stdout(&out).is_empty(), "{}", stdout(&out));
+}
+
+#[test]
+fn real_fields_still_work_and_a_field_of_another_language_in_the_walk_is_valid() {
+    let f = fixture("example.go");
+    let out = ctsq(&["-q", "*function.name(id#NewServer)", &f]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    let out = ctsq(&["-q", "*function.body(id#NewServer)", &f]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    let d = scratch_dir("fieldwalk");
+    std::fs::write(d.join("a.js"), "const o = { k: 1 };\n").unwrap();
+    std::fs::write(d.join("b.c"), "int main(void) { return 0; }\n").unwrap();
+    let out = ctsq(&["-l", "javascript", "-q", "pair.key(id)", d.to_str().unwrap()]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert!(stdout(&out).contains("a.js:1:"), "{}", stdout(&out));
+    // A walk over several languages: the field is valid if one of them defines it.
+    let out = ctsq(&["-q", "*function.name(id#main)", d.to_str().unwrap(), &f]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert!(stdout(&out).contains("b.c:1:") && stdout(&out).contains("example.go:18:"), "{}", stdout(&out));
+    let _ = std::fs::remove_dir_all(&d);
 }

@@ -151,6 +151,8 @@ pub struct Hider {
     jobs: std::collections::HashMap<String, (String, &'static str)>,
     tests: std::collections::HashMap<(std::path::PathBuf, &'static str), std::rc::Rc<LangTests>>,
     scopes: std::collections::HashMap<String, Vec<(usize, usize)>>,
+    /// file -> verdict of `file`, so a match in the file does not re-judge it
+    verdicts: std::collections::HashMap<String, Option<Hide>>,
     /// search root -> repo root, where the config lookup starts
     repos: std::collections::HashMap<String, std::path::PathBuf>,
 }
@@ -163,6 +165,7 @@ impl Hider {
             jobs: Default::default(),
             tests: Default::default(),
             scopes: Default::default(),
+            verdicts: Default::default(),
             repos: Default::default(),
         }
     }
@@ -223,6 +226,15 @@ impl Hider {
     /// Why `file` is hidden as a whole, if it is. A file no `add_jobs` call
     /// recorded, and a file named directly on the command line, are never hidden.
     pub fn file(&mut self, file: &str) -> Option<Hide> {
+        if let Some(v) = self.verdicts.get(file) {
+            return *v;
+        }
+        let v = self.file_verdict(file);
+        self.verdicts.insert(file.to_string(), v);
+        v
+    }
+
+    fn file_verdict(&mut self, file: &str) -> Option<Hide> {
         let (root, lang_name) = self.jobs.get(file)?.clone();
         if file == "-" || std::path::Path::new(&root).is_file() {
             return None;
@@ -276,15 +288,30 @@ impl Hider {
         let (root, lang_name) = self.jobs[file].clone();
         let t = self.tests_for(&root, lang_name);
         let mut ranges = Vec::new();
-        for (l, c) in &t.scopes {
-            if let Ok(rows) = crate::runner::run_rows(c, l.as_ref(), source, false) {
-                for r in rows {
-                    ranges.push((line_at(source, r.start_byte), line_at(source, r.end_byte.saturating_sub(1).max(r.start_byte))));
+        let mut add_rows = |rows: Vec<crate::runner::MatchRow>| {
+            for r in rows {
+                ranges.push((line_at(source, r.start_byte), line_at(source, r.end_byte.saturating_sub(1).max(r.start_byte))));
+            }
+        };
+        if lang_name == "rust" {
+            // A Rust file with neither `mod test` nor `cfg(` has no test scope,
+            // so it is not parsed. Otherwise one parse serves every scope.
+            if contains(source, b"mod test") || contains(source, b"cfg(") {
+                if let Some(tree) = parse_rust(source) {
+                    for (l, c) in &t.scopes {
+                        if let Ok(rows) = crate::runner::run_rows_on(c, l.as_ref(), source, &tree, false) {
+                            add_rows(rows);
+                        }
+                    }
+                    ranges.extend(rust_cfg_test_ranges(&tree, source));
                 }
             }
-        }
-        if lang_name == "rust" {
-            ranges.extend(rust_cfg_test_ranges(source));
+        } else {
+            for (l, c) in &t.scopes {
+                if let Ok(rows) = crate::runner::run_rows(c, l.as_ref(), source, false) {
+                    add_rows(rows);
+                }
+            }
         }
         ranges.sort_unstable();
         ranges.dedup();
@@ -386,16 +413,21 @@ pub fn glob_regex(glob: &str) -> regex::Regex {
     regex::Regex::new(&re).unwrap_or_else(|_| regex::Regex::new(&format!("^{}$", regex::escape(glob))).unwrap())
 }
 
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn parse_rust(source: &[u8]) -> Option<tree_sitter::Tree> {
+    let l = lang::for_name("rust")?;
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&l.ts_language()).ok()?;
+    parser.parse(source, None)
+}
+
 /// Rust items under `#[cfg(test)]`, from the attribute line to the item's end.
 /// Found in code because a selector has no way to say "the item after this
 /// attribute" (BUILD.md A09).
-fn rust_cfg_test_ranges(source: &[u8]) -> Vec<(usize, usize)> {
-    let Some(l) = lang::for_name("rust") else { return vec![] };
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&l.ts_language()).is_err() {
-        return vec![];
-    }
-    let Some(tree) = parser.parse(source, None) else { return vec![] };
+fn rust_cfg_test_ranges(tree: &tree_sitter::Tree, source: &[u8]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
@@ -623,6 +655,25 @@ mod tests {
         assert_eq!(hidden.tests, 2);
         let (mut all, _) = hider_over(&d, &HideOpts { tests: true, exclude: vec![] });
         assert!(all.scope_lines(f, None).is_empty(), "--tests finds no scopes");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_rust_file_without_test_markers_is_not_parsed_for_scopes_and_verdicts_are_cached() {
+        let d = scratch("noscopes");
+        fs::write(d.join("plain.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+        fs::create_dir_all(d.join("tests")).unwrap();
+        fs::write(d.join("tests/cli.rs"), "fn t() {}\n").unwrap();
+        let (mut h, jobs) = hider_over(&d, &HideOpts::default());
+        let plain = jobs.iter().find(|(f, _)| f.ends_with("plain.rs")).unwrap().0.clone();
+        let named = jobs.iter().find(|(f, _)| f.ends_with("tests/cli.rs")).unwrap().0.clone();
+        assert!(h.scope_lines(&plain, None).is_empty());
+        assert!(contains(b"mod tests {}", b"mod test") && contains(b"#[cfg(test)]", b"cfg("));
+        assert!(!contains(b"fn a() {}", b"cfg("));
+        assert_eq!(h.file(&named), Some(Hide::Test));
+        assert!(h.verdicts.contains_key(&named), "the verdict is remembered");
+        assert_eq!(h.site(&named, 1), Some(Hide::Test));
+        assert_eq!(h.site(&plain, 1), None);
         let _ = fs::remove_dir_all(&d);
     }
 

@@ -50,6 +50,22 @@ pub fn run_rows(
     parser.set_language(&ts_lang).map_err(|e| e.to_string())?;
 
     let tree = parser.parse(source, None).ok_or("failed to parse source")?;
+    run_rows_on(compiled, lang, source, &tree, body)
+}
+
+/// `run_rows` over a tree the caller already parsed from `source` with `lang`'s
+/// grammar, so several queries can share one parse.
+pub fn run_rows_on(
+    compiled: &CompiledQuery,
+    lang: &dyn Lang,
+    source: &[u8],
+    tree: &tree_sitter::Tree,
+    body: bool,
+) -> Result<Vec<MatchRow>, String> {
+    if compiled.is_empty() {
+        return Ok(vec![]);
+    }
+    let ts_lang = lang.ts_language();
 
     let source_bytes = source;
     let mut results: Vec<MatchRow> = Vec::new();

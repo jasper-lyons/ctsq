@@ -34,7 +34,14 @@ pub fn run(symbol: &str, path: &str, lang_name: Option<&str>, opts: &Options, no
     let jobs = files::resolve_jobs(path, lang_name, no_ignore);
     let mut hider = files::Hider::new(hide);
     hider.add_jobs(path, &jobs);
-    print!("{}", report_hiding(symbol, &jobs, opts, &mut hider));
+    let (text, found) = report_hiding(symbol, &jobs, opts, &mut hider);
+    print!("{}", text);
+    if !found {
+        // Nothing resolved, or everything was hidden: exit 1 like -q, def and refs.
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        std::process::exit(1);
+    }
 }
 
 // ── Report ───────────────────────────────────────────────────────────────────
@@ -43,23 +50,24 @@ pub fn run(symbol: &str, path: &str, lang_name: Option<&str>, opts: &Options, no
 /// tests can assert on it without capturing stdout.
 #[cfg(test)]
 pub fn report(symbol: &str, jobs: &[(String, &'static str)], opts: &Options) -> String {
-    report_hiding(symbol, jobs, opts, &mut files::Hider::none())
+    report_hiding(symbol, jobs, opts, &mut files::Hider::none()).0
 }
 
 /// `report` with the definitions, callers and references `hider` hides left
-/// out, and the footer counting them at the end. The call graph is still built
+/// out, and the footer counting them at the end. The bool is whether it shows
+/// a definition or a reference row. The call graph is still built
 /// over every file, so hiding a test never changes how a call resolves.
 pub fn report_hiding(
     symbol: &str,
     jobs: &[(String, &'static str)],
     opts: &Options,
     hider: &mut files::Hider,
-) -> String {
+) -> (String, bool) {
     let mut hidden = Hidden::default();
-    let mut out = body(symbol, jobs, opts, hider, &mut hidden);
+    let (mut out, found) = body(symbol, jobs, opts, hider, &mut hidden);
     let shown = out.matches("\nDEFINITION ").count();
     out.push_str(&footer(shown, "definition", &hidden));
-    out
+    (out, found)
 }
 
 fn body(
@@ -68,17 +76,20 @@ fn body(
     opts: &Options,
     hider: &mut files::Hider,
     hidden: &mut Hidden,
-) -> String {
+) -> (String, bool) {
     let mut out = String::new();
     let mut lines = LineCache::default();
+    // Every file:line already counted as hidden, so a site that is both a
+    // caller and a reference, or a definition and a reference, counts once.
+    let mut hidden_seen: HashSet<(String, usize)> = HashSet::new();
 
     let g = graph::build(jobs);
-    let sites = hider.keep(definition_sites(symbol, &g, jobs), |s| (s.file.clone(), s.line), hidden);
+    let sites = keep_once(hider, definition_sites(symbol, &g, jobs), |s| (s.file.clone(), s.line), hidden, &mut hidden_seen);
 
     if sites.is_empty() {
         out.push_str(&format!("SYMBOL {} (no definition resolved)\n", symbol));
-        push_reference_list(&mut out, symbol, jobs, opts, hider, hidden);
-        return out;
+        let n = push_reference_list(&mut out, symbol, jobs, opts, hider, hidden, &mut hidden_seen);
+        return (out, n > 0);
     }
 
     let plural = if sites.len() == 1 { "definition" } else { "definitions" };
@@ -147,7 +158,7 @@ fn body(
     caller_keys.push(NodeKey::External(bare_name(symbol).to_string()));
 
     {
-        let mut ctx = WalkCtx { lines: &mut lines, listed: &mut listed, hider: &mut *hider, hidden: &mut *hidden };
+        let mut ctx = WalkCtx { lines: &mut lines, listed: &mut listed, hider: &mut *hider, hidden: &mut *hidden, hidden_seen: &mut hidden_seen };
         push_walk(&mut out, "CALLERS", Direction::Up, &g, &caller_keys, opts, &mut ctx);
         push_walk(&mut out, "CALLEES", Direction::Down, &g, &keys, opts, &mut ctx);
     }
@@ -156,7 +167,7 @@ fn body(
         .into_iter()
         .filter(|(file, line, _)| !listed.contains(&(file.clone(), *line)))
         .collect();
-    let remaining = hider.keep(remaining, |(f, l, _)| (f.clone(), *l), hidden);
+    let remaining = keep_once(hider, remaining, |(f, l, _)| (f.clone(), *l), hidden, &mut hidden_seen);
     let mut by_file: BTreeMap<String, usize> = BTreeMap::new();
     let mut total = 0usize;
     for (file, _, _) in remaining {
@@ -168,6 +179,30 @@ fn body(
         out.push_str(&format!("  {}: {}\n", file, count));
     }
 
+    (out, true)
+}
+
+/// `Hider::keep`, except a hidden `file:line` already in `seen` is not counted
+/// again, so the hidden count equals the extra rows `--tests` would show.
+fn keep_once<T>(
+    hider: &mut files::Hider,
+    items: Vec<T>,
+    at: impl Fn(&T) -> (String, usize),
+    hidden: &mut Hidden,
+    seen: &mut HashSet<(String, usize)>,
+) -> Vec<T> {
+    let mut out = Vec::new();
+    for it in items {
+        let (f, l) = at(&it);
+        match hider.site(&f, l) {
+            Some(h) => {
+                if seen.insert((f, l)) {
+                    hidden.count(h, 1);
+                }
+            }
+            None => out.push(it),
+        }
+    }
     out
 }
 
@@ -309,6 +344,7 @@ struct WalkCtx<'a> {
     listed: &'a mut HashSet<(String, usize)>,
     hider: &'a mut files::Hider,
     hidden: &'a mut Hidden,
+    hidden_seen: &'a mut HashSet<(String, usize)>,
 }
 
 fn push_walk(
@@ -393,7 +429,7 @@ fn walk(
     rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
     rows.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
     // A call written in a test is hidden with everything above it.
-    let rows = ctx.hider.keep(rows, |r| (r.0.clone(), r.1), ctx.hidden);
+    let rows = keep_once(ctx.hider, rows, |r| (r.0.clone(), r.1), ctx.hidden, ctx.hidden_seen);
 
     for (site_file, site_line, name, loc, guess, next) in rows {
         ctx.listed.insert((site_file.clone(), site_line));
@@ -465,8 +501,9 @@ fn push_reference_list(
     opts: &Options,
     hider: &mut files::Hider,
     hidden: &mut Hidden,
-) {
-    let refs = hider.keep(references(symbol, jobs), |(f, l, _)| (f.clone(), *l), hidden);
+    seen: &mut HashSet<(String, usize)>,
+) -> usize {
+    let refs = keep_once(hider, references(symbol, jobs), |(f, l, _)| (f.clone(), *l), hidden, seen);
     out.push_str(&format!("\nREFERENCES ({})\n", refs.len()));
     for (file, line, text) in refs.iter().take(opts.max_lines) {
         out.push_str(&format!("  {}:{}  {}\n", file, line, text));
@@ -474,6 +511,7 @@ fn push_reference_list(
     if refs.len() > opts.max_lines {
         out.push_str(&format!("  ... ({} more)\n", refs.len() - opts.max_lines));
     }
+    refs.len()
 }
 
 // ── Source line lookup ───────────────────────────────────────────────────────

@@ -37,6 +37,9 @@ pub struct FoundBlock {
     pub rows: Vec<String>,
     /// A query that matches these rows, without the `ctsq -q` around it.
     pub try_query: String,
+    /// `-l` values the try line needs because the kind exists only in some
+    /// grammars (`jsx_text`). One try line per value; empty means no `-l`.
+    pub langs: Vec<&'static str>,
 }
 
 /// The same name defined under another definition kind.
@@ -89,7 +92,12 @@ pub fn report(
         }
     }
     for block in found {
-        out.push_str(&format!("try: ctsq -q {} {}\n", shell_quote(&block.try_query), scope));
+        if block.langs.is_empty() {
+            out.push_str(&format!("try: ctsq -q {} {}\n", shell_quote(&block.try_query), scope));
+        }
+        for l in &block.langs {
+            out.push_str(&format!("try: ctsq -l {} -q {} {}\n", l, shell_quote(&block.try_query), scope));
+        }
     }
     for d in defined {
         out.push_str(&format!("try: ctsq -q {} {}\n", shell_quote(&d.try_query), scope));
@@ -264,7 +272,21 @@ pub fn id_fallback(ast: &Query, jobs: &[(String, &'static str)]) -> Vec<FoundBlo
     for (label, kind) in [("string literal", "string"), ("JSX text", "jsx_text"), ("comment", "comment")] {
         let q = kind_query(None, kind, NameMatch::Regex(pattern.clone()));
         let mut seen = HashSet::new();
-        let rows: Vec<String> = rows_over(&q, jobs)
+        let hits = rows_over(&q, jobs);
+        // jsx_text is a kind of the javascript and tsx grammars only, so its
+        // try line selects the grammar the hits came from.
+        let mut langs: Vec<&'static str> = Vec::new();
+        if kind == "jsx_text" {
+            for (f, _, _) in &hits {
+                if let Some((_, l)) = jobs.iter().find(|(jf, _)| jf == f) {
+                    if !langs.contains(l) {
+                        langs.push(l);
+                    }
+                }
+            }
+            langs.sort_unstable();
+        }
+        let rows: Vec<String> = hits
             .into_iter()
             .map(|(f, line, text)| format!("{}:{}: {}", f, line, text))
             .filter(|r| seen.insert(r.clone()))
@@ -274,6 +296,7 @@ pub fn id_fallback(ast: &Query, jobs: &[(String, &'static str)]) -> Vec<FoundBlo
                 label,
                 rows,
                 try_query: format!("{}#/{}/", kind, pattern.replace('/', "\\/")),
+                langs,
             });
         }
     }
@@ -366,6 +389,7 @@ mod tests {
             label: "string literal",
             rows: vec!["frontend/src/Chat.tsx:118: <p class=\"hint\">Still reading your files</p>".into()],
             try_query: "string#/Still reading your files/".into(),
+            langs: vec![],
         }];
         let text = report(MissKind::Identifier, "id#/Still reading your files/", "frontend/src", 212, &found, &[]);
         assert_eq!(
@@ -380,8 +404,8 @@ mod tests {
     #[test]
     fn each_kind_found_gets_its_own_block_and_try_line() {
         let found = vec![
-            FoundBlock { label: "string literal", rows: vec!["a.rs:1: x".into()], try_query: "string#/x/".into() },
-            FoundBlock { label: "comment", rows: vec!["a.rs:2: // x".into()], try_query: "comment#/x/".into() },
+            FoundBlock { label: "string literal", rows: vec!["a.rs:1: x".into()], try_query: "string#/x/".into(), langs: vec![] },
+            FoundBlock { label: "comment", rows: vec!["a.rs:2: // x".into()], try_query: "comment#/x/".into(), langs: vec![] },
         ];
         let text = report(MissKind::Identifier, "id#x", "src", 1, &found, &[]);
         assert!(text.starts_with("no identifier matches id#x in src (1 file)\n"), "{}", text);
@@ -421,7 +445,7 @@ mod tests {
 
     #[test]
     fn a_try_line_quotes_a_query_holding_a_single_quote() {
-        let found = vec![FoundBlock { label: "comment", rows: vec!["a.c:1: x".into()], try_query: "comment#/it's/".into() }];
+        let found = vec![FoundBlock { label: "comment", rows: vec!["a.c:1: x".into()], try_query: "comment#/it's/".into(), langs: vec![] }];
         let text = report(MissKind::Identifier, "id#x", "src", 1, &found, &[]);
         assert!(text.contains("try: ctsq -q 'comment#/it'\\''s/' src"), "{}", text);
     }
@@ -429,7 +453,7 @@ mod tests {
     #[test]
     fn long_blocks_are_cut_with_a_count() {
         let rows: Vec<String> = (1..=13).map(|i| format!("a.rs:{}: x", i)).collect();
-        let found = vec![FoundBlock { label: "comment", rows, try_query: "comment#/x/".into() }];
+        let found = vec![FoundBlock { label: "comment", rows, try_query: "comment#/x/".into(), langs: vec![] }];
         let text = report(MissKind::Identifier, "id#x", "src", 1, &found, &[]);
         assert!(text.contains("a.rs:10: x\n(3 more)\n"), "{}", text);
         assert!(!text.contains("a.rs:11:"), "{}", text);
