@@ -181,19 +181,74 @@ fixtures/example.go-21- }
 
 `-C` is rejected with exit 2 alongside `--node`, which already prints the whole node.
 
-A match with two or more captures, and a multi-line match under `--body`, keep the node-text form instead, because one source line cannot carry them. Those get no context. They still open with the file they came from, as `path:11-19: …` for a multi-line body and `path:@f:4: …, @call:6: …` for captures, so there is never a match without a file to open. Source read from stdin says `<stdin>`. Nothing matched prints a one-line miss report on stdout and exits 1:
+A match with two or more captures, and a multi-line match under `--body`, keep the node-text form instead, because one source line cannot carry them. Those get no context. They still open with the file they came from, as `path:11-19: …` for a multi-line body and `path:@f:4: …, @call:6: …` for captures, so there is never a match without a file to open. Source read from stdin says `<stdin>`. Nothing matched prints a miss report on stdout and exits 1. For a lone `id#name` the report reruns the name over string literals, JSX text and comments, prints a `found as` block per kind and a `try:` line to run:
 
 ```sh
-ctsq -q 'id#nope' fixtures/example.go
-no match for id#nope in fixtures/example.go (1 files scanned)
+ctsq -q 'id#localhost' fixtures/example.go
+no identifier matches id#localhost in fixtures/example.go (1 file)
+found as string literal:
+fixtures/example.go:19: s := NewServer("localhost", 8080)
+try: ctsq -q 'string#/localhost/' fixtures/example.go
+```
+
+A lone `*kind#name` that matches nothing says which other kinds define the name:
+
+```sh
+ctsq -q '*type#NewServer' fixtures/example.go
+no definition matches *type#NewServer in fixtures/example.go (1 file)
+NewServer is defined as a function here: fixtures/example.go:14
+try: ctsq -q '*function#NewServer' fixtures/example.go
+```
+
+**Query errors.** A query that does not parse prints the query with a caret under the fault and a hint, and exits 2:
+
+```sh
+ctsq -q 'id#(' fixtures/example.go
+query error: expected a name after # at position 3
+  id#(
+     ^
+a name is an identifier, "quoted text" or /regex/, as in id#foo, id#"a b" or id#/a|b/
+```
+
+**Paths.** A path that does not exist prints `no such file: X` on stderr (with `(did you mean Y)` when a close name exists) and the other paths still run.
+
+**Scope (`--scope`).** Under each match, print the nearest named scope holding it as `  in path:START-END  signature`, then a count line. With `--body` the scope's body follows. `def`, `refs`, `callers`, `callees` and `files` take `--scope` too.
+
+```sh
+ctsq -q '*function#NewServer' --scope fixtures/example.go
+fixtures/example.go:14: func NewServer(host string, port int) *Server {
+1 match
 ```
 
 **Flags:**
 - `-C N`, `--context N`: print N source lines either side of each match, like `grep -C`
+- `--scope`: print the function or class holding each match under it
 - `--show-query` — print the compiled TreeSitter S-expression
 - `--body` — show the full body of matched nodes (default: first line only)
 - `--node` — print the matched node's own text instead of the source line (the pre-0.2 form)
 - `--no-ignore` — ignore `.gitignore` / `.ignore` files
+- `--tests`: show test files and test scopes (hidden by default, see below)
+- `--exclude GLOB`: hide paths matching GLOB, judged relative to the search root (repeatable)
+
+### Hidden tests and the footer
+
+Test files and test scopes (Rust `mod tests` and `#[cfg(test)]` items, Go `_test.go` files and the like) are hidden by default in `tree`, `-q`, `def`, `refs`, `callers`, `callees`, `explain`, `files` and `find`. Which paths and scopes count as tests is set per language in the `[tests]` table of `config/languages/*.toml`, and `ctsq config dump go` shows the merged result. A file named directly on the command line is never hidden.
+
+When something was hidden, the output ends with a count line and a `hidden:` line naming each count and the flag that shows it. When everything was hidden the count reads 0 and the exit is 1.
+
+```sh
+ctsq refs HiddenLimit fixtures/hidden
+fixtures/hidden/limit.go:5: "HiddenLimit"
+fixtures/hidden/limit.go:7: "HiddenLimit"
+2 references
+hidden: 2 in tests (--tests)
+
+ctsq -q 'id#HiddenLimit' fixtures/hidden --exclude 'limit*'
+0 matches
+hidden: 4 in excluded paths (drop --exclude)
+```
+
+`--tests` shows the test hits again. `--exclude GLOB` hides more paths and can be given more than once.
 
 ### `tree [PATHS…]` — structural outline
 
@@ -273,6 +328,51 @@ ctsq def NewServe fixtures/
 no definition for 'NewServe' in fixtures/ (28 files scanned)
 similar names: NewServer
 ```
+
+A name the glossary maps (see Named queries and the glossary) also searches the code names it maps to, and a last line says so.
+
+`--scope` adds the holding function under each definition:
+
+```sh
+ctsq def saveAssetNow fixtures/scope --scope
+fixtures/scope/Asset.tsx:4: const saveAssetNow = async () => {  ?
+  in fixtures/scope/Asset.tsx:3-8  export const AssetEditor = (props: Props) => {
+fixtures/scope/Asset.tsx:11: const saveAssetNow = () => props.asset  ?
+  in fixtures/scope/Asset.tsx:10-14  export function BrandAssetPanel(props: Props) {
+2 definitions
+```
+
+### `refs NAME PATH`: usage sites
+
+Every place a name is used, the complement of `def`. It takes `--scope`, `--tests` and `--exclude` like the commands above.
+
+```sh
+ctsq refs NewServer fixtures/example.go
+fixtures/example.go:14: "NewServer"
+fixtures/example.go:19: "NewServer"
+```
+
+### `scopeof PATH:LINE[:COL]…`: from a line to its definition
+
+`def` goes from a name to a location, `scopeof` goes from a location to the function or class holding it. It takes the `path:line` that compilers, stack traces and `grep` print.
+
+```sh
+ctsq scopeof fixtures/example.go:19
+fixtures/example.go:19  in  fixtures/example.go:18-21  func main() {
+func main() {
+	s := NewServer("localhost", 8080)
+	s.Start()
+}
+```
+
+**Flags:**
+- `--up N`: climb N enclosing named scopes (method, then class, then module)
+- `--siblings`: after the body, list the other scopes in the same parent, signature only
+- `--callers`: after the body, list the callers of the scope, one level
+- `--block`: return the innermost block (an `if` or loop body) instead of the named scope
+- `--budget N`: a scope longer than N lines prints a window of N lines centred on the line (default 150)
+
+A line outside every named scope prints `path:LINE  at top level` and a window of the file. Closures are not named scopes, so a line inside one returns its named parent. A missing file or a line past the end goes to stderr and the other coordinates still run. Exit 0 when any coordinate resolved, 1 when none did, 2 when an argument is not a coordinate. Test hiding does not apply.
 
 ### `files -q QUERY [-q QUERY…] [PATH]` — cross-file co-occurrence
 
@@ -374,14 +474,85 @@ abstract mapping fall back to raw tree-sitter passthrough queries
 (`try {} catch (e) {}` → `try_statement`). `--debug` shows candidates that
 failed self-verification and which node the snippet was classified from.
 
+## Named queries and the glossary
+
+A named query answers a question whose shape is fixed per framework, such as which component serves a route. `ctsq find` with no arguments lists the named queries that apply in the current directory and why, and `ctsq find QUERY [KEY]` runs one. The key is a case-insensitive substring, or a regex when written `/…/`.
+
+```sh
+cd fixtures/queries/go-chi
+ctsq find route /users
+main.go:20  /users       listUsers   main.go:9
+main.go:21  /users       createUser  main.go:11
+main.go:22  /users/{id}  Show        main.go:15
+main.go:24  /users/{id}  createUser  main.go:11
+4 routes (chi, from built-in queries/go-chi.toml)
+```
+
+Each row is the file and line of the match, the key, the target, and the target's definition (`?` when `def` finds none). A count line per framework names the file the query came from. Exit 0 when anything matched, 1 when nothing did, 2 for an unknown query or a query file that does not compile.
+
+Built-in packs, in `config/queries/`:
+
+| Query | Frameworks and languages |
+|-------|--------------------------|
+| `route` | Solid, React Router, Next.js app router, Go `net/http` and chi, Rails |
+| `text`, `label`, `component` | JSX and TSX: the component rendering some text between tags, the component rendering a label, title, placeholder or alt prop, and the components themselves |
+| `error` | Go, TypeScript and JavaScript, Ruby: the function emitting an error message. The key is matched as a format string, so `%s`, `%v`, `%d`, `%w` and `${…}` match any text and a message copied from a log finds its source |
+
+Queries are TOML files looked up in `.ctsq/queries/` in the repo, then `$XDG_CONFIG_HOME/ctsq/queries`, then `$XDG_CACHE_HOME/ctsq/queries`, then the built-in packs. `ctsq config path` lists the directories. A repo file with the same framework and query name replaces the built-in one. Each file has these fields:
+
+- `framework`, `langs`: the name shown in output and the languages it applies to
+- `detect`: when it applies, by `import`, `file` or `dependency`
+- `[query]` table, named for the query (such as `[route]`): `match` is a selector or a list of them with `@key` and `@target` captures, `target` is `def`, `enclosing`, `self` or `default-export`, and the optional `rewrite`, `key_rewrite`, `paths` and `key_from_path` shape the key and target
+
+An example, saved as `.ctsq/queries/handlers.toml` in a Go repo:
+
+```toml
+# Package-level http.HandleFunc("/path", handler) calls.
+framework = "plain-http"
+langs     = ["go"]
+detect    = { file = ["main.go"] }
+
+[handler]
+match = [
+  "(call_expression.function(selector_expression.operand(identifier#http).field(field_identifier#HandleFunc))) > (argument_list > (interpreted_string_literal @key) + (identifier @target))",
+]
+target = "def"
+```
+
+```sh
+ctsq find handler
+main.go:30  /  index  main.go:17
+1 handler (plain-http, from .ctsq/queries/handlers.toml)
+```
+
+**Glossary.** A repo file `.ctsq/glossary.toml` maps product words to code names:
+
+```toml
+"pipeline page" = ["Pipeline"]
+"supplies"      = ["/resource|stock/"]
+```
+
+`find`, `def` and the `-q` miss reports also search the code names for a word the glossary holds, and a last line starting with the glossary's `path:line` says so:
+
+```sh
+cd fixtures/glossary
+ctsq def 'pipeline page' .
+./src/pipeline.go:5: func Pipeline() error {
+.ctsq/glossary.toml:2: "pipeline page" also searched as Pipeline
+```
+
 ## Query language
 
 ### Abstract node types
 
 | Type | Matches |
 |------|---------|
-| `id` | any identifier |
-| `function` | function definitions and/or calls |
+| `id` | any identifier, including property and field identifiers and JSX attribute names |
+| `function` | function definitions and/or calls, including function expressions bound to a `const`, `let` or `var` |
+| `method` | alias of `function` |
+| `call` | calls by the last segment of the callee: `call#Println` finds `fmt.Println(…)` and `call#toBe` finds `a.toBe()` |
+| `string` | string literals |
+| `comment` | comments |
 | `class` | class / struct definitions |
 | `var` | variable declarations and/or uses |
 | `variable` (alias `const`) | the declaration statement a name is bound by (`*variable`) and its uses (`&variable`) |
@@ -395,9 +566,11 @@ failed self-verification and which node the snippet was classified from.
 Unknown identifiers pass through to TreeSitter verbatim as concrete node names. An identifier that is neither an abstract type nor a real node type in the language is rejected before anything runs:
 
 ```sh
-ctsq -q '*bogus#X' file.ts
-unknown kind 'bogus' for typescript, valid kinds: id, function, call, class, module, type, var, variable, const, param, import, literal, block, if, for, while, switch, op
+ctsq -q '*bogus#X' fixtures/typescript/example.ts
+unknown kind 'bogus' for typescript, valid kinds: id, function, call, class, module, type, var, variable, const, param, import, literal, block, if, for, while, switch, op, field, method, comment
 ```
+
+An unknown field name after a `.` (as in `.bodyy(…)`) is a caret error like the parse errors above.
 
 `variable` and `const` are the same kind under two names. They cover JavaScript, TypeScript, JSX and TSX (`lexical_declaration`, `variable_declaration`), Go (`var`, `const` and `:=`) and Rust (`let`, `const`, `static`). C, C++ and Python have no mapping: a C declaration mixes variables, prototypes and pointer declarators in one node, so `*variable#X` there would need real disambiguation rather than a table entry.
 
@@ -426,8 +599,8 @@ type#/regex/     regex match
 ```
 A B    descendant  — B anywhere inside A
 A > B  child       — B as a direct child of A
-A + B  adjacent    — A and B are adjacent siblings
-A ~ B  sibling     — A and B are ordered siblings (B anywhere after A, same parent)
+A + B  adjacent    B is the next sibling of A
+A ~ B  sibling     B is a later sibling of A in the same parent
 ```
 
 ### Captures and field access
@@ -439,6 +612,8 @@ Wrap a selector in `()` to capture it or access a specific field:
 (*function#init @f).body(id#CONST)    match CONST inside init's body
 (*function @f).body()                 the body node itself
 selector.params(var#SIZE @v)          match SIZE in the params field
+selector.field(@cap)                  bare @cap as a field argument: capture whatever the field holds
+selector.field(kind @cap)             capture the field's node when it is of that kind
 ```
 
 ### Examples
@@ -505,10 +680,13 @@ function#malloc   # definitions of, or calls to, malloc
 | C | `.c` `.h` |
 | C++ | `.cpp` `.cc` `.cxx` `.hpp` `.hxx` |
 | JavaScript | `.js` `.mjs` `.cjs` `.jsx` |
+| TypeScript | `.ts` `.tsx` |
 | Python | `.py` |
 | Ruby | `.rb` `.rake` `.gemspec` |
 | Rust | `.rs` |
 | Go | `.go` |
+
+`-l ts` includes `.tsx` and `-l js` includes `.jsx`, and each file is parsed by its own grammar. A script with no extension is detected by its shebang line (Ruby, Python and Node), so `ctsq -q '*function' fixtures/shebang` reads the scripts there.
 
 ## Call resolution
 

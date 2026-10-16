@@ -93,7 +93,7 @@ pub fn resolve_jobs(path: &str, lang_name: Option<&str>, no_ignore: bool) -> Vec
             Some(ln) => vec![(path.to_string(), ln)],
             None => {
                 match std::path::Path::new(path).extension().and_then(|e| e.to_str()) {
-                    Some(ext) => eprintln!("Cannot detect language from extension .{}; use --lang", ext),
+                    Some(ext) => eprintln!("Cannot detect language from extension .{}. Use --lang", ext),
                     None if lang::shebang_is_shell(&lang::first_line_of(path)) => {
                         eprintln!("Cannot detect language for {}: shell scripts have no grammar here. Use --lang to force one", path)
                     }

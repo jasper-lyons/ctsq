@@ -185,7 +185,7 @@ Question: where does the message "Cannot detect" come from? The first try used `
 ctsq -q 'id#/Cannot detect/' src/tree.rs
 no identifier matches id#/Cannot detect/ in src/tree.rs (1 file)
 found as string literal:
-src/tree.rs:33: None => { eprintln!("Cannot detect language; use --lang"); std::process::exit(1); }
+src/tree.rs:33: None => { eprintln!("Cannot detect language. Use --lang"); std::process::exit(1); }
 try: ctsq -q 'string#/Cannot detect/' src/tree.rs
 [exit 1]
 ```
@@ -365,6 +365,8 @@ ctsq callees <fn> <path>           what this function calls (walk down the call 
 ctsq callgraph <path>              full call graph (DOT; --format edges for plain pairs)
 ctsq def <name> <path>             resolve a name to its definition location(s)
 ctsq refs <name> <path>            all usage sites of a name (complement of def)
+ctsq scopeof <path:line> ...       the function or class holding each line, with its body (reverse of def)
+ctsq find [<query> [key]]          list the named queries (route, text, error ...) that apply here, or run one
 ctsq imports <file> <path>         what this file imports (forward dependency tree)
 ctsq importers <file> <path>       what files import this file (reverse dependents tree)
 ctsq importgraph <path>            full import graph (DOT; --format edges for plain pairs)
@@ -501,7 +503,72 @@ ctsq def util.Helper src/        # Go package function
 ctsq def Server.Run src/         # Go method (uppercase qualifier = type)
 ```
 
-### files — co-occurrence across a tree
+### scopeof
+
+From a `path:line` (or `path:line:col`) to the function or class holding it,
+with its body. The reverse of `def`.
+
+```bash
+ctsq scopeof src/footer.rs:30
+# src/footer.rs:30  in  src/footer.rs:26-32  pub struct Hidden {
+```
+
+- `--up N` climbs N enclosing scopes, `--siblings` lists the other scopes in the
+  same parent, `--callers` lists callers one level, `--block` returns the
+  innermost block instead of the named scope
+- `--budget N` (default 150) shows a window of N lines for a longer scope
+- several coordinates in one call, a bad one goes to stderr and the rest run
+- exit 0 when any resolved, 1 when none did, 2 for an argument that is not a coordinate
+
+### find
+
+Named queries for questions whose shape is fixed per framework. `ctsq find`
+lists the ones that apply in the current directory and why, `ctsq find <query>
+[key]` runs one. The key is a case-insensitive substring, or `/regex/`.
+
+```bash
+ctsq find
+ctsq find route /users
+ctsq find text 'Welcome back'
+ctsq find error 'failed to load pipeline 12: open x'
+```
+
+- built-in: `route` (Solid, React Router, Next.js app, Go net/http and chi,
+  Rails), `text`, `label`, `component` (TSX and JSX), `error` (Go, TS/JS, Ruby)
+- an error key matches through printf placeholders (`%s`, `%v`, `%w`, `${...}`),
+  so a message copied from a log finds its source
+- query files live in `.ctsq/queries/`, then `$XDG_CONFIG_HOME/ctsq/queries`,
+  then `$XDG_CACHE_HOME/ctsq/queries`, then built-in (`ctsq config path`)
+- `.ctsq/glossary.toml` maps product words to code names, used by `find`, `def`
+  and `-q` miss reports, each saying so in a line starting with its `path:line`
+- exit 0 when anything matched, 1 when nothing did, 2 for an unknown query
+
+### --scope
+
+On `-q`, `def`, `refs`, `callers`, `callees` and `files`. Prints
+`  in path:START-END  signature` under each hit and a count line. With `--body`
+the scope's body follows.
+
+```bash
+ctsq -q 'id#hide_rows' --scope src/
+# src/main.rs:961: hide_rows(&mut hider, file, &source, rows, true, &mut hidden)
+#   in src/main.rs:613-1032  fn main() {
+```
+
+### --tests and --exclude
+
+Test files and test scopes are hidden in `tree`, `-q`, `def`, `refs`,
+`callers`, `callees`, `explain`, `files` and `find`. Output that hid something
+ends with a count line and
+`hidden: N in tests (--tests), N in excluded paths (drop --exclude)`. When
+everything was hidden the count reads 0 and the exit is 1.
+
+- `--tests` shows them again
+- `--exclude GLOB` hides paths matching GLOB, judged from the search root, and
+  can be repeated
+- a file named directly is never hidden
+
+### files: co-occurrence across a tree
 
 Which files mention **both** of these? Pass `-q` more than once and only files
 where every query matches are listed. This is the search grep cannot express in
@@ -516,7 +583,7 @@ ctsq files -q 'id#itemCols' -q 'id#Tx' backend/internal/store/
 Narrow to one file afterwards with `ctsq explain` or `ctsq -q`. Language
 inferred from extension; override with `--lang`.
 
-### example — snippet → query
+### example: snippet to query
 
 Don't know how to write the query? Paste the code you're looking for and ctsq
 derives it. Candidates run most-literal → most-general, and each is verified

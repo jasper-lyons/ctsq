@@ -30,7 +30,7 @@ pub fn report(path: &str, lang_name: Option<&str>, hider: &mut crate::files::Hid
     });
     let lang_name = match lang_name {
         Some(n) => n,
-        None => { eprintln!("Cannot detect language; use --lang"); std::process::exit(1); }
+        None => { eprintln!("Cannot detect language. Use --lang"); std::process::exit(1); }
     };
     let lang_box = match lang::for_name(lang_name) {
         Some(l) => l,
