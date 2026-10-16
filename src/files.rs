@@ -41,6 +41,17 @@ pub fn collect_files(dir: &str, exts: &[&str], no_ignore: bool) -> Vec<String> {
     files
 }
 
+/// `resolve_jobs` for a command that takes several paths: a path that does not
+/// exist prints `no such file: X (did you mean Y)` on stderr and contributes no
+/// jobs, so the other paths still run. Any other failure behaves as in `resolve_jobs`.
+pub fn resolve_jobs_lenient(path: &str, lang_name: Option<&str>, no_ignore: bool) -> Vec<(String, &'static str)> {
+    if matches!(std::fs::metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
+        eprintln!("{}", crate::miss::no_such_file(path));
+        return Vec::new();
+    }
+    resolve_jobs(path, lang_name, no_ignore)
+}
+
 /// Resolve (file_path, lang_name) pairs from a path (file or directory).
 /// `--lang ts` takes `.ts` and `.tsx` files and parses each with its own
 /// grammar. A file with no extension takes its language from its shebang line.
@@ -57,6 +68,10 @@ pub fn resolve_jobs(path: &str, lang_name: Option<&str>, no_ignore: bool) -> Vec
     };
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("{}", crate::miss::no_such_file(path));
+            std::process::exit(1);
+        }
         Err(e) => { eprintln!("Failed to access {}: {}", path, e); std::process::exit(1); }
     };
     if meta.is_dir() {
@@ -157,6 +172,16 @@ mod tests {
         let jobs = resolve_jobs(d.to_str().unwrap(), Some("ts"), true);
         let langs: Vec<&str> = jobs.iter().map(|(_, l)| *l).collect();
         assert_eq!(langs, vec!["typescript", "tsx"]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_missing_path_contributes_no_jobs_and_does_not_exit() {
+        let d = scratch("missing");
+        fs::write(d.join("a.js"), "var a;\n").unwrap();
+        let gone = d.join("b.js");
+        assert!(resolve_jobs_lenient(gone.to_str().unwrap(), None, true).is_empty());
+        assert_eq!(resolve_jobs_lenient(d.to_str().unwrap(), None, true).len(), 1);
         let _ = fs::remove_dir_all(&d);
     }
 

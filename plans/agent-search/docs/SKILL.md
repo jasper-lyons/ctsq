@@ -61,7 +61,7 @@ Question: where does the message "valid kinds" come from?
 ```
 ctsq -q 'literal#/valid kinds/' src/compiler
 src/compiler/mod.rs:216: "unknown kind '{}' for {}, valid kinds: {}",
-src/compiler/mod.rs:925: assert!(err.starts_with("unknown kind 'bogus' for typescript, valid kinds: "), "{}", err);
+src/compiler/mod.rs:1036: assert!(err.starts_with("unknown kind 'bogus' for typescript, valid kinds: "), "{}", err);
 ```
 
 `id#` only matches identifiers, so text inside a string needs `literal#`. Next: pull the function that line 216 sits in.
@@ -171,6 +171,21 @@ fixtures/shebang/brief  6 lines  ~23 tokens  1 entry
 ```
 
 A file with no extension takes its language from the `#!` line (`ruby`, `python`, `python3`, `node`, directly or through `env`), so no `--lang` is needed, and a directory walk includes such files too. A shell script has no grammar, so `bash` and `sh` files are skipped. `-l ts` also takes `.tsx` files and `-l js` takes `.jsx`. Next: pull one body with `ctsq -q '*function#run_brief' --body fixtures/shebang/brief`.
+
+### 11. A miss that explains itself
+
+Question: where does the message "Cannot detect" come from? The first try used `id#`, which only matches identifiers.
+
+```
+ctsq -q 'id#/Cannot detect/' src/tree.rs
+no identifier matches id#/Cannot detect/ in src/tree.rs (1 file)
+found as string literal:
+src/tree.rs:24: None => { eprintln!("Cannot detect language; use --lang"); std::process::exit(1); }
+try: ctsq -q 'string#/Cannot detect/' src/tree.rs
+[exit 1]
+```
+
+When an `id#` query matches nothing, ctsq reruns the name as a substring (or your regex) over string literals, JSX text and comments in the same files and prints one `found as` block per kind it finds, then a `try:` line whose query matches those rows. A definition query that matches nothing, such as `*function#Server` when `Server` is a type, says `Server is defined as a type here: path:line` with a `try:` line for that kind. A path that does not exist prints `no such file: X (did you mean Y)` on stderr and the other paths still run. A query that cannot parse prints the query with a caret under the fault and exits 2. A miss exits 1. Next: run the `try:` line.
 
 ## Reference
 

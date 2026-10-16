@@ -89,3 +89,33 @@ pub struct Query {
     pub head: Selector,
     pub tail: Vec<(Combinator, Selector)>,
 }
+
+/// A query that does not parse or does not compile. `pos` is a byte offset into
+/// the query string the user typed, so the report can put a caret under the fault.
+/// `hint` is a suggested fix when one is knowable.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryError {
+    pub msg: String,
+    pub pos: usize,
+    pub hint: Option<String>,
+}
+
+impl QueryError {
+    pub fn new(msg: impl Into<String>, pos: usize) -> Self {
+        Self { msg: msg.into(), pos, hint: None }
+    }
+
+    /// Sets the hint unless one is already there, so the most specific one wins.
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        if self.hint.is_none() {
+            self.hint = Some(hint.into());
+        }
+        self
+    }
+}
+
+impl std::fmt::Display for QueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} at position {}", self.msg, self.pos)
+    }
+}

@@ -652,11 +652,122 @@ fn apply_field_access(frags: Vec<Fragment>, fa: &FieldAccess, lang: &dyn Lang) -
         .collect()
 }
 
+/// A tree-sitter query string literal reads `\"` and `\\` as escapes, so a name
+/// holding either has to be written with them doubled up or the predicate does not parse.
+fn ts_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn name_predicate(cap: &str, nm: &NameMatch) -> String {
     match nm {
-        NameMatch::Exact(s) => format!("(#eq? {} \"{}\")", cap, s),
-        NameMatch::Regex(s) => format!("(#match? {} \"{}\")", cap, s),
+        NameMatch::Exact(s) => format!("(#eq? {} \"{}\")", cap, ts_string(s)),
+        NameMatch::Regex(s) => format!("(#match? {} \"{}\")", cap, ts_string(s)),
     }
+}
+
+/// The query text for one atom, as a user would type it. Used to find the atom
+/// again in the query string when tree-sitter rejects what it compiled to.
+pub fn render_atom(atom: &Atom) -> String {
+    let mut out = String::new();
+    match atom.sigil {
+        Some(Sigil::Def) => out.push('*'),
+        Some(Sigil::Ref) => out.push('&'),
+        None => {}
+    }
+    if let Some(t) = &atom.node_type {
+        out.push_str(t);
+    }
+    match &atom.name_match {
+        Some(NameMatch::Exact(s)) => {
+            if !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                out.push_str(&format!("#{}", s));
+            } else {
+                out.push_str(&format!("#\"{}\"", s));
+            }
+        }
+        Some(NameMatch::Regex(s)) => out.push_str(&format!("#/{}/", s.replace('/', "\\/"))),
+        None => {}
+    }
+    out
+}
+
+/// Every bare atom in the query, in source order, with the field names that
+/// apply to its selector. Groups and field inner queries are entered.
+fn collect_atoms<'q>(query: &'q Query, out: &mut Vec<&'q Atom>, fields: &mut Vec<&'q str>) {
+    collect_selector_atoms(&query.head, out, fields);
+    for (_, sel) in &query.tail {
+        collect_selector_atoms(sel, out, fields);
+    }
+}
+
+fn collect_selector_atoms<'q>(sel: &'q Selector, out: &mut Vec<&'q Atom>, fields: &mut Vec<&'q str>) {
+    match &sel.node {
+        SelectorNode::Bare(a) => out.push(a),
+        SelectorNode::Group { query, .. } => collect_atoms(query, out, fields),
+    }
+    for fa in &sel.fields {
+        fields.push(fa.field.as_str());
+        if let Some(inner) = &fa.inner {
+            collect_atoms(inner, out, fields);
+        }
+    }
+}
+
+/// Compile the query for `lang` and make tree-sitter parse the result, so a
+/// pattern it rejects (a regex that does not compile, a field the node lacks) is
+/// reported against the part of the query that caused it, before any file is read.
+/// `src` is the query string the user typed. Never returns tree-sitter's own text.
+pub fn check_compiles(query: &Query, lang: &dyn Lang, lang_name: &str, src: &str) -> Result<(), QueryError> {
+    let ts_lang = lang.ts_language();
+    let bad = |c: &CompiledQuery| -> bool {
+        if c.is_empty() {
+            return false;
+        }
+        match c {
+            CompiledQuery::Simple(s) => tree_sitter::Query::new(&ts_lang, s).is_err(),
+            CompiledQuery::Scoped { outer, inner, .. } => {
+                tree_sitter::Query::new(&ts_lang, outer).is_err()
+                    || tree_sitter::Query::new(&ts_lang, inner).is_err()
+            }
+        }
+    };
+    if !bad(&compile(query, lang)) {
+        return Ok(());
+    }
+
+    // Find the atom that fails on its own.
+    let mut atoms = Vec::new();
+    let mut fields = Vec::new();
+    collect_atoms(query, &mut atoms, &mut fields);
+    for atom in atoms {
+        let solo = Query {
+            head: Selector { node: SelectorNode::Bare(atom.clone()), fields: vec![], not: vec![] },
+            tail: vec![],
+        };
+        if bad(&compile(&solo, lang)) {
+            let text = render_atom(atom);
+            let pos = src.find(&text).unwrap_or(0);
+            let msg = match &atom.name_match {
+                Some(NameMatch::Regex(r)) if regex::Regex::new(r).is_err() => {
+                    let why = regex::Regex::new(r).err().map(|e| e.to_string()).unwrap_or_default();
+                    let first = why.lines().last().unwrap_or("").trim().to_string();
+                    let pos = pos + text.find('#').map(|h| h + 1).unwrap_or(0);
+                    return Err(QueryError::new(format!("the regex /{}/ does not compile: {}", r, first), pos)
+                        .with_hint("escape regex metacharacters with a backslash, as in \\( or \\."));
+                }
+                _ => format!("'{}' does not compile for {}", text, lang_name),
+            };
+            return Err(QueryError::new(msg, pos));
+        }
+    }
+    // Every atom is fine alone, so a field name is the cause.
+    for f in fields {
+        let text = format!(".{}(", f);
+        if let Some(pos) = src.find(&text) {
+            return Err(QueryError::new(format!("field '{}' does not fit this node in {}", f, lang_name), pos));
+        }
+    }
+    Err(QueryError::new(format!("this query does not compile for {}", lang_name), 0))
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,6 +1132,48 @@ mod tests {
         for q in ["function#log.Printf", "function[from=\"log/slog\"]", "*function#x[in=Server]"] {
             let parsed = parse(q).unwrap();
             assert!(validate(&parsed, lang.as_ref(), "go").is_ok(), "{}", q);
+        }
+    }
+
+    #[test]
+    fn name_predicates_escape_quotes_and_backslashes_for_tree_sitter() {
+        let out = compile_str("literal#/call\"/", "rust");
+        assert!(out.contains("(#match? @_nm"), "{}", out);
+        assert!(out.contains("\"call\\\"\""), "the quote is escaped: {}", out);
+        let out = compile_str("id#/\\d+/", "go");
+        assert!(out.contains("\"\\\\d+\""), "the backslash survives as the regex engine's: {}", out);
+        let out = compile_str("id#\"a\\\\b\"", "go");
+        assert!(out.contains("(#eq? @_nm") && out.contains("\"a\\\\b\""), "{}", out);
+    }
+
+    #[test]
+    fn filters_with_slashes_quotes_and_backslashes_compile_in_tree_sitter() {
+        let lang = for_name("rust").unwrap();
+        for src in ["id#/a\\/b/", "literal#/call\"/", "id#\"say \\\"hi\\\"\"", "id#/\\d+\\.x/", "id#/a,b|c/"] {
+            let q = parse(src).unwrap_or_else(|e| panic!("{}: {}", src, e));
+            check_compiles(&q, lang.as_ref(), "rust", src).unwrap_or_else(|e| panic!("{}: {}", src, e));
+        }
+    }
+
+    #[test]
+    fn a_regex_that_does_not_compile_is_pinned_on_its_selector() {
+        let lang = for_name("go").unwrap();
+        let src = "function#a variable#/x(/";
+        let q = parse(src).unwrap();
+        let e = check_compiles(&q, lang.as_ref(), "go", src).unwrap_err();
+        assert!(e.msg.starts_with("the regex /x(/ does not compile"), "{}", e);
+        assert_eq!(&src[e.pos..e.pos + 1], "/", "the caret sits on the opening slash: {}", e);
+        assert!(e.pos > "function#a ".len(), "{}", e);
+        assert!(!e.msg.contains("Invalid predicate"), "never tree-sitter's own text: {}", e);
+        assert!(e.hint.is_some());
+    }
+
+    #[test]
+    fn a_query_that_compiles_passes_the_check() {
+        let lang = for_name("typescript").unwrap();
+        for src in ["id#foo", "(*function @f).body((&function#bar @c))", "function#a variable#b", "class"] {
+            let q = parse(src).unwrap();
+            assert!(check_compiles(&q, lang.as_ref(), "typescript", src).is_ok(), "{}", src);
         }
     }
 

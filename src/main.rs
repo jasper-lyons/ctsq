@@ -3,6 +3,7 @@ mod cooccur;
 mod example;
 mod explain;
 mod files;
+mod miss;
 mod query;
 mod runner;
 mod tree;
@@ -43,7 +44,7 @@ use std::io::{BufRead, IsTerminal, Read};
 
   Name filter     type#name        exact match
                   type#\"my name\"  exact match (quoted, allows spaces)
-                  type#/regex/     regex match
+                  type#/regex/     regex match (a / inside is written \\/)
 
   Captures        Wrap in () and append @label to bind the matched node:
                   (&function#malloc @call)
@@ -63,7 +64,14 @@ OUTPUT
   node's own text instead. --body prints the full text of a multi-line match,
   as path:START-END: <text>. Every form opens with the file the match is in
   (<stdin> for piped source), so nothing needs a second look to be located.
-  No match prints a one-line miss report on stdout and exits 1.
+  No match prints a miss report on stdout and exits 1. It names the query, the
+  path and the file count. A lone id#name that matches nothing is rerun as text
+  over string literals, JSX text and comments, and prints a `found as` block per
+  kind plus a `try:` line to run. A lone *kind#name that matches nothing says
+  where the name is defined under another kind. A walk that finds no files is
+  a miss too. A path that does not exist prints `no such file: X (did you mean
+  Y)` on stderr and the other paths still run. A query that does not parse
+  prints the query with a caret under the fault and exits 2.
 
   -C N (--context N) adds N source lines either side of each match, like
   grep -C: matched lines keep path:LINE:, context lines use path-LINE-, groups
@@ -85,6 +93,8 @@ EXAMPLES (a question as a comment, the call, then the next call)
   # Find calls by the last segment of the callee, comments by text.
   ctsq -q 'call#Println' fixtures/example.go
   ctsq -q 'comment#/shebang/' src/files.rs
+  # A wrong path is named on stderr and the other paths still run.
+  ctsq -q 'id#fmt_tokens' src/tre.rs src/tree.rs
   # Who calls it? Which files mention both names?
   ctsq callers count_items src/
   ctsq files -q 'id#DefIndex' -q 'id#CallGraph' src/
@@ -458,8 +468,11 @@ fn main() {
                 std::process::exit(2);
             }
             let jobs: Vec<_> = paths.iter()
-                .flat_map(|p| files::resolve_jobs(p, cli.lang.as_deref(), cli.no_ignore))
+                .flat_map(|p| files::resolve_jobs_lenient(p, cli.lang.as_deref(), cli.no_ignore))
                 .collect();
+            if jobs.is_empty() {
+                std::process::exit(1);
+            }
             let multiple = jobs.len() > 1;
             for (i, (file, lang_name)) in jobs.iter().enumerate() {
                 if multiple && i > 0 { println!(); }
@@ -533,8 +546,8 @@ fn main() {
     let ast = match query::parse(query_str) {
         Ok(q) => q,
         Err(e) => {
-            eprintln!("Parse error: {}", e);
-            std::process::exit(1);
+            eprint!("{}", miss::query_error_report(query_str, &e));
+            std::process::exit(2);
         }
     };
 
@@ -560,6 +573,10 @@ fn main() {
             if let Err(msg) = compiler::validate(&ast, lang.as_ref(), canonical) {
                 eprintln!("{}", msg);
                 std::process::exit(validate_exit_code(&msg));
+            }
+            if let Err(e) = compiler::check_compiles(&ast, lang.as_ref(), canonical, query_str) {
+                eprint!("{}", miss::query_error_report(query_str, &e));
+                std::process::exit(2);
             }
             let compiled = compiler::compile(&ast, lang.as_ref());
             println!("=== Compiled S-expression ({}) ===", lang_name);
@@ -638,7 +655,7 @@ fn main() {
         if files_from_stdin && std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false) {
             continue;
         }
-        jobs.extend(files::resolve_jobs(path, cli.lang.as_deref(), cli.no_ignore));
+        jobs.extend(files::resolve_jobs_lenient(path, cli.lang.as_deref(), cli.no_ignore));
     }
 
     let multiple = jobs.len() > 1;
@@ -656,6 +673,10 @@ fn main() {
         if let Err(msg) = compiler::validate(&ast, l.as_ref(), lang_name) {
             eprintln!("{}", msg);
             std::process::exit(validate_exit_code(&msg));
+        }
+        if let Err(e) = compiler::check_compiles(&ast, l.as_ref(), lang_name, query_str) {
+            eprint!("{}", miss::query_error_report(query_str, &e));
+            std::process::exit(2);
         }
         if let Err(msg) = semantic::attrs::check_lang(&attrs, lang_name) {
             eprintln!("{}", msg);
@@ -747,18 +768,13 @@ fn main() {
         }
     }
 
-    if total_matches == 0 && !jobs.is_empty() {
+    if total_matches == 0 {
         let where_ = if files_from_stdin {
             "the files on stdin".to_string()
         } else {
             effective_files.join(" ")
         };
-        println!(
-            "no match for {} in {} ({} files scanned)",
-            query_str,
-            where_,
-            jobs.len()
-        );
+        print!("{}", miss::report_for(&ast, query_str, &where_, &jobs));
         std::process::exit(1);
     }
 }
@@ -850,7 +866,7 @@ fn run_refs(name: &str, path: &str, lang_override: Option<&str>, no_ignore: bool
     let query_str = format!("id#{}", name);
     let ast = match query::parse(&query_str) {
         Ok(q) => q,
-        Err(e) => { eprintln!("Parse error: {}", e); std::process::exit(1); }
+        Err(e) => { eprint!("{}", miss::query_error_report(&query_str, &e)); std::process::exit(2); }
     };
 
     let jobs = files::resolve_jobs(path, lang_override, no_ignore);
@@ -904,7 +920,7 @@ fn run_path(
     let ast = match parsed {
         Ok(q) => q,
         Err(e) => {
-            eprintln!("Parse error: {}", e);
+            eprint!("{}", miss::query_error_report(query_str, &e));
             return 2;
         }
     };
@@ -924,7 +940,7 @@ fn run_path(
     let paths = if paths.is_empty() { &default[..] } else { paths };
     let jobs: Vec<_> = paths
         .iter()
-        .flat_map(|p| files::resolve_jobs(p, lang_override, no_ignore))
+        .flat_map(|p| files::resolve_jobs_lenient(p, lang_override, no_ignore))
         .collect();
     let store = resolve::TreeStore::build(&jobs);
     let graph = resolve::graph::build_from_store(&store);

@@ -4,7 +4,7 @@
   - what is this symbol or what does it do (start here): `ctsq explain Name src/` gives the body, callers, callees and other uses in one call
   - show a definition: `ctsq -q '*function#Name' --body src/`. Several at once: `ctsq -q '*function#/^(A|B)$/' --body src/`. `*type#` and `*variable#` (alias `*const#`) work the same
   - where is a name used: `ctsq -q 'id#Name' src/` prints `path:LINE: source line`. Add `-C 3` for context lines, then pull the caller with `--body`
-  - where does some text appear: `ctsq -q 'literal#/some text/' src/`. `id#` only matches identifiers, so a string needs `literal#`
+  - where does some text appear: `ctsq -q 'literal#/some text/' src/`. `id#` only matches identifiers, so a string needs `literal#`. An `id#` that matches nothing is rerun over strings and comments and ends with a `try:` line, run it. A `/` inside a regex filter is written `\/`
   - what is in a file: `ctsq tree file.rs` for the outline and size, then `ctsq -q '*function#name' --body file.rs` for one body
   - who calls it: `ctsq callers Name src/`, then `ctsq explain` on a caller. Also `callees` and `callgraph`
   - where is a method called: `ctsq -q 'call#Name' src/` matches the last segment, so `pkg.Name(...)` and `x.Name(...)` both hit. `comment#/text/` finds comments. Scripts with no extension are read by their shebang, no `--lang` needed

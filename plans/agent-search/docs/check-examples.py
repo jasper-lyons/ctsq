@@ -22,15 +22,21 @@ for block in re.findall(r"```\n(.*?)```", section, re.S):
     n += 1
     rc, out = run(lines[0])
     have = {l.strip() for l in out.split("\n")}
+    want_rc = 0
     for shown in lines[1:]:
         s = shown.strip()
         if not s or s == "...":
             continue
+        # A line "[exit N]" is not output, it states the exit code the call returns.
+        m = re.fullmatch(r"\[exit (\d+)\]", s)
+        if m:
+            want_rc = int(m.group(1))
+            continue
         if s not in have:
             print(f"FAIL skill: {lines[0]}\n  missing line: {s}")
             fail = 1
-    if rc != 0:
-        print(f"FAIL skill: {lines[0]} exited {rc}")
+    if rc != want_rc:
+        print(f"FAIL skill: {lines[0]} exited {rc}, expected {want_rc}")
         fail = 1
 print(f"skill: {n} examples checked")
 

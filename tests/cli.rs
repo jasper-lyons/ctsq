@@ -81,9 +81,127 @@ fn a_query_that_matches_nothing_says_so_on_stdout() {
     let f = fixture("example.go");
     let out = ctsq(&["-q", "id#no_such_name_anywhere", &f]);
     let text = stdout(&out);
-    assert!(text.starts_with("no match for id#no_such_name_anywhere in "), "{}", text);
-    assert!(text.contains("(1 files scanned)"), "{}", text);
+    assert!(text.starts_with("no identifier matches id#no_such_name_anywhere in "), "{}", text);
+    assert!(text.contains("(1 file)"), "{}", text);
     assert_eq!(out.status.code(), Some(1), "a miss exits 1 like grep");
+}
+
+#[test]
+fn a_query_other_than_a_lone_id_keeps_the_no_match_header() {
+    let f = fixture("example.go");
+    let out = ctsq(&["-q", "function#no_such_name_anywhere variable#x", &f]);
+    let text = stdout(&out);
+    assert!(text.starts_with("no match for function#no_such_name_anywhere variable#x in "), "{}", text);
+    assert!(text.contains("(1 file)"), "{}", text);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn an_id_miss_reports_where_the_name_is_a_string_literal() {
+    let f = fixture("example.go");
+    let out = ctsq(&["-q", "id#/starting/", &f]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text.starts_with(&format!("no identifier matches id#/starting/ in {} (1 file)\n", f)), "{}", text);
+    assert!(text.contains("found as string literal:\n"), "{}", text);
+    assert!(text.contains(&format!("{}:11: fmt.Println(\"starting\")\n", f)), "{}", text);
+    let try_line = text.lines().last().unwrap();
+    assert_eq!(try_line, format!("try: ctsq -q 'string#/starting/' {}", f));
+    // The suggestion really finds the hit.
+    let again = ctsq(&["-q", "string#/starting/", &f]);
+    assert!(again.status.success(), "{}", stdout(&again));
+    assert!(stdout(&again).contains(":11:"), "{}", stdout(&again));
+}
+
+#[test]
+fn a_definition_miss_says_what_the_name_is_defined_as() {
+    let f = fixture("example.go");
+    let out = ctsq(&["-q", "*function#Server", &f]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text.starts_with(&format!("no definition matches *function#Server in {} (1 file)\n", f)), "{}", text);
+    assert!(text.contains(&format!("Server is defined as a type here: {}:5\n", f)), "{}", text);
+    assert!(text.ends_with(&format!("try: ctsq -q '*type#Server' {}\n", f)), "{}", text);
+}
+
+#[test]
+fn a_walk_with_no_files_is_a_miss() {
+    let d = std::env::temp_dir().join(format!("ctsq-cli-empty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("notes.txt"), "id").unwrap();
+    let dir = d.to_str().unwrap();
+    let out = ctsq(&["-q", "id#x", dir]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{}{}", text, stderr(&out));
+    assert!(text.starts_with(&format!("no identifier matches id#x in {} (0 files)\n", dir)), "{}", text);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_query_error_prints_the_query_with_a_caret_and_exits_2() {
+    let out = ctsq(&["-q", "function#(", &fixture("example.go")]);
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(2), "{}", err);
+    assert!(err.starts_with("query error: expected a name after # at position 9\n  function#(\n"), "{}", err);
+    assert!(err.contains("\n           ^\n"), "caret under the paren: {}", err);
+    assert!(!err.contains("Invalid"), "no raw tree-sitter text: {}", err);
+}
+
+#[test]
+fn an_unescaped_slash_in_a_regex_filter_suggests_the_escape() {
+    let out = ctsq(&["-q", "id#/ui/page/", &fixture("example.go")]);
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(err.starts_with("query error: unexpected '/' at position 6\n  id#/ui/page/\n        ^\n"), "{}", err);
+    assert!(err.contains("must be escaped: id#/ui\\/page/"), "{}", err);
+}
+
+#[test]
+fn a_regex_that_does_not_compile_is_reported_against_the_query_not_tree_sitter() {
+    let out = ctsq(&["-q", "id#/a(/", &fixture("example.go")]);
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(2), "{}", err);
+    assert!(err.starts_with("query error: the regex /a(/ does not compile"), "{}", err);
+    assert!(err.contains("\n  id#/a(/\n     ^\n"), "caret under the opening slash: {}", err);
+    assert!(!err.contains("Invalid predicate"), "{}", err);
+    assert!(!err.contains("Runner error"), "{}", err);
+}
+
+#[test]
+fn an_escaped_slash_and_a_quote_inside_a_filter_compile_and_run() {
+    let f = fixture("example.go");
+    let out = ctsq(&["-q", "id#/a\\/b/", &f]);
+    assert_eq!(out.status.code(), Some(1), "a miss, not a parse error: {}", stderr(&out));
+    assert!(stderr(&out).is_empty(), "{}", stderr(&out));
+    let out = ctsq(&["-q", "literal#/call\"/", &f]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).is_empty(), "no per-file tree-sitter error: {}", stderr(&out));
+}
+
+#[test]
+fn a_missing_path_is_named_on_stderr_and_the_others_still_run() {
+    let f = fixture("example.go");
+    let missing = fixture("nope.go");
+    let out = ctsq(&["-q", "id#NewServer", &missing, &f]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).contains(&format!("no such file: {}", missing)), "{}", stderr(&out));
+    assert!(stdout(&out).contains(&format!("{}:14: func NewServer(", f)), "{}", stdout(&out));
+    // Nothing matched overall: exit 1.
+    let none = ctsq(&["-q", "id#NewServer", &missing]);
+    assert_eq!(none.status.code(), Some(1));
+    assert!(stderr(&none).contains("no such file:"), "{}", stderr(&none));
+}
+
+#[test]
+fn a_missing_path_suggests_a_close_sibling() {
+    let typo = fixture("exampl.go");
+    let out = ctsq(&["-q", "id#NewServer", &typo, &fixture("example.go")]);
+    assert!(
+        stderr(&out).contains(&format!("no such file: {} (did you mean {})", typo, fixture("example.go"))),
+        "{}",
+        stderr(&out)
+    );
 }
 
 #[test]

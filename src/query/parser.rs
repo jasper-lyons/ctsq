@@ -29,6 +29,8 @@ enum Token {
     FlowsFromEventually,
     /// A character that starts no token. `parse` turns it into an error.
     Invalid(char),
+    /// A quoted name or regex whose closing delimiter never came.
+    Unterminated(char),
     Ident(String),
     QuotedStr(String),
     Regex(String),
@@ -36,13 +38,26 @@ enum Token {
     Eof,
 }
 
+/// Byte span of a token in the query string: start inclusive, end exclusive.
+type Span = (usize, usize);
+
 struct Lexer<'a> {
     chars: std::iter::Peekable<std::str::Chars<'a>>,
+    /// Byte offset of the next unread character.
+    at: usize,
 }
 
 impl<'a> Lexer<'a> {
     fn new(s: &'a str) -> Self {
-        Self { chars: s.chars().peekable() }
+        Self { chars: s.chars().peekable(), at: 0 }
+    }
+
+    fn bump(&mut self) -> Option<char> {
+        let c = self.chars.next();
+        if let Some(c) = c {
+            self.at += c.len_utf8();
+        }
+        c
     }
 
     fn next_token(&mut self) -> Token {
@@ -50,48 +65,48 @@ impl<'a> Lexer<'a> {
             None => Token::Eof,
             Some(c) if c == ' ' || c == '\t' => {
                 while matches!(self.chars.peek(), Some(' ') | Some('\t')) {
-                    self.chars.next();
+                    self.bump();
                 }
                 Token::Whitespace
             }
             Some('*') => {
-                self.chars.next();
+                self.bump();
                 if self.chars.peek() == Some(&'=') {
-                    self.chars.next();
+                    self.bump();
                     Token::ContainsEq
                 } else {
                     Token::Star
                 }
             }
             Some('^') => {
-                self.chars.next();
+                self.bump();
                 if self.chars.peek() == Some(&'=') {
-                    self.chars.next();
+                    self.bump();
                     Token::PrefixEq
                 } else {
                     Token::Invalid('^')
                 }
             }
             Some('$') => {
-                self.chars.next();
+                self.bump();
                 if self.chars.peek() == Some(&'=') {
-                    self.chars.next();
+                    self.bump();
                     Token::SuffixEq
                 } else {
                     Token::Invalid('$')
                 }
             }
-            Some('[') => { self.chars.next(); Token::LBracket }
-            Some(']') => { self.chars.next(); Token::RBracket }
-            Some(':') => { self.chars.next(); Token::Colon }
+            Some('[') => { self.bump(); Token::LBracket }
+            Some(']') => { self.bump(); Token::RBracket }
+            Some(':') => { self.bump(); Token::Colon }
             Some('-') => {
-                self.chars.next();
+                self.bump();
                 match self.chars.peek() {
-                    Some('>') => { self.chars.next(); Token::Calls }
+                    Some('>') => { self.bump(); Token::Calls }
                     Some('-') => {
-                        self.chars.next();
+                        self.bump();
                         if self.chars.peek() == Some(&'>') {
-                            self.chars.next();
+                            self.bump();
                             Token::CallsEventually
                         } else {
                             Token::Invalid('-')
@@ -101,21 +116,21 @@ impl<'a> Lexer<'a> {
                 }
             }
             Some('<') => {
-                self.chars.next();
+                self.bump();
                 match self.chars.peek() {
                     Some('-') => {
-                        self.chars.next();
+                        self.bump();
                         if self.chars.peek() == Some(&'-') {
-                            self.chars.next();
+                            self.bump();
                             Token::CalledByEventually
                         } else {
                             Token::CalledBy
                         }
                     }
                     Some('=') => {
-                        self.chars.next();
+                        self.bump();
                         if self.chars.peek() == Some(&'=') {
-                            self.chars.next();
+                            self.bump();
                             Token::FlowsFromEventually
                         } else {
                             Token::FlowsFrom
@@ -125,13 +140,13 @@ impl<'a> Lexer<'a> {
                 }
             }
             Some('=') => {
-                self.chars.next();
+                self.bump();
                 match self.chars.peek() {
-                    Some('>') => { self.chars.next(); Token::Flows }
+                    Some('>') => { self.bump(); Token::Flows }
                     Some('=') => {
-                        self.chars.next();
+                        self.bump();
                         if self.chars.peek() == Some(&'>') {
-                            self.chars.next();
+                            self.bump();
                             Token::FlowsEventually
                         } else {
                             Token::Invalid('=')
@@ -140,71 +155,113 @@ impl<'a> Lexer<'a> {
                     _ => Token::Eq,
                 }
             }
-            Some('&') => { self.chars.next(); Token::Amp }
-            Some('>') => { self.chars.next(); Token::Gt }
-            Some('+') => { self.chars.next(); Token::Plus }
-            Some('~') => { self.chars.next(); Token::Tilde }
-            Some('.') => { self.chars.next(); Token::Dot }
-            Some('(') => { self.chars.next(); Token::LParen }
-            Some(')') => { self.chars.next(); Token::RParen }
-            Some('@') => { self.chars.next(); Token::At }
-            Some('#') => { self.chars.next(); Token::Hash }
+            Some('&') => { self.bump(); Token::Amp }
+            Some('>') => { self.bump(); Token::Gt }
+            Some('+') => { self.bump(); Token::Plus }
+            Some('~') => { self.bump(); Token::Tilde }
+            Some('.') => { self.bump(); Token::Dot }
+            Some('(') => { self.bump(); Token::LParen }
+            Some(')') => { self.bump(); Token::RParen }
+            Some('@') => { self.bump(); Token::At }
+            Some('#') => { self.bump(); Token::Hash }
             Some('"') => {
-                self.chars.next();
+                self.bump();
                 let mut s = String::new();
                 loop {
-                    match self.chars.next() {
-                        Some('"') | None => break,
+                    match self.bump() {
+                        Some('"') => return Token::QuotedStr(s),
+                        None => return Token::Unterminated('"'),
+                        // `\"` is a quote and `\\` a backslash, so a name can hold either.
+                        Some('\\') => match self.chars.peek().copied() {
+                            Some(c @ ('"' | '\\')) => {
+                                self.bump();
+                                s.push(c);
+                            }
+                            _ => s.push('\\'),
+                        },
                         Some(c) => s.push(c),
                     }
                 }
-                Token::QuotedStr(s)
             }
             Some('/') => {
-                self.chars.next();
+                self.bump();
                 let mut s = String::new();
                 loop {
-                    match self.chars.next() {
-                        Some('/') | None => break,
+                    match self.bump() {
+                        Some('/') => return Token::Regex(s),
+                        None => return Token::Unterminated('/'),
+                        // `\/` is a literal slash in the regex. Every other escape
+                        // (`\d`, `\.`, `\\`) belongs to the regex engine and stays as typed.
+                        Some('\\') => match self.bump() {
+                            Some('/') => s.push('/'),
+                            Some(c) => {
+                                s.push('\\');
+                                s.push(c);
+                            }
+                            None => return Token::Unterminated('/'),
+                        },
                         Some(c) => s.push(c),
                     }
                 }
-                Token::Regex(s)
             }
             Some(c) if c.is_alphanumeric() || c == '_' => {
                 let mut s = String::new();
                 while matches!(self.chars.peek(), Some(c) if c.is_alphanumeric() || *c == '_') {
-                    s.push(self.chars.next().unwrap());
+                    s.push(self.bump().unwrap());
                 }
                 Token::Ident(s)
             }
             Some(c) => {
-                self.chars.next();
+                self.bump();
                 Token::Invalid(c)
             }
         }
     }
 
-    fn tokenize(mut self) -> Vec<Token> {
+    fn tokenize(mut self) -> (Vec<Token>, Vec<Span>) {
         let mut tokens = Vec::new();
+        let mut spans = Vec::new();
         loop {
+            let start = self.at;
             let t = self.next_token();
             let done = t == Token::Eof;
             tokens.push(t);
+            spans.push((start, self.at));
             if done { break; }
         }
-        tokens
+        (tokens, spans)
     }
 }
 
 pub struct Parser {
+    src: String,
     tokens: Vec<Token>,
+    spans: Vec<Span>,
     pos: usize,
 }
 
 impl Parser {
     pub fn new(s: &str) -> Self {
-        Self { tokens: Lexer::new(s).tokenize(), pos: 0 }
+        let (tokens, spans) = Lexer::new(s).tokenize();
+        Self { src: s.to_string(), tokens, spans, pos: 0 }
+    }
+
+    /// An error at the token under the cursor.
+    fn err_here(&self, msg: impl Into<String>) -> QueryError {
+        self.err_at(self.pos, msg)
+    }
+
+    /// An error at the token `advance` just consumed.
+    fn err_prev(&self, msg: impl Into<String>) -> QueryError {
+        self.err_at(self.pos.saturating_sub(1), msg)
+    }
+
+    fn err_at(&self, idx: usize, msg: impl Into<String>) -> QueryError {
+        if let Some(e) = self.slash_error(idx) {
+            return e;
+        }
+        let pos = self.spans.get(idx).map(|s| s.0).unwrap_or(self.src.len());
+        QueryError::new(msg, pos)
     }
 
     fn peek(&self) -> &Token {
@@ -223,7 +280,7 @@ impl Parser {
         }
     }
 
-    pub fn parse_query(&mut self) -> Result<Query, String> {
+    pub fn parse_query(&mut self) -> Result<Query, QueryError> {
         self.skip_whitespace();
         let head = self.parse_selector()?;
         let mut tail = Vec::new();
@@ -268,7 +325,7 @@ impl Parser {
         }
     }
 
-    fn parse_selector(&mut self) -> Result<Selector, String> {
+    fn parse_selector(&mut self) -> Result<Selector, QueryError> {
         let node = if self.peek() == &Token::LParen {
             self.advance(); // consume (
             self.skip_whitespace();
@@ -278,14 +335,14 @@ impl Parser {
                 self.advance();
                 match self.advance() {
                     Token::Ident(name) => Some(name),
-                    _ => return Err("expected capture name after @".into()),
+                    _ => return Err(self.err_prev("expected capture name after @")),
                 }
             } else {
                 None
             };
             self.skip_whitespace();
             if self.peek() != &Token::RParen {
-                return Err("expected )".into());
+                return Err(self.err_here("expected )").with_hint(format!("close the group: {})", self.src)));
             }
             self.advance();
             SelectorNode::Group { query: Box::new(query), capture }
@@ -300,18 +357,18 @@ impl Parser {
                 self.advance();
                 match self.advance() {
                     Token::Ident(name) if name == "not" => {}
-                    Token::Ident(name) => return Err(format!("unsupported pseudo-class :{}", name)),
-                    _ => return Err("expected pseudo-class name after :".into()),
+                    Token::Ident(name) => return Err(self.err_prev(format!("unsupported pseudo-class :{}", name)).with_hint("the only pseudo-class is :not(selector)")),
+                    _ => return Err(self.err_prev("expected pseudo-class name after :")),
                 }
                 if self.peek() != &Token::LParen {
-                    return Err("expected ( after :not".into());
+                    return Err(self.err_here("expected ( after :not"));
                 }
                 self.advance();
                 self.skip_whitespace();
                 not.push(self.parse_selector()?);
                 self.skip_whitespace();
                 if self.peek() != &Token::RParen {
-                    return Err("expected ) to close :not".into());
+                    return Err(self.err_here("expected ) to close :not"));
                 }
                 self.advance();
                 continue;
@@ -322,10 +379,10 @@ impl Parser {
             self.advance();
             let field = match self.advance() {
                 Token::Ident(name) => name,
-                _ => return Err("expected field name after .".into()),
+                _ => return Err(self.err_prev("expected field name after .")),
             };
             if self.peek() != &Token::LParen {
-                return Err("expected ( after field name".into());
+                return Err(self.err_here("expected ( after field name"));
             }
             self.advance();
             self.skip_whitespace();
@@ -336,7 +393,7 @@ impl Parser {
             };
             self.skip_whitespace();
             if self.peek() != &Token::RParen {
-                return Err("expected ) to close field access".into());
+                return Err(self.err_here("expected ) to close field access").with_hint(format!("close the field access: {})", self.src)));
             }
             self.advance();
             fields.push(FieldAccess { field, inner });
@@ -345,7 +402,7 @@ impl Parser {
         Ok(Selector { node, fields, not })
     }
 
-    fn parse_atom(&mut self) -> Result<Atom, String> {
+    fn parse_atom(&mut self) -> Result<Atom, QueryError> {
         let sigil = match self.peek() {
             Token::Star => { self.advance(); Some(Sigil::Def) }
             Token::Amp => { self.advance(); Some(Sigil::Ref) }
@@ -378,7 +435,7 @@ impl Parser {
 
     /// Returns the name match, plus the `qual` attribute when the name used the
     /// dot shorthand (`A.B` not followed by `(` is name `B` qualified by `A`).
-    fn parse_name_match(&mut self) -> Result<(NameMatch, Option<AttrMatch>), String> {
+    fn parse_name_match(&mut self) -> Result<(NameMatch, Option<AttrMatch>), QueryError> {
         match self.peek().clone() {
             Token::QuotedStr(s) => { self.advance(); Ok((NameMatch::Exact(s), None)) }
             Token::Regex(s) => { self.advance(); Ok((NameMatch::Regex(s), None)) }
@@ -397,16 +454,16 @@ impl Parser {
                 }
                 Ok((NameMatch::Exact(s), None))
             }
-            _ => Err("expected name match after #".into()),
+            _ => Err(self.err_here("expected a name after #").with_hint("a name is an identifier, \"quoted text\" or /regex/, as in id#foo, id#\"a b\" or id#/a|b/")),
         }
     }
 
-    fn parse_attr(&mut self) -> Result<AttrMatch, String> {
+    fn parse_attr(&mut self) -> Result<AttrMatch, QueryError> {
         self.advance(); // [
         self.skip_whitespace();
         let key = match self.advance() {
             Token::Ident(k) => k,
-            _ => return Err("expected attribute name after [".into()),
+            _ => return Err(self.err_prev("expected attribute name after [")),
         };
         self.skip_whitespace();
         let op = match self.advance() {
@@ -414,18 +471,18 @@ impl Parser {
             Token::PrefixEq => AttrOp::Prefix,
             Token::ContainsEq => AttrOp::Contains,
             Token::SuffixEq => AttrOp::Suffix,
-            _ => return Err(format!("expected =, ^=, *= or $= after attribute '{}'", key)),
+            _ => return Err(self.err_prev(format!("expected =, ^=, *= or $= after attribute '{}'", key))),
         };
         self.skip_whitespace();
         let (op, value) = match (self.advance(), op) {
             (Token::Ident(v) | Token::QuotedStr(v), op) => (op, v),
             (Token::Regex(v), AttrOp::Eq) => (AttrOp::Regex, v),
-            (Token::Regex(_), _) => return Err("a /regex/ value needs plain =".into()),
-            _ => return Err(format!("expected a value for attribute '{}'", key)),
+            (Token::Regex(_), _) => return Err(self.err_prev("a /regex/ value needs plain =")),
+            _ => return Err(self.err_prev(format!("expected a value for attribute '{}'", key))),
         };
         self.skip_whitespace();
         if self.advance() != Token::RBracket {
-            return Err("expected ] to close attribute".into());
+            return Err(self.err_prev("expected ] to close attribute"));
         }
         Ok(AttrMatch { key, op, value })
     }
@@ -445,17 +502,93 @@ fn semantic_combinator(t: &Token) -> Option<Combinator> {
     })
 }
 
-pub fn parse(s: &str) -> Result<Query, String> {
+pub fn parse(s: &str) -> Result<Query, QueryError> {
     let mut parser = Parser::new(s);
-    if let Some(Token::Invalid(c)) = parser.tokens.iter().find(|t| matches!(t, Token::Invalid(_))) {
-        return Err(format!("unexpected character '{}' in query", c));
+    for (i, t) in parser.tokens.iter().enumerate() {
+        match t {
+            Token::Invalid(c) => {
+                return Err(QueryError::new(format!("unexpected character '{}'", c), parser.spans[i].0));
+            }
+            Token::Unterminated(d) => {
+                // A stray inner slash starts a second regex that never closes. Name the
+                // first slash rather than the last, since that is where the fault is.
+                for j in 1..i {
+                    if let Some(e) = parser.slash_error(j) {
+                        return Err(e);
+                    }
+                }
+                let what = if *d == '/' { "regex" } else { "quoted name" };
+                let start = parser.spans[i].0;
+                let fix = format!("{}{}", s, d);
+                return Err(QueryError::new(format!("unterminated {}", what), start)
+                    .with_hint(format!("close it with a '{}': {}", d, fix)));
+            }
+            _ => {}
+        }
     }
     let query = parser.parse_query()?;
     parser.skip_whitespace();
     if parser.peek() != &Token::Eof {
-        return Err(format!("unexpected input at position {}", parser.pos));
+        let at = parser.spans[parser.pos];
+        let text = &s[at.0..at.1];
+        return Err(parser.err_here(format!("unexpected '{}'", text)));
     }
     Ok(query)
+}
+
+impl Parser {
+    /// A regex name filter that ends early because it holds an unescaped `/`:
+    /// the token after it touches its closing slash. Reports the slash and
+    /// suggests the query with the inner slashes escaped.
+    fn slash_error(&self, idx: usize) -> Option<QueryError> {
+        if idx == 0 || !matches!(self.tokens.get(idx - 1), Some(Token::Regex(_))) {
+            return None;
+        }
+        if !matches!(
+            self.tokens.get(idx),
+            Some(Token::Ident(_) | Token::Regex(_) | Token::QuotedStr(_) | Token::Unterminated(_))
+        ) {
+            return None;
+        }
+        let (open, close) = (self.spans[idx - 1].0, self.spans[idx - 1].1);
+        if close != self.spans[idx].0 {
+            return None;
+        }
+        let mut err = QueryError::new("unexpected '/'", close - 1);
+        // The filter runs to the next space. Its last slash closes it, the ones before are inner.
+        let after_open = open + 1;
+        let run_end = self.src[after_open..]
+            .find(|c: char| c.is_whitespace())
+            .map(|n| after_open + n)
+            .unwrap_or(self.src.len());
+        let run = &self.src[after_open..run_end];
+        if let Some(last) = run.rfind('/') {
+            let first_close = close - 1 - after_open;
+            if last > first_close {
+                let mut body = String::new();
+                let mut prev = ' ';
+                for c in run[..last].chars() {
+                    if c == '/' && prev != '\\' {
+                        body.push('\\');
+                    }
+                    body.push(c);
+                    prev = c;
+                }
+                let fixed = format!(
+                    "{}/{}/{}{}",
+                    &self.src[..open],
+                    body,
+                    &run[last + 1..],
+                    &self.src[run_end..]
+                );
+                err = err.with_hint(format!(
+                    "a '/' inside a regex name filter must be escaped: {}",
+                    fixed
+                ));
+            }
+        }
+        Some(err)
+    }
 }
 
 #[cfg(test)]
@@ -708,6 +841,89 @@ mod tests {
         for src in ["function:has(x)", "function:", "function:not", "function:not(", "function:not(a"] {
             assert!(parse(src).is_err(), "{}", src);
         }
+    }
+
+    fn name_of(src: &str) -> Option<NameMatch> {
+        atom_of(&parse(src).unwrap_or_else(|e| panic!("{}: {}", src, e))).name_match.clone()
+    }
+
+    #[test]
+    fn a_regex_filter_holds_commas_pipes_quotes_and_escaped_slashes() {
+        assert_eq!(name_of("id#/a,b|c/"), Some(NameMatch::Regex("a,b|c".into())));
+        assert_eq!(name_of("literal#/call\"/"), Some(NameMatch::Regex("call\"".into())));
+        assert_eq!(name_of("id#/a\\/b/"), Some(NameMatch::Regex("a/b".into())));
+        assert_eq!(name_of("id#/\\/ui\\/page/"), Some(NameMatch::Regex("/ui/page".into())));
+    }
+
+    #[test]
+    fn other_regex_escapes_reach_the_regex_untouched() {
+        assert_eq!(name_of("id#/\\d+\\.x/"), Some(NameMatch::Regex("\\d+\\.x".into())));
+        assert_eq!(name_of("id#/a\\\\/"), Some(NameMatch::Regex("a\\\\".into())));
+    }
+
+    #[test]
+    fn a_quoted_filter_holds_slashes_commas_pipes_and_escaped_quotes() {
+        assert_eq!(name_of("id#\"a/b\""), Some(NameMatch::Exact("a/b".into())));
+        assert_eq!(name_of("id#\"a,b|c\""), Some(NameMatch::Exact("a,b|c".into())));
+        assert_eq!(name_of("id#\"say \\\"hi\\\"\""), Some(NameMatch::Exact("say \"hi\"".into())));
+        assert_eq!(name_of("id#\"a\\\\b\""), Some(NameMatch::Exact("a\\b".into())));
+    }
+
+    #[test]
+    fn filters_with_odd_characters_still_close_around_the_rest_of_the_query() {
+        let q = parse("(*function#/a,b|c\\/d/ @f).body(id#\"x/y\")").unwrap();
+        assert_eq!(q.head.fields[0].field, "body");
+        let q = parse("id#/a\"b/ > id#\"c,d\"").unwrap();
+        assert_eq!(q.tail.len(), 1);
+    }
+
+    #[test]
+    fn errors_carry_the_byte_position_of_the_fault() {
+        let e = parse("function#(").unwrap_err();
+        assert_eq!((e.pos, e.msg.as_str()), (9, "expected a name after #"));
+        let e = parse("function ! x").unwrap_err();
+        assert_eq!((e.pos, e.msg.as_str()), (9, "unexpected character '!'"));
+        let e = parse("(function#a").unwrap_err();
+        assert_eq!((e.pos, e.msg.as_str()), (11, "expected )"));
+        assert_eq!(e.hint.as_deref(), Some("close the group: (function#a)"));
+        let e = parse("function[from").unwrap_err();
+        assert_eq!(e.pos, 13);
+        let e = parse("function:has(x)").unwrap_err();
+        assert_eq!(e.pos, 9);
+        assert!(e.hint.is_some());
+    }
+
+    #[test]
+    fn positions_are_bytes_so_they_follow_multibyte_names() {
+        let e = parse("id#\"é\" !").unwrap_err();
+        assert_eq!(e.pos, 8);
+    }
+
+    #[test]
+    fn an_unterminated_filter_says_so_and_offers_the_closing_delimiter() {
+        let e = parse("id#/abc").unwrap_err();
+        assert_eq!((e.pos, e.msg.as_str()), (3, "unterminated regex"));
+        assert_eq!(e.hint.as_deref(), Some("close it with a '/': id#/abc/"));
+        let e = parse("id#\"abc").unwrap_err();
+        assert_eq!((e.pos, e.msg.as_str()), (3, "unterminated quoted name"));
+        let e = parse("id#/abc\\/").unwrap_err();
+        assert_eq!(e.msg, "unterminated regex", "an escaped slash does not close it");
+    }
+
+    #[test]
+    fn an_unescaped_inner_slash_points_at_the_slash_and_suggests_the_escape() {
+        let e = parse("id#/ui/page/").unwrap_err();
+        assert_eq!((e.pos, e.msg.as_str()), (6, "unexpected '/'"));
+        assert_eq!(
+            e.hint.as_deref(),
+            Some("a '/' inside a regex name filter must be escaped: id#/ui\\/page/")
+        );
+        let e = parse("(id#/a/b/c/ @x)").unwrap_err();
+        assert_eq!(e.pos, 6, "{:?}", e);
+        assert_eq!(
+            e.hint.as_deref(),
+            Some("a '/' inside a regex name filter must be escaped: (id#/a\\/b\\/c/ @x)")
+        );
     }
 
     #[test]
