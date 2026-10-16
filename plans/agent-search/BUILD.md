@@ -87,3 +87,15 @@ The plan's packages run in plan order, split where one agent would not finish in
 ### A16. Docs stay runnable
 
 Every package that adds a flag or command adds a worked example to `plans/agent-search/docs/SKILL.md` (a fenced block whose first line starts with `ctsq `, under `## Worked examples`), a line to the help EXAMPLES in `src/main.rs`, and a line to `plans/agent-search/docs/claude-md-ctsq.md` if it changes what an agent should reach for first. `bash plans/agent-search/docs/check-examples.sh` must pass after every package. Examples quote line numbers from this repo's source, so a package that shifts those lines updates the examples.
+
+## Deferred minors
+
+Minor findings from the mid-build adversarial review, not fixed in this build:
+
+- `call#X` misses nested C++ qualified calls (`ns::Cls::target()`), template-scoped and template member calls (`obj.foo<int>()`), and Rust turbofish method calls (`x.target::<u8>()`). Single-level member and scoped calls work in all 8 languages.
+- `callers` exits 0 on a walk with no files. `refs zzz dir` prints nothing and exits 0 (as before this build). An unknown kind exits 1, not 2 (as before). `tree emptydir` exits 1 with no message.
+- Suggested fixes for quotes are wrong (`id#a"b` suggests `id#a"b"`, which also fails). `id#x > ` puts the caret at 0, not the dangling `>`. `id#/(/` puts the caret on the opening `/`.
+- Rust test detection misses `#[cfg(all(test, ...))]`, a `#[test] fn` outside a cfg(test) mod, `mod test` (singular), and `src/tests.rs` loaded by `#[cfg(test)] mod tests;`. No false positives were found.
+- An `--exclude` glob with a slash is matched relative to the search root, so the path as ctsq prints it (`th/ts/**`) excludes nothing, silently.
+- `string` and `literal` do not cover JS/TS template strings, so the id# miss fallback misses them too.
+- Test-scope detection still costs time: `tree src/` takes 0.27s against 0.10s before this build (0.41s before the fix). Next step: cache compiled scope queries across files.
