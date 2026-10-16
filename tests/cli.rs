@@ -774,3 +774,27 @@ fn files_scope_lists_each_distinct_scope_holding_a_match() {
     );
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn scopeof_prints_the_heading_and_body_and_exits_zero() {
+    let f = fixture("example.go");
+    let out = ctsq(&["scopeof", &format!("{}:15", f)]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(text.starts_with(&format!("{}:15  in  {}:", f, f)), "{}", text);
+}
+
+#[test]
+fn scopeof_rejects_a_non_coordinate_with_exit_2() {
+    let out = ctsq(&["scopeof", "src/footer.rs"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("expected path:LINE or path:LINE:COL"), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+}
+
+#[test]
+fn scopeof_missing_file_is_named_on_stderr_and_exits_one() {
+    let out = ctsq(&["scopeof", "no/such/file.rs:3"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("no such file: no/such/file.rs"), "{}", stderr(&out));
+}

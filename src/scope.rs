@@ -69,7 +69,6 @@ pub fn parse(lang_name: &str, source: &[u8]) -> Option<Tree> {
 }
 
 struct Found<'t> {
-    core: Node<'t>,
     outer: Node<'t>,
     kind: &'static str,
     name: String,
@@ -193,7 +192,7 @@ fn found<'t>(node: Node<'t>, fam: Fam, source: &[u8]) -> Option<Found<'t>> {
         }
         _ => {}
     }
-    Some(Found { core: node, outer, kind, name: text(name_node, source), name_end: name_node.end_byte() })
+    Some(Found { outer, kind, name: text(name_node, source), name_end: name_node.end_byte() })
 }
 
 fn to_scope(path: &str, f: &Found, source: &[u8]) -> Scope {
@@ -331,6 +330,35 @@ pub fn line_start_byte(source: &[u8], line: usize) -> usize {
         b += 1;
     }
     b
+}
+
+/// Bytes of the first and the last non-blank character on 1-based `line`.
+/// A blank line gives the same byte twice.
+pub fn line_bytes(source: &[u8], line: usize) -> (usize, usize) {
+    let first = line_start_byte(source, line);
+    let mut end = first;
+    while end < source.len() && source[end] != b'\n' {
+        end += 1;
+    }
+    let mut last = end;
+    while last > first && matches!(source[last - 1], b' ' | b'\t' | b'\r') {
+        last -= 1;
+    }
+    (first, if last > first { last - 1 } else { first })
+}
+
+/// Byte offset of 1-based `col` (a byte column) on 1-based `line`, kept inside
+/// the line.
+pub fn byte_at(source: &[u8], line: usize, col: usize) -> usize {
+    let mut start = 0usize;
+    for _ in 1..line {
+        match source[start..].iter().position(|&b| b == b'\n') {
+            Some(i) => start += i + 1,
+            None => return source.len(),
+        }
+    }
+    let end = source[start..].iter().position(|&b| b == b'\n').map_or(source.len(), |i| start + i);
+    (start + col.saturating_sub(1)).min(end.saturating_sub(1).max(start))
 }
 
 // ── What --scope prints ──────────────────────────────────────────────────────

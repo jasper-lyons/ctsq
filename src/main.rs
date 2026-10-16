@@ -8,6 +8,7 @@ mod miss;
 mod query;
 mod runner;
 mod scope;
+mod scopeof;
 mod tree;
 mod calltree;
 mod importgraph;
@@ -113,6 +114,10 @@ EXAMPLES (a question as a comment, the call, then the next call)
   # Which function or class holds each hit? --scope adds a row under it, --body the scope's body.
   ctsq -q 'id#hide_rows' --scope src/
   ctsq def saveAssetNow fixtures/scope --scope
+  # def goes from a name to a location, scopeof from a location to its definition.
+  ctsq def hide_rows src/
+  ctsq scopeof src/footer.rs:30
+  ctsq scopeof src/footer.rs:30 --up 1 --siblings
 
 STDIN
   Pipe file paths (language detected per file from extension):
@@ -142,6 +147,7 @@ SUBCOMMANDS
   ctsq callgraph src/ --format edges    full call graph as plain caller -> callee pairs
   ctsq def helper src/                  where is this function defined (file:line)
   ctsq def Foo::method src/             resolve a qualified path or method to its definition
+  ctsq scopeof src/a.rs:40 src/b.rs:9   the reverse of def: the function or class holding each line, with its body
   ctsq files -q 'id#A' -q 'id#B' src/   files where every one of several queries matches
   ctsq imports src/main.rs src/         what files this file imports (down the import tree)
   ctsq importers src/files.rs src/      what files import this file (up the import tree)
@@ -359,6 +365,45 @@ holds it, so a name defined inside several components tells them apart:
         path: String,
         #[command(flatten)]
         scope: ScopeArgs,
+    },
+    /// The function or class holding each path:line, with its body (the reverse of def)
+    #[command(after_help = "def goes from a name to a location, scopeof goes from a location to its
+definition. It takes the path:line or path:line:col that grep, compilers and
+stack traces print, and returns the nearest named scope holding the line:
+
+  ctsq scopeof src/footer.rs:30
+  ctsq scopeof src/a.rs:40:12 src/b.rs:9 --up 1
+  ctsq scopeof src/a.rs:40 --siblings --callers
+  ctsq scopeof src/main.rs:600 --budget 20
+
+Each coordinate prints `path:LINE  in  path:START-END  signature` and then the
+scope's lines as they sit in the file. A line outside every named scope prints
+`path:LINE  at top level` and a window of the file. A scope longer than --budget
+prints its heading, a window centred on the line and a `showing lines` footer.
+A line that is a function's own signature returns that function. Closures are
+not named scopes, so a line inside one returns its named parent. Test hiding
+does not apply. A missing file or a line past the end goes to stderr and the
+other coordinates still run. Exit 0 when any coordinate resolved, 1 when none
+did, 2 when an argument is not a coordinate.")]
+    Scopeof {
+        /// path:LINE or path:LINE:COL (COL is a 1-based byte column)
+        #[arg(num_args(1..), required = true)]
+        coords: Vec<String>,
+        /// Climb N enclosing named scopes (method, then class, then module)
+        #[arg(long, default_value = "0", conflicts_with = "block")]
+        up: usize,
+        /// After the body, list the other scopes in the same parent, signature only
+        #[arg(long)]
+        siblings: bool,
+        /// After the body, list the callers of the scope, one level
+        #[arg(long)]
+        callers: bool,
+        /// Return the innermost block (an if or loop body) instead of the named scope
+        #[arg(long)]
+        block: bool,
+        /// A scope longer than N lines prints a window of N lines centred on the line
+        #[arg(long, default_value = "150", value_parser = clap::value_parser!(u64).range(1..))]
+        budget: u64,
     },
     /// Find all usage sites of a name (complement of def)
     Refs {
@@ -586,6 +631,31 @@ fn main() {
         Some(Commands::Def { name_or_expr, path, scope }) => {
             resolve::run_def(&name_or_expr, &path, cli.lang.as_deref(), cli.no_ignore, &hide, scope.opts());
             return;
+        }
+        Some(Commands::Scopeof { coords, up, siblings, callers, block, budget }) => {
+            let mut parsed = Vec::new();
+            for c in &coords {
+                match scopeof::parse_coord(c) {
+                    Ok(p) => parsed.push(p),
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        std::process::exit(2);
+                    }
+                }
+            }
+            let opts = scopeof::Options {
+                up,
+                siblings,
+                callers,
+                block,
+                budget: budget as usize,
+                lang: cli.lang.clone(),
+                no_ignore: cli.no_ignore,
+            };
+            let r = scopeof::report(&parsed, &opts, &hide);
+            eprint!("{}", r.err);
+            print!("{}", r.out);
+            std::process::exit(r.code);
         }
         Some(Commands::Refs { name, path, scope }) => {
             run_refs(&name, &path, cli.lang.as_deref(), cli.no_ignore, &hide, scope.opts());

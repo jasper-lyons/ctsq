@@ -231,15 +231,44 @@ fixtures/scope/Asset.tsx:11: const saveAssetNow = () => props.asset  ?
 
 ```
 ctsq -q 'id#hide_rows' --scope src/
-src/main.rs:841: hide_rows(&mut hider, file, &source, rows, true, &mut hidden)
-  in src/main.rs:521-905  fn main() {
-src/main.rs:910: fn hide_rows(
-src/main.rs:1073: for r in &hide_rows(&mut hider, file, &source, rows, false, &mut hidden) {
-  in src/main.rs:1035-1090  fn run_refs(
+src/main.rs:911: hide_rows(&mut hider, file, &source, rows, true, &mut hidden)
+  in src/main.rs:566-975  fn main() {
+src/main.rs:980: fn hide_rows(
+src/main.rs:1143: for r in &hide_rows(&mut hider, file, &source, rows, false, &mut hidden) {
+  in src/main.rs:1105-1160  fn run_refs(
 3 matches
 ```
 
 Next: pull the scope with `ctsq -q '*function#run_refs' --body src/main.rs`.
+
+### 14. From a line to its definition
+
+Question: a stack trace says `src/scope.rs:395`. What function is that, and what holds it?
+
+```
+ctsq scopeof src/scope.rs:395 --budget 6
+src/scope.rs:395  in  src/scope.rs:392-395  pub fn call_line(&mut self, path: &str, lang_name: &str, source: &[u8], line: usize) -> Option<Scope...
+    pub fn call_line(&mut self, path: &str, lang_name: &str, source: &[u8], line: usize) -> Option<Scope> {
+        let tree = self.tree(path, lang_name, source)?;
+        nearest(path, lang_name, source, tree, line_start_byte(source, line))
+    }
+```
+
+`def` goes from a name to a location, `scopeof` goes from a location to its definition. The heading names the line you asked about and the span of the nearest named scope holding it, then the scope's lines as they sit in the file. A line inside a closure returns the closure's named parent, and a function's own signature line returns that function. Give several coordinates in one call, `path:LINE:COL` to pin the byte. Ask for the owner of the method:
+
+```
+ctsq scopeof src/scope.rs:395 --up 1 --budget 6
+src/scope.rs:395  in  src/scope.rs:372-402  impl Scopes {
+    pub fn call_line(&mut self, path: &str, lang_name: &str, source: &[u8], line: usize) -> Option<Scope> {
+        let tree = self.tree(path, lang_name, source)?;
+        nearest(path, lang_name, source, tree, line_start_byte(source, line))
+    }
+
+    /// The scope holding a definition on `line`, stepping over a declaration
+showing lines 392-397 of 372-402, --budget 31 for all
+```
+
+`--up N` climbs N enclosing scopes (past the outermost it stops there and says `only K enclosing scopes`). `--siblings` adds the other scopes in the same parent as `path:LINE: signature` rows, `--callers` adds one level of callers, `--block` returns the innermost block (an `if` or loop body) instead. A scope longer than `--budget` (default 150) prints a window of that many lines centred on your line, then a `showing lines` footer whose `--budget` value shows it all. A line outside every named scope prints `path:LINE  at top level` and a window of the file. A missing file or a line past the end goes to stderr and the other coordinates still run. Test hiding does not apply, since you named the file and line.
 
 ## Reference
 
