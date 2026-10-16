@@ -831,8 +831,39 @@ fn find_with_no_arguments_lists_what_applies_and_exits_0() {
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(
         stdout(&out),
-        "built-in queries/solid-routes.toml:9: route  solid-routes  (import @solidjs/router in src/App.tsx)\nnot detected here: route (chi), route (net-http), route (next-app), route (rails-routes), route (react-router)\n"
+        "built-in queries/jsx-component.toml:8: component  jsx-component  (always)\n\
+         built-in queries/error-js.toml:7: error           js-error       (always)\n\
+         built-in queries/jsx-label.toml:8: label          jsx-label      (always)\n\
+         built-in queries/solid-routes.toml:9: route       solid-routes   (import @solidjs/router in src/App.tsx)\n\
+         built-in queries/jsx-text.toml:7: text            jsx-text       (always)\n\
+         not detected here: error (go-error), error (ruby-error), route (chi), route (net-http), route (next-app), route (rails-routes), route (react-router)\n"
     );
+}
+
+#[test]
+fn find_text_and_error_name_the_function_that_renders_or_emits_them() {
+    let out = ctsq_in(&fixture("queries/jsx"), &["find", "text", "welcome"]);
+    assert_eq!(stdout(&out), "src/Card.tsx:6  Welcome back  Card  src/Card.tsx:3\n1 text (jsx-text, from built-in queries/jsx-text.toml)\n");
+    let out = ctsq_in(&fixture("queries/errors"), &["find", "error", "failed to load pipeline 12: open x: no such file"]);
+    assert_eq!(stdout(&out), "go/load.go:14  failed to load pipeline %s: %w  Load  go/load.go:10\n1 error (go-error, from built-in queries/error-go.toml)\n");
+}
+
+#[test]
+fn the_glossary_is_used_by_find_def_and_a_miss_and_each_says_so_last() {
+    let dir = fixture("glossary");
+    let note = ".ctsq/glossary.toml:2: \"pipeline page\" also searched as Pipeline\n";
+    let out = ctsq_in(&dir, &["find", "error", "pipeline page"]);
+    assert!(out.status.success() && stdout(&out).ends_with(note), "{}", stdout(&out));
+    let out = ctsq_in(&dir, &["def", "pipeline page", "src"]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert_eq!(stdout(&out), format!("src/pipeline.go:5: func Pipeline() error {{\n{}", note));
+    let out = ctsq_in(&dir, &["-q", "id#\"pipeline page\"", "src"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stdout(&out).starts_with("no identifier matches id#\"pipeline page\" in src (1 file)\nfound as Pipeline:\nsrc/pipeline.go:5: func Pipeline() error {\n"), "{}", stdout(&out));
+    assert!(stdout(&out).ends_with(note), "{}", stdout(&out));
+    let out = ctsq_in(&dir, &["def", "supplies", "src"]);
+    assert!(stdout(&out).ends_with(".ctsq/glossary.toml:4: \"supplies\" also searched as /resource|stock/\n"), "{}", stdout(&out));
+    assert!(stdout(&out).starts_with("src/pipeline.go:13: func stockLevel() error {"), "{}", stdout(&out));
 }
 
 #[test]
@@ -882,7 +913,11 @@ fn config_path_lists_a_queries_directory_per_layer() {
     let text = stdout(&out);
     assert!(text.contains("\nqueries:\n1. repo      "), "{}", text);
     assert!(text.contains("solid-mavexa/.ctsq/queries\n"), "{}", text);
-    assert!(text.contains("4. built-in  go-chi.toml, go-http.toml, next-app.toml, rails-routes.toml, react-router.toml, solid-routes.toml\n"), "{}", text);
+    assert!(
+        text.contains("4. built-in  error-go.toml, error-js.toml, error-ruby.toml, go-chi.toml, go-http.toml, jsx-component.toml, jsx-label.toml, jsx-text.toml, next-app.toml, rails-routes.toml, react-router.toml, solid-routes.toml\n"),
+        "{}",
+        text
+    );
 }
 
 /// Every `match` of every built-in pack also runs as a plain -q query and

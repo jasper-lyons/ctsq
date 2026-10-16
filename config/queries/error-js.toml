@@ -1,0 +1,17 @@
+# Error messages in TypeScript and JavaScript: new Error("..."), new
+# SomethingError("..."), throw "...". A template string keeps its ${...}, which
+# find matches as a wildcard. The target is the function that emits the error.
+framework = "js-error"
+langs     = ["ts", "tsx", "js"]
+
+[error]
+match = [
+  # throw new Error("nothing to parse")
+  "(new_expression.constructor(identifier#/Error$/) > (arguments > (string @key)))",
+  # throw new ValidationError(`bad field ${name}`)
+  "(new_expression.constructor(identifier#/Error$/) > (arguments > (template_string @key)))",
+  # throw "plain string failure"
+  "(throw_statement > (string @key))",
+  "(throw_statement > (template_string @key))",
+]
+target = "enclosing"

@@ -381,6 +381,63 @@ pub fn report_for(ast: &Query, query: &str, scope: &str, jobs: &[(String, &'stat
     report(kind, query, scope, jobs.len(), &found, &defined)
 }
 
+/// `report_for`, plus the repo glossary: when the missed name is a glossary
+/// term, the same kind of query runs for each name it maps to. What they found
+/// is shown with a `try:` line each, and a last line names the glossary file
+/// and line that was used.
+pub fn report_for_glossary(
+    ast: &Query,
+    query: &str,
+    scope: &str,
+    jobs: &[(String, &'static str)],
+    glossary: Option<&crate::config::glossary::Glossary>,
+) -> String {
+    let mut out = report_for(ast, query, scope, jobs);
+    let Some(g) = glossary else { return out };
+    let Some(atom) = lone_atom(ast) else { return out };
+    let (Some(kind), Some(NameMatch::Exact(asked))) = (atom.node_type.as_deref(), &atom.name_match) else { return out };
+    let mut notes = Vec::new();
+    for entry in g.lookup(asked, true) {
+        for (raw, name) in entry.raw.iter().zip(&entry.names) {
+            let nm = match name {
+                crate::config::glossary::Name::Exact(n) => NameMatch::Exact(n.clone()),
+                crate::config::glossary::Name::Re(r) => NameMatch::Regex(r.as_str().to_string()),
+            };
+            let q = kind_query(atom.sigil.clone(), kind, nm.clone());
+            let mut seen = HashSet::new();
+            let rows: Vec<String> = rows_over(&q, jobs)
+                .into_iter()
+                .map(|(f, line, text)| format!("{}:{}: {}", f, line, text))
+                .filter(|r| seen.insert(r.clone()))
+                .collect();
+            if rows.is_empty() {
+                continue;
+            }
+            out.push_str(&format!("found as {}:\n", raw));
+            for r in rows.iter().take(MAX_ROWS) {
+                out.push_str(r);
+                out.push('\n');
+            }
+            if rows.len() > MAX_ROWS {
+                out.push_str(&format!("({} more)\n", rows.len() - MAX_ROWS));
+            }
+            let try_query = compiler::render_atom(&Atom {
+                sigil: atom.sigil.clone(),
+                node_type: Some(kind.to_string()),
+                name_match: Some(nm),
+                attrs: vec![],
+            });
+            out.push_str(&format!("try: ctsq -q {} {}\n", shell_quote(&try_query), scope));
+        }
+        notes.push(entry.note(&g.file));
+    }
+    for n in notes {
+        out.push_str(&n);
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

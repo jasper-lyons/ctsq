@@ -260,7 +260,26 @@ pub fn run_def(
 ) {
     let jobs = crate::files::resolve_jobs(path, lang_name, no_ignore);
     let mut all_names: Vec<String> = Vec::new();
-    let rows = def_rows(expr, &jobs, &mut all_names);
+    let mut rows = def_rows(expr, &jobs, &mut all_names);
+    // A name that is a glossary term is also searched as each name it maps to.
+    let glossary = match crate::config::glossary::load(&std::env::current_dir().unwrap_or_default()) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(2);
+        }
+    };
+    let mut notes: Vec<String> = Vec::new();
+    if let Some(g) = &glossary {
+        for entry in g.lookup(expr, true) {
+            for r in mapped_rows(&entry.names, &jobs) {
+                if !rows.iter().any(|(f, l, _)| *f == r.0 && *l == r.1) {
+                    rows.push(r);
+                }
+            }
+            notes.push(entry.note(&g.file));
+        }
+    }
     let found_any = !rows.is_empty();
     let mut hider = crate::files::Hider::new(hide);
     hider.add_jobs(path, &jobs);
@@ -278,6 +297,9 @@ pub fn run_def(
         if !similar.is_empty() {
             println!("similar names: {}", similar.join(", "));
         }
+        for n in &notes {
+            println!("{}", n);
+        }
         std::process::exit(1);
     }
 
@@ -293,6 +315,10 @@ pub fn run_def(
         if let Some(p) = printer.as_mut() {
             print!("{}", p.def_rows(&file, line, ""));
         }
+    }
+    // The glossary line comes last before the footer.
+    for n in &notes {
+        println!("{}", n);
     }
     // Every definition hidden: the footer says where they are, and exit 1.
     print!("{}", crate::footer::tail(shown, "definition", &hidden, scope.is_some()));
@@ -357,55 +383,118 @@ pub fn def_rows(
 /// for any function, class, type or variable declaration of that name.
 /// `def_rows` for many names over the same jobs, quiet, with the index and the
 /// outline fallback built once. `find` resolves every route target with it.
+///
+/// It is targeted: a definition of a name has the name's bytes in its file, so
+/// `find` parses only the files that hold them (a byte search over the sources
+/// read once) and builds the index from those. The rows and their ranking are
+/// the ones a full index gives. Each file is parsed at most once per lookup.
 pub struct DefLookup {
     jobs: Vec<(String, &'static str)>,
-    index: DefIndex,
-    /// (file, name, line) of every outline entry, read on the first miss.
-    locs: Option<Vec<(String, String, usize)>>,
+    /// Text of each job's file, empty when it cannot be read.
+    sources: Vec<String>,
+    /// Definitions of a job, once the job was needed.
+    defs: HashMap<usize, Vec<Def>>,
+    /// (name, line) of a job's outline entries, once a miss needed them.
+    locs: HashMap<usize, Vec<(String, usize)>>,
+    answers: HashMap<String, Vec<(String, usize, Confidence)>>,
+}
+
+/// Whether `hay` holds the bytes of `needle`. Valid UTF-8, which source nearly
+/// always is, goes through the standard library's substring search, which is
+/// far faster than comparing a window at every offset.
+pub fn holds(hay: &[u8], needle: &str) -> bool {
+    match std::str::from_utf8(hay) {
+        Ok(s) => s.contains(needle),
+        Err(_) => {
+            let n = needle.as_bytes();
+            n.is_empty() || hay.windows(n.len()).any(|w| w == n)
+        }
+    }
 }
 
 impl DefLookup {
     pub fn new(jobs: &[(String, &'static str)]) -> DefLookup {
-        let mut index = DefIndex::default();
-        for (file, lang) in jobs {
-            let Ok(source) = std::fs::read(file) else { continue };
-            for def in resolver_for(lang).collect_defs(file, &source) {
-                index.push(def);
-            }
+        let sources = jobs
+            .iter()
+            .map(|(f, _)| String::from_utf8_lossy(&std::fs::read(f).unwrap_or_default()).into_owned())
+            .collect();
+        DefLookup {
+            jobs: jobs.to_vec(),
+            sources,
+            defs: HashMap::new(),
+            locs: HashMap::new(),
+            answers: HashMap::new(),
         }
-        DefLookup { jobs: jobs.to_vec(), index, locs: None }
     }
 
     /// The same rows `def_rows` gives for `expr`, in the same order.
     pub fn find(&mut self, expr: &str) -> Vec<(String, usize, Confidence)> {
-        let rows: Vec<(String, usize, Confidence)> = resolve_def_query(expr, &self.index)
-            .into_iter()
-            .map(|(i, conf)| (self.index.defs[i].id.file.clone(), self.index.defs[i].id.line, conf))
-            .collect();
-        if !rows.is_empty() {
-            return rows;
+        if let Some(a) = self.answers.get(expr) {
+            return a.clone();
         }
-        let jobs = &self.jobs;
-        let locs = self.locs.get_or_insert_with(|| {
-            jobs.iter()
-                .flat_map(|(file, lang)| {
-                    crate::tree::collect_def_locs(file, lang)
-                        .into_iter()
-                        .map(move |(_, name, line)| (file.clone(), name, line))
-                })
-                .collect()
-        });
         let bare = crate::explain::bare_name(expr);
-        let mut found: Vec<(String, usize)> =
-            locs.iter().filter(|(_, n, _)| n == bare).map(|(f, _, l)| (f.clone(), *l)).collect();
-        found.sort();
-        found.dedup();
-        if found.is_empty() {
-            found = nested_def_sites(bare, &self.jobs);
+        let mine: Vec<usize> = (0..self.jobs.len()).filter(|&i| self.sources[i].contains(bare)).collect();
+        let mut index = DefIndex::default();
+        for &i in &mine {
+            let (file, lang) = &self.jobs[i];
+            let source = &self.sources[i];
+            let defs = self.defs.entry(i).or_insert_with(|| resolver_for(lang).collect_defs(file, source.as_bytes()));
+            for d in defs.iter() {
+                index.push(d.clone());
+            }
         }
-        let conf = if found.len() == 1 { Confidence::Exact } else { Confidence::Guess };
-        found.into_iter().map(|(f, l)| (f, l, conf)).collect()
+        let mut rows: Vec<(String, usize, Confidence)> = resolve_def_query(expr, &index)
+            .into_iter()
+            .map(|(i, conf)| (index.defs[i].id.file.clone(), index.defs[i].id.line, conf))
+            .collect();
+        if rows.is_empty() {
+            let mut found: Vec<(String, usize)> = Vec::new();
+            for &i in &mine {
+                let (file, lang) = &self.jobs[i];
+                let locs = self.locs.entry(i).or_insert_with(|| {
+                    crate::tree::collect_def_locs(file, lang).into_iter().map(|(_, n, l)| (n, l)).collect()
+                });
+                found.extend(locs.iter().filter(|(n, _)| n == bare).map(|(_, l)| (file.clone(), *l)));
+            }
+            found.sort();
+            found.dedup();
+            if found.is_empty() {
+                let subset: Vec<(String, &'static str)> = mine.iter().map(|&i| self.jobs[i].clone()).collect();
+                found = nested_def_sites(bare, &subset);
+            }
+            let conf = if found.len() == 1 { Confidence::Exact } else { Confidence::Guess };
+            rows = found.into_iter().map(|(f, l)| (f, l, conf)).collect();
+        }
+        self.answers.insert(expr.to_string(), rows.clone());
+        rows
     }
+}
+
+/// Definition sites for each name a glossary entry maps to: an exact name goes
+/// through `def_rows`, a regex over names is matched against the outline names.
+pub fn mapped_rows(
+    names: &[crate::config::glossary::Name],
+    jobs: &[(String, &'static str)],
+) -> Vec<(String, usize, Confidence)> {
+    use crate::config::glossary::Name;
+    let mut out: Vec<(String, usize, Confidence)> = Vec::new();
+    for n in names {
+        match n {
+            Name::Exact(name) => out.extend(def_rows(name, jobs, &mut Vec::new())),
+            Name::Re(re) => {
+                for (file, lang) in jobs {
+                    for (_, name, line) in crate::tree::collect_def_locs(file, lang) {
+                        if re.is_match(&name) {
+                            out.push((file.clone(), line, Confidence::Guess));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+    out.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+    out
 }
 
 fn nested_def_sites(name: &str, jobs: &[(String, &'static str)]) -> Vec<(String, usize)> {

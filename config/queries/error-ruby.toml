@@ -1,0 +1,12 @@
+# Error messages in Ruby: raise "...", raise Klass, "...". A string with #{...}
+# in it keeps it, which find matches as a wildcard. The target is the method
+# that raises.
+framework = "ruby-error"
+langs     = ["ruby"]
+
+[error]
+match = [
+  # raise "slot is taken" and raise ArgumentError, "bad slot"
+  "(call.method(identifier#raise) > (argument_list > (string @key)))",
+]
+target = "enclosing"

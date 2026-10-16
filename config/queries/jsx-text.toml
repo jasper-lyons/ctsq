@@ -1,0 +1,9 @@
+# Text a user reads in JSX: the text between tags. The key is the text with its
+# surrounding whitespace dropped, the target is the component or function that
+# renders it. Text made only of whitespace is skipped.
+framework = "jsx-text"
+langs     = ["tsx", "js"]
+
+[text]
+match  = "(jsx_text#/\\S/ @key)"
+target = "enclosing"

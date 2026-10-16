@@ -1,0 +1,15 @@
+# Components: capitalised functions (declarations, and consts bound to an arrow
+# or function) with JSX anywhere in them. The key is the name, the target is the
+# component's own signature line. A capitalised helper that holds JSX counts, a
+# lower case render helper does not.
+framework = "jsx-component"
+langs     = ["tsx", "js"]
+
+[component]
+match = [
+  "(function_declaration.name(identifier#/^[A-Z]/ @key) @_root).body(jsx_element)",
+  "(function_declaration.name(identifier#/^[A-Z]/ @key) @_root).body(jsx_self_closing_element)",
+  "(variable_declarator.name(identifier#/^[A-Z]/ @key) @_root).value(jsx_element)",
+  "(variable_declarator.name(identifier#/^[A-Z]/ @key) @_root).value(jsx_self_closing_element)",
+]
+target = "self"

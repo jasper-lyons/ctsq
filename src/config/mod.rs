@@ -16,6 +16,7 @@
 //!   `LangConfig::model(qualified_name) -> Option<&Model>`
 //!   `gomod::{module_path, go_version, find_go_mod, is_outside}`
 
+pub mod glossary;
 pub mod gomod;
 pub mod mechanics;
 pub mod models;
@@ -134,8 +135,14 @@ const BUILTIN_LANGUAGES: &[(&str, &str)] = &[
 
 /// Built-in named queries, `queries/<file>` beside `languages/`.
 const BUILTIN_QUERIES: &[(&str, &str)] = &[
+    ("error-go.toml", include_str!("../../config/queries/error-go.toml")),
+    ("error-js.toml", include_str!("../../config/queries/error-js.toml")),
+    ("error-ruby.toml", include_str!("../../config/queries/error-ruby.toml")),
     ("go-chi.toml", include_str!("../../config/queries/go-chi.toml")),
     ("go-http.toml", include_str!("../../config/queries/go-http.toml")),
+    ("jsx-component.toml", include_str!("../../config/queries/jsx-component.toml")),
+    ("jsx-label.toml", include_str!("../../config/queries/jsx-label.toml")),
+    ("jsx-text.toml", include_str!("../../config/queries/jsx-text.toml")),
     ("next-app.toml", include_str!("../../config/queries/next-app.toml")),
     ("rails-routes.toml", include_str!("../../config/queries/rails-routes.toml")),
     ("react-router.toml", include_str!("../../config/queries/react-router.toml")),

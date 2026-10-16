@@ -1,0 +1,4 @@
+# Product words and the names they have in code.
+"pipeline page" = ["Pipeline"]
+"brief sync"    = ["sync_merged", "cmd_sync"]
+"supplies"      = ["/resource|stock/"]

@@ -1,0 +1,19 @@
+# Error messages in Go: errors.New("...") and fmt.Errorf("..."). The key is the
+# message as written, so an Errorf key keeps its %s and %w, and a message copied
+# from a log still finds it (find matches those verbs as wildcards). The target
+# is the function that emits the error, or (top level) for a package variable.
+framework = "go-error"
+langs     = ["go"]
+
+[error]
+match = [
+  # errors.New("pipeline is empty")
+  "(call_expression.function(selector_expression.operand(identifier#errors).field(field_identifier#New)) > (argument_list > (interpreted_string_literal @key)))",
+  # fmt.Errorf("failed to load %s: %w", id, err)
+  "(call_expression.function(selector_expression.operand(identifier#fmt).field(field_identifier#Errorf)) > (argument_list > (interpreted_string_literal @key)))",
+  # errors.New(`raw message`)
+  "(call_expression.function(selector_expression.operand(identifier#errors).field(field_identifier#New)) > (argument_list > (raw_string_literal @key)))",
+  # fmt.Errorf(`raw %s`, x)
+  "(call_expression.function(selector_expression.operand(identifier#fmt).field(field_identifier#Errorf)) > (argument_list > (raw_string_literal @key)))",
+]
+target = "enclosing"

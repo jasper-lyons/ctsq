@@ -1,0 +1,15 @@
+# Text a user reads in JSX props: label, title, placeholder, alt, aria-label,
+# aria-description, helperText and tooltip, given as a string or as a string in
+# braces. The key is the string, the target is the component or function that
+# renders it.
+framework = "jsx-label"
+langs     = ["tsx", "js"]
+
+[label]
+match = [
+  # <Input placeholder="Search" />
+  "(jsx_attribute > (property_identifier#/^(label|title|placeholder|alt|aria-label|aria-description|helperText|tooltip)$/) + (string @key))",
+  # <Input placeholder={"Search"} />
+  "(jsx_attribute > (property_identifier#/^(label|title|placeholder|alt|aria-label|aria-description|helperText|tooltip)$/) + (jsx_expression > (string @key)))",
+]
+target = "enclosing"

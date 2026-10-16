@@ -235,56 +235,76 @@ mod tests {
 17 example.js:10 helper@11 -> -
 18 example.py:1 malloc@2 -> -
 19 example.rb:6 allocate_buffer@7 -> -
-20 importgraph/c/main.c:4 printf@5 -> -
-21 importgraph/c/main.c:4 add@5 -> -
-22 importgraph/go/main.go:9 Distance@10 -> importgraph/go/util/geo.go:3 Exact
-23 importgraph/go/main.go:9 Println@11 -> -
-24 importgraph/go/main.go:9 Pretty@11 -> importgraph/go/util/format.go:5 Exact
-25 importgraph/go/util/format.go:5 Sprintf@6 -> -
-26 importgraph/js/app.ts:6 helper@7 -> -
-27 importgraph/js/app.ts:6 log@9 -> -
-28 importgraph/py/app.py:7 Geo@8 -> -
-29 importgraph/py/app.py:7 do_thing@9 -> -
-30 importgraph/py/app.py:7 print@10 -> -
-31 importgraph/py/app.py:7 getpid@10 -> -
-32 importgraph/py/helpers.py:4 Geo@5 -> -
-33 importgraph/py/util/geo.py:5 do_thing@6 -> -
-34 importgraph/ruby/app.rb:6 ping@7 -> -
-35 importgraph/ruby/app.rb:6 new@7 -> -
-36 importgraph/ruby/app.rb:6 dump@9 -> -
-37 importgraph/ruby/helpers.rb:3 new@4 -> -
-38 importgraph/ts-alias/src/app.ts:5 helper@5 -> -
-39 queries/go-chi/main.go:17 NewRouter@18 -> -
-40 queries/go-chi/main.go:17 Get@20 -> -
-41 queries/go-chi/main.go:17 Post@21 -> -
-42 queries/go-chi/main.go:17 Route@23 -> -
-43 queries/go-chi/main.go:17 Delete@24 -> -
-44 queries/go-chi/main.go:17 ListenAndServe@26 -> -
-45 queries/go-http/main.go:19 HandleFunc@20 -> -
-46 queries/go-http/main.go:19 authed@22 -> queries/go-http/main.go:15 Exact
-47 queries/go-http/main.go:19 Handle@23 -> -
-48 queries/go-http/main.go:19 NotFoundHandler@23 -> -
-49 queries/go-http/main.go:26 NewServeMux@28 -> -
-50 queries/go-http/main.go:26 Routes@29 -> queries/go-http/main.go:19 Exact
-51 queries/go-http/main.go:26 HandleFunc@30 -> -
-52 queries/go-http/main.go:26 ListenAndServe@31 -> -
-53 queries/next-app/app/about/page.tsx:1 <p>@1 -> -
-54 queries/next-app/app/blog/[slug]/page.tsx:1 <p>@1 -> -
-55 queries/next-app/app/page.tsx:1 <h1>@1 -> -
-56 queries/solid-mavexa/frontend/src/routes/library.tsx:3 createSignal@4 -> -
-57 queries/solid-mavexa/frontend/src/routes/library.tsx:3 <div>@5 -> -
-58 queries/solid-mavexa/frontend/src/routes/library.tsx:3 String@5 -> -
-59 queries/solid-mavexa/frontend/src/routes/library.tsx:3 open@5 -> -
-60 queries/solid-mavexa/frontend/src/routes/library/[id].tsx:1 <div>@2 -> -
-61 typescript/example.ts:26 log@34 -> -
-62 typescript/example.ts:27 log@28 -> -
-63 typescript/example.ts:33 log@34 -> -
-64 typescript/example.tsx:8 <button onClick={onClick}>@9 -> -
-65 typescript/example.tsx:12 <span>@12 -> -
-66 typescript/example.tsx:14 log@15 -> -
-67 typescript/example.tsx:14 <div>@17 -> -
-68 typescript/example.tsx:14 <Button label=\"Click me\" onClick={handleClick} />@18 -> -
-69 typescript/example.tsx:14 <Icon />@19 -> -
+20 glossary/src/pipeline.go:5 New@6 -> -
+21 glossary/src/pipeline.go:9 New@10 -> -
+22 glossary/src/pipeline.go:13 New@14 -> -
+23 glossary/src/pipeline.go:17 New@18 -> -
+24 importgraph/c/main.c:4 printf@5 -> -
+25 importgraph/c/main.c:4 add@5 -> -
+26 importgraph/go/main.go:9 Distance@10 -> importgraph/go/util/geo.go:3 Exact
+27 importgraph/go/main.go:9 Println@11 -> -
+28 importgraph/go/main.go:9 Pretty@11 -> importgraph/go/util/format.go:5 Exact
+29 importgraph/go/util/format.go:5 Sprintf@6 -> -
+30 importgraph/js/app.ts:6 helper@7 -> -
+31 importgraph/js/app.ts:6 log@9 -> -
+32 importgraph/py/app.py:7 Geo@8 -> -
+33 importgraph/py/app.py:7 do_thing@9 -> -
+34 importgraph/py/app.py:7 print@10 -> -
+35 importgraph/py/app.py:7 getpid@10 -> -
+36 importgraph/py/helpers.py:4 Geo@5 -> -
+37 importgraph/py/util/geo.py:5 do_thing@6 -> -
+38 importgraph/ruby/app.rb:6 ping@7 -> -
+39 importgraph/ruby/app.rb:6 new@7 -> -
+40 importgraph/ruby/app.rb:6 dump@9 -> -
+41 importgraph/ruby/helpers.rb:3 new@4 -> -
+42 importgraph/ts-alias/src/app.ts:5 helper@5 -> -
+43 queries/errors/go/load.go:10 Errorf@14 -> -
+44 queries/errors/go/load.go:10 New@14 -> -
+45 queries/errors/go/load.go:17 Errorf@18 -> -
+46 queries/errors/go/load.go:21 New@22 -> -
+47 queries/errors/go/load.go:25 Errorf@26 -> -
+48 queries/errors/rb/gig.rb:2 raise \"Slot #{slot} is taken\@3 -> -
+49 queries/errors/rb/gig.rb:2 nil?@3 -> -
+50 queries/errors/rb/gig.rb:2 raise ArgumentError@4 -> -
+51 queries/go-chi/main.go:17 NewRouter@18 -> -
+52 queries/go-chi/main.go:17 Get@20 -> -
+53 queries/go-chi/main.go:17 Post@21 -> -
+54 queries/go-chi/main.go:17 Route@23 -> -
+55 queries/go-chi/main.go:17 Delete@24 -> -
+56 queries/go-chi/main.go:17 ListenAndServe@26 -> -
+57 queries/go-http/main.go:19 HandleFunc@20 -> -
+58 queries/go-http/main.go:19 authed@22 -> queries/go-http/main.go:15 Exact
+59 queries/go-http/main.go:19 Handle@23 -> -
+60 queries/go-http/main.go:19 NotFoundHandler@23 -> -
+61 queries/go-http/main.go:26 NewServeMux@28 -> -
+62 queries/go-http/main.go:26 Routes@29 -> queries/go-http/main.go:19 Exact
+63 queries/go-http/main.go:26 HandleFunc@30 -> -
+64 queries/go-http/main.go:26 ListenAndServe@31 -> -
+65 queries/jsx/src/Card.tsx:3 <section title=\"Profile card\">@5 -> -
+66 queries/jsx/src/Card.tsx:3 <h2>@6 -> -
+67 queries/jsx/src/Card.tsx:3 <input placeholder=\"Search people\" aria-label={\"Find a person\"} />@7 -> -
+68 queries/jsx/src/Card.tsx:3 name} />@8 -> -
+69 queries/jsx/src/Card.tsx:3 <Button label=\"Save changes\" tooltip=\"Stores the card\" />@9 -> -
+70 queries/jsx/src/Card.tsx:14 <footer>@14 -> -
+71 queries/jsx/src/Card.tsx:16 <div>@18 -> -
+72 queries/jsx/src/Card.tsx:21 <Divider />@21 -> -
+73 queries/next-app/app/about/page.tsx:1 <p>@1 -> -
+74 queries/next-app/app/blog/[slug]/page.tsx:1 <p>@1 -> -
+75 queries/next-app/app/page.tsx:1 <h1>@1 -> -
+76 queries/solid-mavexa/frontend/src/routes/library.tsx:3 createSignal@4 -> -
+77 queries/solid-mavexa/frontend/src/routes/library.tsx:3 <div>@5 -> -
+78 queries/solid-mavexa/frontend/src/routes/library.tsx:3 String@5 -> -
+79 queries/solid-mavexa/frontend/src/routes/library.tsx:3 open@5 -> -
+80 queries/solid-mavexa/frontend/src/routes/library/[id].tsx:1 <div>@2 -> -
+81 typescript/example.ts:26 log@34 -> -
+82 typescript/example.ts:27 log@28 -> -
+83 typescript/example.ts:33 log@34 -> -
+84 typescript/example.tsx:8 <button onClick={onClick}>@9 -> -
+85 typescript/example.tsx:12 <span>@12 -> -
+86 typescript/example.tsx:14 log@15 -> -
+87 typescript/example.tsx:14 <div>@17 -> -
+88 typescript/example.tsx:14 <Button label=\"Click me\" onClick={handleClick} />@18 -> -
+89 typescript/example.tsx:14 <Icon />@19 -> -
 fwd attrs/logs.go:17 [0, 1]
 fwd attrs/paths.py:11 [4, 5]
 fwd attrs/paths.py:6 [2, 3]
@@ -298,76 +318,101 @@ fwd example.js:1 [14, 15]
 fwd example.js:10 [16, 17]
 fwd example.py:1 [18]
 fwd example.rb:6 [19]
-fwd importgraph/c/main.c:4 [21, 20]
-fwd importgraph/go/main.go:9 [22, 24, 23]
-fwd importgraph/go/util/format.go:5 [25]
-fwd importgraph/js/app.ts:6 [26, 27]
-fwd importgraph/py/app.py:7 [28, 29, 31, 30]
-fwd importgraph/py/helpers.py:4 [32]
-fwd importgraph/py/util/geo.py:5 [33]
-fwd importgraph/ruby/app.rb:6 [35, 34, 36]
-fwd importgraph/ruby/helpers.rb:3 [37]
-fwd importgraph/ts-alias/src/app.ts:5 [38]
-fwd queries/go-chi/main.go:17 [39, 40, 41, 42, 43, 44]
-fwd queries/go-http/main.go:19 [45, 46, 47, 48]
-fwd queries/go-http/main.go:26 [49, 50, 51, 52]
-fwd queries/next-app/app/about/page.tsx:1 [53]
-fwd queries/next-app/app/blog/[slug]/page.tsx:1 [54]
-fwd queries/next-app/app/page.tsx:1 [55]
-fwd queries/solid-mavexa/frontend/src/routes/library.tsx:3 [56, 57, 58, 59]
-fwd queries/solid-mavexa/frontend/src/routes/library/[id].tsx:1 [60]
-fwd typescript/example.ts:26 [61]
-fwd typescript/example.ts:27 [62]
-fwd typescript/example.ts:33 [63]
-fwd typescript/example.tsx:12 [65]
-fwd typescript/example.tsx:14 [66, 67, 68, 69]
-fwd typescript/example.tsx:8 [64]
+fwd glossary/src/pipeline.go:13 [22]
+fwd glossary/src/pipeline.go:17 [23]
+fwd glossary/src/pipeline.go:5 [20]
+fwd glossary/src/pipeline.go:9 [21]
+fwd importgraph/c/main.c:4 [25, 24]
+fwd importgraph/go/main.go:9 [26, 28, 27]
+fwd importgraph/go/util/format.go:5 [29]
+fwd importgraph/js/app.ts:6 [30, 31]
+fwd importgraph/py/app.py:7 [32, 33, 35, 34]
+fwd importgraph/py/helpers.py:4 [36]
+fwd importgraph/py/util/geo.py:5 [37]
+fwd importgraph/ruby/app.rb:6 [39, 38, 40]
+fwd importgraph/ruby/helpers.rb:3 [41]
+fwd importgraph/ts-alias/src/app.ts:5 [42]
+fwd queries/errors/go/load.go:10 [43, 44]
+fwd queries/errors/go/load.go:17 [45]
+fwd queries/errors/go/load.go:21 [46]
+fwd queries/errors/go/load.go:25 [47]
+fwd queries/errors/rb/gig.rb:2 [49, 48, 50]
+fwd queries/go-chi/main.go:17 [51, 52, 53, 54, 55, 56]
+fwd queries/go-http/main.go:19 [57, 58, 59, 60]
+fwd queries/go-http/main.go:26 [61, 62, 63, 64]
+fwd queries/jsx/src/Card.tsx:14 [70]
+fwd queries/jsx/src/Card.tsx:16 [71]
+fwd queries/jsx/src/Card.tsx:21 [72]
+fwd queries/jsx/src/Card.tsx:3 [65, 66, 67, 68, 69]
+fwd queries/next-app/app/about/page.tsx:1 [73]
+fwd queries/next-app/app/blog/[slug]/page.tsx:1 [74]
+fwd queries/next-app/app/page.tsx:1 [75]
+fwd queries/solid-mavexa/frontend/src/routes/library.tsx:3 [76, 77, 78, 79]
+fwd queries/solid-mavexa/frontend/src/routes/library/[id].tsx:1 [80]
+fwd typescript/example.ts:26 [81]
+fwd typescript/example.ts:27 [82]
+fwd typescript/example.ts:33 [83]
+fwd typescript/example.tsx:12 [85]
+fwd typescript/example.tsx:14 [86, 87, 88, 89]
+fwd typescript/example.tsx:8 [84]
 rev example.go:10 [13]
 rev example.go:14 [12]
-rev ext <Button label=\"Click me\" onClick={handleClick} /> [68]
-rev ext <Icon /> [69]
-rev ext <button onClick={onClick}> [64]
-rev ext <div> [60, 57, 67]
-rev ext <h1> [55]
-rev ext <p> [53, 54]
-rev ext <span> [65]
-rev ext Delete [43]
-rev ext Geo [32, 28]
-rev ext Get [40]
-rev ext Handle [47]
-rev ext HandleFunc [45, 51]
+rev ext <Button label=\"Click me\" onClick={handleClick} /> [88]
+rev ext <Button label=\"Save changes\" tooltip=\"Stores the card\" /> [69]
+rev ext <Divider /> [72]
+rev ext <Icon /> [89]
+rev ext <button onClick={onClick}> [84]
+rev ext <div> [80, 77, 87, 71]
+rev ext <footer> [70]
+rev ext <h1> [75]
+rev ext <h2> [66]
+rev ext <input placeholder=\"Search people\" aria-label={\"Find a person\"} /> [67]
+rev ext <p> [73, 74]
+rev ext <section title=\"Profile card\"> [65]
+rev ext <span> [85]
+rev ext Delete [55]
+rev ext Errorf [43, 45, 47]
+rev ext Geo [36, 32]
+rev ext Get [52]
+rev ext Handle [59]
+rev ext HandleFunc [57, 63]
 rev ext Info [1]
-rev ext ListenAndServe [44, 52]
-rev ext NewRouter [39]
-rev ext NewServeMux [49]
-rev ext NotFoundHandler [48]
-rev ext Post [41]
+rev ext ListenAndServe [56, 64]
+rev ext New [20, 21, 22, 44, 23, 46]
+rev ext NewRouter [51]
+rev ext NewServeMux [61]
+rev ext NotFoundHandler [60]
+rev ext Post [53]
 rev ext Printf [0]
-rev ext Println [11, 23]
-rev ext Route [42]
-rev ext Sprintf [25]
-rev ext String [58]
-rev ext add [21]
+rev ext Println [11, 27]
+rev ext Route [54]
+rev ext Sprintf [29]
+rev ext String [78]
+rev ext add [25]
 rev ext allocate_buffer [19]
-rev ext createSignal [56]
-rev ext do_thing [33, 29]
-rev ext dump [36]
+rev ext createSignal [76]
+rev ext do_thing [37, 33]
+rev ext dump [40]
 rev ext free [7]
-rev ext getpid [31]
-rev ext helper [38, 26, 15, 17]
+rev ext getpid [35]
+rev ext helper [42, 30, 15, 17]
 rev ext info [3, 5]
 rev ext join [2, 4]
-rev ext log [14, 16, 27, 66, 62, 61, 63]
+rev ext log [14, 16, 31, 86, 82, 81, 83]
 rev ext malloc [18, 6, 9]
-rev ext new [37, 35]
-rev ext open [59]
-rev ext ping [34]
-rev ext print [30]
-rev ext printf [20]
+rev ext name} /> [68]
+rev ext new [41, 39]
+rev ext nil? [49]
+rev ext open [79]
+rev ext ping [38]
+rev ext print [34]
+rev ext printf [24]
 rev ext process [8, 10]
-rev importgraph/go/util/format.go:5 [24]
-rev importgraph/go/util/geo.go:3 [22]
-rev queries/go-http/main.go:15 [46]
-rev queries/go-http/main.go:19 [50]
+rev ext raise ArgumentError [50]
+rev ext raise \"Slot #{slot} is taken\ [48]
+rev importgraph/go/util/format.go:5 [28]
+rev importgraph/go/util/geo.go:3 [26]
+rev queries/go-http/main.go:15 [58]
+rev queries/go-http/main.go:19 [62]
 "#;
 }

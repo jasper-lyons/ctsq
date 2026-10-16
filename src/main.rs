@@ -1003,7 +1003,14 @@ fn main() {
         };
         let shown: Vec<(String, &'static str)> =
             jobs.iter().filter(|(f, _)| hider.file(f).is_none()).cloned().collect();
-        print!("{}", miss::report_for(&ast, query_str, &where_, &shown));
+        let glossary = match config::glossary::load(&std::env::current_dir().unwrap_or_default()) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(2);
+            }
+        };
+        print!("{}", miss::report_for_glossary(&ast, query_str, &where_, &shown, glossary.as_ref()));
         std::process::exit(1);
     }
     print!("{}", footer::tail(total_matches, "match", &hidden, scope_opts.is_some()));

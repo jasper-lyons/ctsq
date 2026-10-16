@@ -35,6 +35,24 @@ pub struct Capture {
     pub end_byte: usize,
 }
 
+thread_local! {
+    /// Compiled tree-sitter queries by grammar and pattern text. Building a
+    /// query costs far more than running it on one file, and a run over a
+    /// repo asks for the same pattern once per file.
+    static QUERIES: std::cell::RefCell<std::collections::HashMap<(tree_sitter::Language, String), std::rc::Rc<Query>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn cached_query(lang: &tree_sitter::Language, text: &str) -> Result<std::rc::Rc<Query>, tree_sitter::QueryError> {
+    let key = (lang.clone(), text.to_string());
+    if let Some(q) = QUERIES.with(|c| c.borrow().get(&key).cloned()) {
+        return Ok(q);
+    }
+    let q = std::rc::Rc::new(Query::new(lang, text)?);
+    QUERIES.with(|c| c.borrow_mut().insert(key, q.clone()));
+    Ok(q)
+}
+
 /// Backwards-compatible wrapper: the node-text rendering only.
 pub fn run(
     compiled: &CompiledQuery,
@@ -146,8 +164,7 @@ pub fn run_rows_on(
 
     match compiled {
         CompiledQuery::Simple(ts_query) => {
-            let query =
-                Query::new(&ts_lang, ts_query).map_err(|e| format!("query error: {e}"))?;
+            let query = cached_query(&ts_lang, ts_query).map_err(|e| format!("query error: {e}"))?;
             let mut cursor = QueryCursor::new();
             let mut matches = cursor.matches(&query, tree.root_node(), source_bytes);
 
@@ -202,10 +219,8 @@ pub fn run_rows_on(
         }
 
         CompiledQuery::Scoped { outer, scope_field, inner } => {
-            let outer_q =
-                Query::new(&ts_lang, outer).map_err(|e| format!("outer query error: {e}"))?;
-            let inner_q =
-                Query::new(&ts_lang, inner).map_err(|e| format!("inner query error: {e}"))?;
+            let outer_q = cached_query(&ts_lang, outer).map_err(|e| format!("outer query error: {e}"))?;
+            let inner_q = cached_query(&ts_lang, inner).map_err(|e| format!("inner query error: {e}"))?;
 
             let outer_cap_names = outer_q.capture_names();
             let inner_cap_names = inner_q.capture_names();

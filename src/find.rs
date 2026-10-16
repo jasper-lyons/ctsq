@@ -10,6 +10,7 @@
 //! assert on it directly: `list_report` and `report`.
 
 use crate::compiler::{self, lang};
+use crate::config::glossary::{Glossary, Name};
 use crate::config::queries::{self, Detect, NamedQuery, Target};
 use crate::files;
 use crate::footer;
@@ -208,12 +209,62 @@ impl KeyFilter {
         }
     }
 
-    fn matches(&self, key: &str) -> bool {
+    /// `errors` makes a substring key match an error's format string through
+    /// its placeholders as well (`error_key_matches`).
+    fn matches(&self, key: &str, errors: bool) -> bool {
         match self {
             KeyFilter::Any => true,
+            KeyFilter::Sub(s) if errors => error_key_matches(s, key),
             KeyFilter::Sub(s) => key.to_lowercase().contains(s),
             KeyFilter::Re(r) => r.is_match(key),
         }
+    }
+}
+
+/// The verbs and interpolations of a format string: `%s %v %d %w %q %x %f %T
+/// %+v` and friends, `${...}` in a JS template and `#{...}` in a Ruby string.
+fn placeholders() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"%[+#\-]?\d*(?:\.\d+)?[svdwqxfTtgep]|\$\{[^}]*\}|#\{[^}]*\}").unwrap()
+    })
+}
+
+/// Whether a message typed by the user finds an error whose key is the format
+/// string `fmt`. It does when the user's text is a case-insensitive substring
+/// of the format string, or when the format string with every placeholder
+/// turned into a wildcard matches somewhere in the user's text (a message
+/// copied from a log has the verbs filled in). Concatenation is not followed.
+/// A format string with under four literal characters is too loose for the
+/// second rule.
+fn error_key_matches(user: &str, fmt: &str) -> bool {
+    let fmt = fmt.replace("\\\"", "\"");
+    if fmt.to_lowercase().contains(&user.to_lowercase()) {
+        return true;
+    }
+    let mut pattern = String::new();
+    let mut literal = 0;
+    let mut at = 0;
+    for m in placeholders().find_iter(&fmt) {
+        let lit = &fmt[at..m.start()];
+        literal += lit.chars().filter(|c| !c.is_whitespace()).count();
+        pattern.push_str(&regex::escape(lit));
+        pattern.push_str(".*?");
+        at = m.end();
+    }
+    let lit = &fmt[at..];
+    literal += lit.chars().filter(|c| !c.is_whitespace()).count();
+    pattern.push_str(&regex::escape(lit));
+    literal >= 4 && regex::Regex::new(&format!("(?is){}", pattern)).is_ok_and(|r| r.is_match(user))
+}
+
+/// A key as printed: its quotes dropped, a message over several lines on one.
+fn tidy_key(raw: &str) -> String {
+    let k = unquote(raw);
+    if k.contains(['\n', '\r']) {
+        k.split_whitespace().collect::<Vec<_>>().join(" ")
+    } else {
+        k.to_string()
     }
 }
 
@@ -270,22 +321,42 @@ fn config_error(q: &NamedQuery, m: &str, why: &str) -> Report {
 /// Compile each of `q`'s selectors for each language its files are in. A
 /// selector whose node kinds one grammar lacks is skipped for that grammar,
 /// but it has to compile for at least one of the query's languages.
-type Compiled = Vec<(&'static str, Box<dyn lang::Lang>, compiler::CompiledQuery, Vec<String>)>;
+type Compiled = Vec<(&'static str, Box<dyn lang::Lang>, compiler::CompiledQuery, Vec<Vec<String>>)>;
 
-/// Every exact name filter in the query. Each one has to match a node whose
-/// text is that name, so a file that does not hold all of them cannot match
-/// and is never parsed. Most files in a repo fall out here.
-fn needles(q: &crate::query::ast::Query, out: &mut Vec<String>) {
+/// The literal texts a regex name filter cannot match without: one of them
+/// has to occur in the node's text. Only the plain shapes give any, a literal
+/// or an alternation of literals, optionally anchored and grouped
+/// (`Error$`, `^(Get|Post)$`). Anything else (classes, repeats, flags) gives
+/// None and the filter is not used to skip files.
+fn regex_literals(src: &str) -> Option<Vec<String>> {
+    let s = src.strip_prefix('^').unwrap_or(src);
+    let s = s.strip_suffix('$').unwrap_or(s);
+    let s = match s.strip_prefix('(') {
+        Some(inner) => inner.strip_prefix("?:").unwrap_or(inner).strip_suffix(')')?,
+        None => s,
+    };
+    let alts: Vec<String> = s.split('|').map(str::to_string).collect();
+    let plain = |a: &String| !a.is_empty() && a.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | ' ' | ':'));
+    alts.iter().all(plain).then_some(alts)
+}
+
+/// The name filters in the query that name literal text. Each group is the
+/// alternatives of one filter, and a file has to hold one of each group's
+/// texts, so a file that fails any group cannot match and is never parsed. An
+/// exact name is a group of one. Most files in a repo fall out here.
+fn needles(q: &crate::query::ast::Query, out: &mut Vec<Vec<String>>) {
     use crate::query::ast::{NameMatch, Selector, SelectorNode};
-    fn sel(s: &Selector, out: &mut Vec<String>) {
+    fn sel(s: &Selector, out: &mut Vec<Vec<String>>) {
         match &s.node {
-            SelectorNode::Bare(a) => {
-                if let Some(NameMatch::Exact(n)) = &a.name_match {
-                    if !n.is_empty() {
-                        out.push(n.clone());
+            SelectorNode::Bare(a) => match &a.name_match {
+                Some(NameMatch::Exact(n)) if !n.is_empty() => out.push(vec![n.clone()]),
+                Some(NameMatch::Regex(r)) => {
+                    if let Some(alts) = regex_literals(r) {
+                        out.push(alts);
                     }
                 }
-            }
+                _ => {}
+            },
             SelectorNode::Group { query, .. } => needles(query, out),
         }
         for f in &s.fields {
@@ -300,10 +371,7 @@ fn needles(q: &crate::query::ast::Query, out: &mut Vec<String>) {
     }
 }
 
-fn holds(hay: &[u8], needle: &str) -> bool {
-    let n = needle.as_bytes();
-    n.is_empty() || hay.windows(n.len()).any(|w| w == n)
-}
+use crate::resolve::holds;
 
 fn compile_all(q: &NamedQuery) -> Result<Compiled, Report> {
     let mut out: Compiled = Vec::new();
@@ -342,16 +410,35 @@ fn compile_all(q: &NamedQuery) -> Result<Compiled, Report> {
     Ok(out)
 }
 
+/// What a run looks for: the key filter, and the names a glossary term adds. A
+/// row that fails the key still shows when its key holds, or its target is, one
+/// of the added names.
+struct Ask<'a> {
+    filter: &'a KeyFilter,
+    extra: &'a [Name],
+}
+
+impl Ask<'_> {
+    fn key_ok(&self, q: &NamedQuery, key: &str) -> bool {
+        self.filter.matches(key, q.name == "error")
+    }
+
+    /// Whether a row the key filter dropped is kept by the glossary.
+    fn glossary_keeps(&self, key: &str, target: &str) -> bool {
+        self.extra.iter().any(|n| n.found_in(key) || n.matches(target))
+    }
+}
+
 /// Run one named query over the files of its languages.
 fn run_query(
     q: &NamedQuery,
     scan: &mut Scan,
-    filter: &KeyFilter,
+    ask: &Ask,
     hider: &mut files::Hider,
     hidden: &mut footer::Hidden,
 ) -> Result<Vec<Hit>, Report> {
     if q.paths.is_some() {
-        return run_paths(q, scan, filter, hider, hidden);
+        return run_paths(q, scan, ask, hider, hidden);
     }
     let compiled = compile_all(q)?;
     let jobs = scan.jobs_for(&q.langs);
@@ -368,7 +455,7 @@ fn run_query(
         let Ok(source) = std::fs::read(file) else { continue };
         let mine: Vec<_> = compiled
             .iter()
-            .filter(|(l, _, _, must)| l == lang_name && must.iter().all(|n| holds(&source, n)))
+            .filter(|(l, _, _, must)| l == lang_name && must.iter().all(|alts| alts.iter().any(|n| holds(&source, n))))
             .collect();
         if mine.is_empty() {
             continue;
@@ -383,20 +470,24 @@ fn run_query(
             for r in rows {
                 let cap = |n: &str| r.captures.iter().find(|c| c.name == n);
                 let key = match cap("key") {
-                    Some(k) => unquote(&k.text).to_string(),
+                    Some(k) => tidy_key(&k.text),
                     None => r.src_line.clone().unwrap_or_default(),
                 };
                 let key = match &q.key_rewrite {
                     Some(rw) => queries::apply_rewrite(rw, &key),
                     None => key,
                 };
-                if !filter.matches(&key) {
+                let key_ok = ask.key_ok(q, &key);
+                if !key_ok && ask.extra.is_empty() {
                     continue;
                 }
                 let line = cap("key").map(|k| k.line).unwrap_or(r.line);
-                if let Some(h) = hider.site(file, line) {
-                    hidden.count(h, 1);
-                    continue;
+                let why_hidden = hider.site(file, line);
+                if key_ok {
+                    if let Some(h) = why_hidden {
+                        hidden.count(h, 1);
+                        continue;
+                    }
                 }
                 let tcap = cap("target");
                 let (target, target_loc) = match q.target {
@@ -445,6 +536,15 @@ fn run_query(
                         None => (r.src_line.clone().unwrap_or_default(), format!("{}:{}", shown(file), r.line)),
                     },
                 };
+                if !key_ok {
+                    if !ask.glossary_keeps(&key, &target) {
+                        continue;
+                    }
+                    if let Some(h) = why_hidden {
+                        hidden.count(h, 1);
+                        continue;
+                    }
+                }
                 if seen.insert((file.clone(), line, key.clone(), target.clone())) {
                     hits.push(Hit { file: file.clone(), line, key, target, target_loc });
                 }
@@ -579,7 +679,7 @@ fn default_export(file: &str, lang_name: &str) -> Option<(Option<String>, usize)
 fn run_paths(
     q: &NamedQuery,
     scan: &mut Scan,
-    filter: &KeyFilter,
+    ask: &Ask,
     hider: &mut files::Hider,
     hidden: &mut footer::Hidden,
 ) -> Result<Vec<Hit>, Report> {
@@ -604,14 +704,27 @@ fn run_paths(
         if let Some(rw) = &q.key_rewrite {
             key = queries::apply_rewrite(rw, &key);
         }
-        if !filter.matches(&key) {
+        let key_ok = ask.key_ok(q, &key);
+        if !key_ok && ask.extra.is_empty() {
             continue;
         }
-        if let Some(h) = hider.site(file, 1) {
-            hidden.count(h, 1);
-            continue;
+        let why_hidden = hider.site(file, 1);
+        if key_ok {
+            if let Some(h) = why_hidden {
+                hidden.count(h, 1);
+                continue;
+            }
         }
         let (target, target_loc) = export_of(file, &jobs, &prefix, rel);
+        if !key_ok {
+            if !ask.glossary_keeps(&key, &target) {
+                continue;
+            }
+            if let Some(h) = why_hidden {
+                hidden.count(h, 1);
+                continue;
+            }
+        }
         hits.push(Hit { file: file.clone(), line: 1, key, target, target_loc });
     }
     hits.sort_by(|a, b| (&a.key, &a.file).cmp(&(&b.key, &b.file)));
@@ -619,7 +732,22 @@ fn run_paths(
 }
 
 /// `ctsq find <query> [key]`.
+#[cfg(test)]
 pub fn report(queries: &[NamedQuery], name: &str, key: Option<&str>, scan: &mut Scan, hide: &files::HideOpts) -> Report {
+    report_with(queries, name, key, scan, hide, None)
+}
+
+/// `report` with a repo glossary: a key that is, or holds as a whole phrase, a
+/// glossary term also finds the rows whose key holds, or whose target is, one
+/// of the term's names. A line says so, last before any footer.
+pub fn report_with(
+    queries: &[NamedQuery],
+    name: &str,
+    key: Option<&str>,
+    scan: &mut Scan,
+    hide: &files::HideOpts,
+    glossary: Option<&Glossary>,
+) -> Report {
     let mine: Vec<&NamedQuery> = queries.iter().filter(|q| q.name == name).collect();
     if mine.is_empty() {
         let mut names: Vec<&str> = queries.iter().map(|q| q.name.as_str()).collect();
@@ -634,6 +762,18 @@ pub fn report(queries: &[NamedQuery], name: &str, key: Option<&str>, scan: &mut 
         Ok(f) => f,
         Err(e) => return Report { out: format!("{}\n", e), code: 2 },
     };
+    let mut extra: Vec<Name> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    if let (Some(g), Some(k)) = (glossary, key) {
+        // A /regex/ key is a filter, not a phrase.
+        if !(k.len() >= 2 && k.starts_with('/') && k.ends_with('/')) {
+            for e in g.lookup(k, false) {
+                extra.extend(e.names.iter().cloned());
+                notes.push(e.note(&g.file));
+            }
+        }
+    }
+    let ask = Ask { filter: &filter, extra: &extra };
     let owned: Vec<NamedQuery> = mine.iter().map(|q| (*q).clone()).collect();
     let why = verdicts(&owned, scan);
     let mut hider = files::Hider::new(hide);
@@ -645,16 +785,22 @@ pub fn report(queries: &[NamedQuery], name: &str, key: Option<&str>, scan: &mut 
     let mut not_detected: Vec<(String, String)> = Vec::new();
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut counts: Vec<String> = Vec::new();
+    let mut printed: HashSet<(String, usize, String, String)> = HashSet::new();
     for (q, w) in owned.iter().zip(&why) {
         if w.is_none() {
             not_detected.push((q.framework.clone(), q.source.clone()));
             continue;
         }
         tried.push((q.framework.clone(), q.source.clone()));
-        let hits = match run_query(q, scan, &filter, &mut hider, &mut hidden) {
+        let hits = match run_query(q, scan, &ask, &mut hider, &mut hidden) {
             Ok(h) => h,
             Err(r) => return r,
         };
+        // A row two frameworks both found prints once, under the first.
+        let hits: Vec<Hit> = hits
+            .into_iter()
+            .filter(|h| printed.insert((h.file.clone(), h.line, h.key.clone(), h.target.clone())))
+            .collect();
         if hits.is_empty() {
             continue;
         }
@@ -672,11 +818,20 @@ pub fn report(queries: &[NamedQuery], name: &str, key: Option<&str>, scan: &mut 
 
     let shown_n = rows.len();
     if shown_n == 0 && !hidden.any() {
-        return Report { out: crate::miss::find_report(name, key, &tried, &not_detected), code: 1 };
+        let mut out = crate::miss::find_report(name, key, &tried, &not_detected);
+        for n in &notes {
+            out.push_str(n);
+            out.push('\n');
+        }
+        return Report { out, code: 1 };
     }
     let mut out = columns(&rows);
     for c in &counts {
         out.push_str(c);
+        out.push('\n');
+    }
+    for n in &notes {
+        out.push_str(n);
         out.push('\n');
     }
     if hidden.any() {
@@ -703,10 +858,17 @@ pub fn run(name: Option<&str>, key: Option<&str>, no_ignore: bool, hide: &files:
             return 2;
         }
     };
+    let glossary = match crate::config::glossary::load(&cwd) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 2;
+        }
+    };
     let mut scan = Scan::new(Path::new("."), no_ignore);
     let r = match name {
         None => list_report(&queries, &mut scan),
-        Some(n) => report(&queries, n, key, &mut scan, hide),
+        Some(n) => report_with(&queries, n, key, &mut scan, hide, glossary.as_ref()),
     };
     if r.code == 2 {
         eprint!("{}", r.out);
@@ -902,13 +1064,17 @@ mod tests {
         assert_eq!(r.code, 0);
         assert_eq!(
             r.out,
-            "built-in queries/solid-routes.toml:9: route  solid-routes  (import @solidjs/router in src/App.tsx)\n\
-             not detected here: route (chi), route (net-http), route (next-app), route (rails-routes), route (react-router)\n"
+            "built-in queries/jsx-component.toml:8: component  jsx-component  (always)\n\
+             built-in queries/error-js.toml:7: error           js-error       (always)\n\
+             built-in queries/jsx-label.toml:8: label          jsx-label      (always)\n\
+             built-in queries/solid-routes.toml:9: route       solid-routes   (import @solidjs/router in src/App.tsx)\n\
+             built-in queries/jsx-text.toml:7: text            jsx-text       (always)\n\
+             not detected here: error (go-error), error (ruby-error), route (chi), route (net-http), route (next-app), route (rails-routes), route (react-router)\n"
         );
         let dir = fixture("solid-mavexa");
         let r = list_report(&queries_in(&dir), &mut Scan::new(&dir, false));
         assert!(
-            r.out.starts_with(".ctsq/queries/solid-routes.toml:10: route  solid-routes  (import @solidjs/router in frontend/src/routesConfig.ts)\n"),
+            r.out.contains(".ctsq/queries/solid-routes.toml:10: route         solid-routes   (import @solidjs/router in frontend/src/routesConfig.ts)\n"),
             "{}",
             r.out
         );
@@ -919,7 +1085,124 @@ mod tests {
         let dir = fixture("solid");
         let r = report(&queries_in(&dir), "routes", None, &mut Scan::new(&dir, false), &hide());
         assert_eq!(r.code, 2);
-        assert_eq!(r.out, "no named query 'routes', the queries are: route\n");
+        assert_eq!(r.out, "no named query 'routes', the queries are: component, error, label, route, text\n");
+    }
+
+    fn run_named(name: &str, query: &str, key: Option<&str>) -> Report {
+        let dir = fixture(name);
+        let qs = queries_in(&dir);
+        report(&qs, query, key, &mut Scan::new(&dir, false), &hide())
+    }
+
+    #[test]
+    fn jsx_text_labels_and_components_name_the_component_that_renders_them() {
+        let r = run_named("jsx", "text", None);
+        assert_eq!(
+            r.out,
+            "src/Card.tsx:6    Welcome back         Card    src/Card.tsx:3\n\
+             src/Card.tsx:14   All rights reserved  Footer  src/Card.tsx:14\n\
+             src/Card.tsx:18   Panel                Panel   src/Card.tsx:16\n\
+             src/Legacy.jsx:2  Old page             Legacy  src/Legacy.jsx:1\n\
+             4 texts (jsx-text, from built-in queries/jsx-text.toml)\n"
+        );
+        let r = run_named("jsx", "label", Some("person"));
+        assert_eq!(
+            r.out,
+            "src/Card.tsx:7  Find a person  Card  src/Card.tsx:3\n\
+             1 label (jsx-label, from built-in queries/jsx-label.toml)\n"
+        );
+        let r = run_named("jsx", "label", None);
+        let mut at = 0;
+        for key in ["Profile card", "Find a person", "Search people", "Avatar", "Save changes", "Stores the card", "Old helper"] {
+            // title, aria-label as {"string"}, placeholder, alt, label, tooltip and helperText
+            let found = r.out[at..].find(key);
+            assert!(found.is_some(), "{} missing or out of order: {}", key, r.out);
+            at += found.unwrap();
+        }
+        assert!(r.out.contains("7 labels ("), "{}", r.out);
+        let r = run_named("jsx", "component", None);
+        let names: Vec<&str> = r.out.lines().filter(|l| l.starts_with("src/")).map(|l| l.split_whitespace().nth(1).unwrap()).collect();
+        assert_eq!(names, vec!["Card", "Footer", "Panel", "Spacer", "Legacy"], "helper and NotAComponent are not components: {}", r.out);
+    }
+
+    #[test]
+    fn an_error_key_matches_through_placeholders_in_each_language() {
+        let go = run_named("errors", "error", Some("failed to load pipeline abc-1: open x: no such file"));
+        assert_eq!(go.out, "go/load.go:14  failed to load pipeline %s: %w  Load  go/load.go:10\n1 error (go-error, from built-in queries/error-go.toml)\n");
+        let go = run_named("errors", "error", Some("render 3 blocks ({1 2})"));
+        assert!(go.out.starts_with("go/load.go:18  render %d blocks (%+v)  Render  go/load.go:17\n"), "{}", go.out);
+        let ts = run_named("errors", "error", Some("bad field 7"));
+        assert!(ts.out.starts_with("web/api.ts:3  Bad field ${text}  parse  web/api.ts:1\n"), "{}", ts.out);
+        let rb = run_named("errors", "error", Some("Slot 4 is taken"));
+        assert!(rb.out.starts_with("rb/gig.rb:3  Slot #{slot} is taken  book  rb/gig.rb:2\n"), "{}", rb.out);
+        let plain = run_named("errors", "error", Some("nothing to parse"));
+        assert!(plain.out.starts_with("web/api.ts:2  Nothing to parse  parse  web/api.ts:1\n"), "a literal substring, any case: {}", plain.out);
+        let top = run_named("errors", "error", Some("pipeline is empty"));
+        assert!(top.out.starts_with("go/load.go:8  pipeline is empty  (top level)  ?\n"), "{}", top.out);
+        let miss = run_named("errors", "error", Some("something unrelated happened"));
+        assert_eq!(miss.code, 1, "{}", miss.out);
+        let all = run_named("errors", "error", None);
+        assert_eq!(all.out.lines().filter(|l| l.contains(" errors (") || l.contains(" error (")).count(), 3, "{}", all.out);
+    }
+
+    #[test]
+    fn error_key_matching_rules() {
+        assert!(error_key_matches("failed to load pipeline 7: boom", "failed to load pipeline %s: %w"));
+        assert!(error_key_matches("render 3 blocks (&{a})", "render %d blocks (%+v)"));
+        assert!(error_key_matches("bad field 9", "Bad field ${text}"));
+        assert!(error_key_matches("got \"x\" here", "got %q here"));
+        assert!(error_key_matches("pipeline is empty (id=3)", "pipeline is empty"), "the format string anywhere in the log line");
+        assert!(error_key_matches("load pipeline", "failed to load pipeline %s"), "a substring of the literal text");
+        assert!(!error_key_matches("totally different", "failed to load pipeline %s"));
+        assert!(!error_key_matches("anything at all", "%w"), "all placeholder, too loose");
+        assert!(!error_key_matches("a b", "x: %s"), "under four literal characters");
+        assert!(!error_key_matches("failed to load pipeline abc", "\"failed to load \" + name"), "concatenation is not followed");
+    }
+
+    #[test]
+    fn a_glossary_term_as_key_also_finds_rows_by_target_name_and_says_so() {
+        let dir = fixture("../glossary");
+        let qs = queries_in(&dir);
+        let g = crate::config::glossary::load_with(&Roots::from_vars(&dir, None, None, None), &dir).unwrap().unwrap();
+        let run = |key: &str| report_with(&qs, "error", Some(key), &mut Scan::new(&dir, false), &hide(), Some(&g));
+        let r = run("pipeline page");
+        assert_eq!(
+            r.out,
+            "src/pipeline.go:6  cannot start the run  Pipeline  src/pipeline.go:5\n\
+             1 error (go-error, from built-in queries/error-go.toml)\n\
+             .ctsq/glossary.toml:2: \"pipeline page\" also searched as Pipeline\n"
+        );
+        assert!(run("the Pipeline Page is down").out.contains("src/pipeline.go:6"), "a term inside a longer phrase");
+        let r = run("supplies");
+        assert!(r.out.starts_with("src/pipeline.go:14  the shelf ran dry  stockLevel  "), "a regex name: {}", r.out);
+        assert!(r.out.ends_with(".ctsq/glossary.toml:4: \"supplies\" also searched as /resource|stock/\n"), "{}", r.out);
+        let none = report(&qs, "error", Some("pipeline page"), &mut Scan::new(&dir, false), &hide());
+        assert_eq!(none.code, 1, "without the glossary nothing matches: {}", none.out);
+        let miss = run("brief sync today");
+        assert!(miss.out.contains("src/pipeline.go:10  nothing was merged  sync_merged"), "{}", miss.out);
+        let unrelated = run("zzz nothing");
+        assert_eq!(unrelated.code, 1);
+        assert!(!unrelated.out.contains("glossary"), "no term, no line: {}", unrelated.out);
+    }
+
+    #[test]
+    fn a_row_two_frameworks_both_find_prints_once_under_the_first() {
+        let dir = std::env::temp_dir().join(format!("ctsq-find-dedup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".ctsq/queries")).unwrap();
+        std::fs::write(dir.join("a.go"), "package a\nimport \"errors\"\nfunc F() error { return errors.New(\"same thing\") }\n").unwrap();
+        let copy = std::fs::read_to_string(format!("{}/config/queries/error-go.toml", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        std::fs::write(dir.join(".ctsq/queries/zz-copy.toml"), copy.replace("go-error", "zz-copy")).unwrap();
+        let r = run_named_in(&dir, "error", None);
+        assert_eq!(r.out.lines().filter(|l| l.starts_with("a.go:3")).count(), 1, "{}", r.out);
+        assert!(r.out.contains("1 error (go-error,"), "{}", r.out);
+        assert!(!r.out.contains("zz-copy"), "the second framework found nothing new: {}", r.out);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn run_named_in(dir: &Path, query: &str, key: Option<&str>) -> Report {
+        let qs = queries_in(dir);
+        report(&qs, query, key, &mut Scan::new(dir, false), &hide())
     }
 
     #[test]
@@ -983,10 +1266,25 @@ mod tests {
 
     #[test]
     fn a_file_without_the_exact_names_is_never_parsed() {
-        let ast = crate::query::parse("(pair.key(property_identifier#path).value(string @key)) ~ (id#/x/ @t)").unwrap();
+        let ast = crate::query::parse("(pair.key(property_identifier#path).value(string @key)) ~ (id#/x.y/ @t)").unwrap();
         let mut n = Vec::new();
         needles(&ast, &mut n);
-        assert_eq!(n, vec!["path"], "regex filters give no needle");
+        assert_eq!(n, vec![vec!["path".to_string()]], "a regex that is not plain literals gives no needle");
+    }
+
+    #[test]
+    fn a_regex_of_plain_literals_gives_alternatives_and_others_give_none() {
+        let lits = |s: &str| regex_literals(s);
+        assert_eq!(lits("Error$"), Some(vec!["Error".to_string()]));
+        assert_eq!(lits("^(Get|Post)$"), Some(vec!["Get".to_string(), "Post".to_string()]));
+        assert_eq!(lits("^(?:aria-label|title)$"), Some(vec!["aria-label".to_string(), "title".to_string()]));
+        for none in ["^[A-Z]", "\\S", "a.b", "(?i)foo", "a*", "", "(a)(b)"] {
+            assert_eq!(lits(none), None, "{}", none);
+        }
+        let ast = crate::query::parse("(call_expression.function(selector_expression.field(field_identifier#/^(Get|Post)$/)))").unwrap();
+        let mut n = Vec::new();
+        needles(&ast, &mut n);
+        assert_eq!(n, vec![vec!["Get".to_string(), "Post".to_string()]]);
     }
 
     #[test]
