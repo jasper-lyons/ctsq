@@ -122,6 +122,7 @@ EXAMPLES (a question as a comment, the call, then the next call)
   # Which named questions (routes, labels) does this repo answer? Then ask one.
   ctsq find
   ctsq find route /about
+  ctsq find route '/users/{id}'
 
 STDIN
   Pipe file paths (language detected per file from extension):

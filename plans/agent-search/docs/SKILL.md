@@ -231,11 +231,11 @@ fixtures/scope/Asset.tsx:11: const saveAssetNow = () => props.asset  ?
 
 ```
 ctsq -q 'id#hide_rows' --scope src/
-src/main.rs:948: hide_rows(&mut hider, file, &source, rows, true, &mut hidden)
-  in src/main.rs:600-1012  fn main() {
-src/main.rs:1017: fn hide_rows(
-src/main.rs:1180: for r in &hide_rows(&mut hider, file, &source, rows, false, &mut hidden) {
-  in src/main.rs:1142-1197  fn run_refs(
+src/main.rs:949: hide_rows(&mut hider, file, &source, rows, true, &mut hidden)
+  in src/main.rs:601-1013  fn main() {
+src/main.rs:1018: fn hide_rows(
+src/main.rs:1181: for r in &hide_rows(&mut hider, file, &source, rows, false, &mut hidden) {
+  in src/main.rs:1143-1198  fn run_refs(
 3 matches
 ```
 
@@ -293,6 +293,19 @@ hidden: 1 in tests (--tests)
 ```
 
 Each match is the route's `path:LINE`, the key, the component and where `def` finds it (`?` when it finds nothing). The key is a case-insensitive substring, or a regex written `/.../`. With no key every route prints. The count line per framework names the file the query came from: when a query misses a repo's shape, copy that file to `.ctsq/queries/` in the repo, keep the `framework` name, and edit the `match` selectors, each of which also runs as a plain `-q` query. `ctsq config path` lists the queries directories. The search root is the current directory, and tests are hidden as everywhere else.
+
+### 16. Which handler serves this route (Go, Rails, Next.js)
+
+Question: which function handles `/users/{id}`? The same `find route` call answers it for a Go repo, because the built-in `chi` and `net-http` queries read `r.Get("/users/{id}", handler)` and `mux.HandleFunc("GET /x", h.method)`:
+
+```
+ctsq find route '/users/{id}'
+fixtures/queries/go-chi/main.go:22  /users/{id}  Show        fixtures/queries/go-chi/main.go:15
+fixtures/queries/go-chi/main.go:24  /users/{id}  createUser  fixtures/queries/go-chi/main.go:11
+2 routes (chi, from built-in queries/go-chi.toml)
+```
+
+The target is the handler as `def` finds it, and `h.Show` gives `Show`. A Go 1.22 key keeps its method (`GET /api/healthz`). Rails reads `config/routes.rb`: `get '/about', to: 'static#about'` is rewritten to `StaticController#about` (the `rewrite` key, with the `${1:pascal}` case filter), then resolved to the controller file and the action inside it, `?` when nothing defines it. A `resources :gigs` line is one row, `/gigs`, aimed at `GigsController`. Next.js `app/**/page.tsx` files are routes whose key comes from the directory (`paths` and `key_from_path`) and whose target is the file's default export. A repo that names a module in its routes can use `target = "default-export"`, which resolves the module specifier with the tsconfig aliases and names the default export.
 
 ## Reference
 
