@@ -3,9 +3,153 @@ name: ctsq
 description: CSS-style structural code search via tree-sitter. Replaces treequery. Use for finding function definitions, call sites, class members, cross-file patterns, structural file outlines, call trees, call graphs, import graphs, and definition lookup in C++, Python, JS/TS, Rust, Go, Ruby, and more. Start with ctsq explain when the question is what a symbol is or does. Includes query-by-example (ctsq example) to derive a query from a code snippet when you don't know the syntax.
 ---
 
-# ctsq — Cascading TreeSitter Queries
+# ctsq: Cascading TreeSitter Queries
 
-Replaces `treequery` entirely. Use `ctsq` for all structural code searches.
+Use `ctsq` for all structural code searches. When you are unsure where to start, run `ctsq explain Name src/`. It returns the definition, its callers, its callees and the other uses in one call.
+
+## Worked examples
+
+Each example is a question, the call, a trimmed real output and the next call. Outputs come from this repo's `src/`. Copy the shape and swap in your own names.
+
+### 1. Pull a named definition
+
+Question: show me the function `fmt_tokens`.
+
+```
+ctsq -q '*function#fmt_tokens' --body src/tree.rs
+src/tree.rs:55-61: fn fmt_tokens(n: usize) -> String {
+    if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+...
+```
+
+`*` means definitions only and `--body` prints the whole thing, so no Read follows. Next: find who uses it (example 3).
+
+### 2. Pull several bodies at once
+
+Question: show me `fmt_tokens` and `count_items` together.
+
+```
+ctsq -q '*function#/^(fmt_tokens|count_items)$/' --body src/tree.rs
+src/tree.rs:55-61: fn fmt_tokens(n: usize) -> String {
+...
+src/tree.rs:63-65: fn count_items(items: &[Item]) -> usize {
+    items.iter().map(|i| 1 + count_items(&i.children)).sum()
+}
+```
+
+`/regex/` after `#` matches names, so one call replaces one call per name. Anchor with `^` and `$` or it also matches longer names. Next: see what calls them (example 6).
+
+### 3. Find where a name is used
+
+Question: where is `fmt_tokens` used?
+
+```
+ctsq -q 'id#fmt_tokens' src/
+src/tree.rs:45: fmt_tokens(source.len() / 4),
+src/tree.rs:55: fn fmt_tokens(n: usize) -> String {
+src/tree.rs:691: assert_eq!(fmt_tokens(907), "907");
+src/tree.rs:692: assert_eq!(fmt_tokens(3400), "3.4k");
+```
+
+Each hit is `path:LINE: the source line`, so you rarely need to open the file. Add `-C 3` for three lines of context. Next: pull the function around line 45 with `ctsq -q '*function#report' --body src/tree.rs`.
+
+### 4. Find where some text appears
+
+Question: where does the message "valid kinds" come from?
+
+```
+ctsq -q 'literal#/valid kinds/' src/compiler
+src/compiler/mod.rs:216: "unknown kind '{}' for {}, valid kinds: {}",
+src/compiler/mod.rs:925: assert!(err.starts_with("unknown kind 'bogus' for typescript, valid kinds: "), "{}", err);
+```
+
+`id#` only matches identifiers, so text inside a string needs `literal#`. Next: pull the function that line 216 sits in.
+
+```
+ctsq -q '*function#validate' --body src/compiler/mod.rs
+src/compiler/mod.rs:195-223: pub fn validate(query: &Query, lang: &dyn Lang, lang_name: &str) -> Result<(), String> {
+...
+```
+
+### 5. Outline a file, then pull one body
+
+Question: what is in `src/tree.rs`, and what does `count_items` do?
+
+```
+ctsq tree src/tree.rs
+src/tree.rs  694 lines  ~7.3k tokens  39 entries
+├── pub fn run(path: &str, lang_name: Option<&str>) {  :4
+├── pub fn report(path: &str, lang_name: Option<&str>) -> String {  :10  (42 lines)
+├── fn fmt_tokens(n: usize) -> String {  :55
+├── fn count_items(items: &[Item]) -> usize {  :63
+...
+```
+
+The header gives the file size, so you know whether a whole Read is sensible. Next: pull only the entry you want.
+
+```
+ctsq -q '*function#count_items' --body src/tree.rs
+src/tree.rs:63-65: fn count_items(items: &[Item]) -> usize {
+    items.iter().map(|i| 1 + count_items(&i.children)).sum()
+}
+```
+
+### 6. Who calls something
+
+Question: what calls `count_items`?
+
+```
+ctsq callers count_items src/
+count_items()
+├── report()  [tree.rs:10]
+│   ├── outline()  [tree.rs:616]
+...
+└── count_items()  [tree.rs:63] (cycle)
+```
+
+The tree reads upward through every level. `callees` goes down and `callgraph` shows both. Next: pull the nearest caller with `ctsq -q '*function#report' --body src/tree.rs`.
+
+### 7. Files where several names occur
+
+Question: which files mention both `DefIndex` and `CallGraph`?
+
+```
+ctsq files -q 'id#DefIndex' -q 'id#CallGraph' src/
+src/flow/upward.rs  2 1
+src/semantic/flows.rs  2 1
+```
+
+The trailing numbers are the match count for each `-q`, in order. This replaces `grep -rl A | xargs grep -l B`. Next: look at the hits in one file.
+
+```
+ctsq -q 'id#/^(DefIndex|CallGraph)$/' src/flow/upward.rs
+src/flow/upward.rs:24: use crate::resolve::graph::CallGraph;
+src/flow/upward.rs:25: use crate::resolve::{DefIndex, DefKind, TreeStore};
+...
+```
+
+### 8. What is this symbol (the default)
+
+Question: what is `count_items` and how is it used?
+
+```
+ctsq explain count_items src/
+SYMBOL count_items (1 definition)
+
+DEFINITION src/tree.rs:63  function
+fn count_items(items: &[Item]) -> usize {
+    items.iter().map(|i| 1 + count_items(&i.children)).sum()
+}
+
+CALLERS (1 level)
+  src/tree.rs:39  report()  [tree.rs:10]  let entries = count_items(&items);
+...
+```
+
+One call returns the body, callers, callees and the remaining references. Start here whenever the question is what something is or does. Next: follow a caller or callee with another `explain`.
+
+## Reference
 
 ## Subcommands
 

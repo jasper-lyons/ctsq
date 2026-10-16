@@ -1,21 +1,15 @@
 # Code Search Tools
 - prefer semble (/semble) over grep for semantic code search
-- prefer ctsq over grep, sed, cat, head or tail for anything in source files (.c .cpp .h .py .js .ts .rs .go .rb). A PreToolUse hook denies those shell readers on source paths. Use Read only when you need a whole file:
-  - `ctsq explain Symbol src/`               — FIRST CHOICE for what a symbol is or does: definition with body, callers, callees, other refs, one call
-  - `ctsq tree file.cpp`                       structural outline, file size, each entry's signature and line span
-  - `ctsq -q '*function#Name' --body file.cpp` one function definition with its body
-  - `ctsq -q '*type#Name' --body file.go`      one type or Go struct with its body
-  - `ctsq -q '*variable#Name' --body file.ts`  one const or variable declaration with its initialiser (js, ts, go, rust). `*const#` is the same
-  - `ctsq files -q 'id#A' -q 'id#B' src/`      files where both occur, which grep cannot do in one call
-  - `ctsq -q '(&function#Name @c)' file.cpp`  — find call sites
-  - `ctsq -q '(*function @f).body(id#CONST)' file.cpp` — functions that reference a symbol/constant
-  - `ctsq callers|callees|callgraph FnName src/` — call chain up, down, or the whole graph (recursive, cycle-safe)
-  - `ctsq def Symbol src/`                     — resolve a name to its definition location(s), same resolver as explain
-  - `ctsq -q 'id#Symbol' file.cpp`             each occurrence printed with its source line, replaces `grep -n "Symbol" file.cpp`
-  - `ctsq -q 'id#Symbol' -C 5 file.cpp`        each occurrence with 5 lines either side, replaces `grep -n -C 5` and a windowed Read around a hit
-  - `ctsq -q 'id#/A|B|C/' file.cpp`           — replaces `grep -n "A\|B\|C" file.cpp`
-  - `ctsq -l cpp -q 'id#Symbol' src/`         — replaces `grep -rn "Symbol" src/ --include="*.cpp"`
-  - `ctsq example '$X.send(msg)' -l js`        — unsure of query syntax? derive it from example code ($UPPER = wildcard, unmarked stays literal)
+- prefer ctsq over grep, sed, cat, head or tail for anything in source files (.c .cpp .h .py .js .ts .rs .go .rb). A PreToolUse hook denies those shell readers on source paths. Use Read only when you need a whole file. One call per question, then the next call:
+  - what is this symbol or what does it do (start here): `ctsq explain Name src/` gives the body, callers, callees and other uses in one call
+  - show a definition: `ctsq -q '*function#Name' --body src/`. Several at once: `ctsq -q '*function#/^(A|B)$/' --body src/`. `*type#` and `*variable#` (alias `*const#`) work the same
+  - where is a name used: `ctsq -q 'id#Name' src/` prints `path:LINE: source line`. Add `-C 3` for context lines, then pull the caller with `--body`
+  - where does some text appear: `ctsq -q 'literal#/some text/' src/`. `id#` only matches identifiers, so a string needs `literal#`
+  - what is in a file: `ctsq tree file.rs` for the outline and size, then `ctsq -q '*function#name' --body file.rs` for one body
+  - who calls it: `ctsq callers Name src/`, then `ctsq explain` on a caller. Also `callees` and `callgraph`
+  - files where several names occur: `ctsq files -q 'id#A' -q 'id#B' src/`
+  - where is it defined: `ctsq def Name src/`. Functions that use a constant: `ctsq -q '(*function @f).body(id#CONST)' file.cpp`
+  - restrict by language with `-l cpp`. Unsure of the query syntax: `ctsq example '$X.send(msg)' -l js`
 - prefer mdq over cat/sed/grep for any markdown file (.md): run `mdq tree` first, then `mdq section` for the part you need, never read a markdown file whole to find one section:
   - `mdq tree file.md`                        replaces `cat file.md` / `head -100 file.md`
   - `mdq toc file.md`                         replaces `grep -n '^#' file.md`

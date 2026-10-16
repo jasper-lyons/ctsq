@@ -64,17 +64,22 @@ OUTPUT
   grep -C: matched lines keep path:LINE:, context lines use path-LINE-, groups
   are separated by --, and lines keep their indentation. Not valid with --node.
 
-EXAMPLES
-  ctsq -q 'id#Symbol' file.cpp                             grep -n \"Symbol\" file.cpp
-  ctsq -q 'id#/A|B|C/' file.cpp                           grep -n \"A\\|B\\|C\" file.cpp
-  ctsq -l cpp -q 'id#Symbol' src/                         grep -rn \"Symbol\" src/ --include=*.cpp
-  ctsq -q 'id#Symbol' a.cpp b.cpp                         grep -n \"Symbol\" a.cpp b.cpp
-  ctsq -q 'id#Symbol' -C 2 file.ts                        grep -n -C 2 \"Symbol\" file.ts
-  ctsq -q '*function#Foo' file.cpp                        grep -n \"void Foo\" file.cpp
-  ctsq -q '*type#Config' --body file.go                   the whole type declaration
-  ctsq -q '*variable#config' --body file.ts               the whole const declaration
-  ctsq -q '(*function @f).body(id#CONST)' file.cpp        functions that reference CONST
-  ctsq files -q 'id#A' -q 'id#B' src/                     grep -rl A | xargs grep -l B
+EXAMPLES (a question as a comment, the call, then the next call)
+  # What is this symbol and how is it used? Start here.
+  ctsq explain count_items src/
+  # Show definitions by name, several at once with a regex filter.
+  ctsq -q '*function#/^(fmt_tokens|count_items)$/' --body src/tree.rs
+  # Where is a name used? Then the same hits with context.
+  ctsq -q 'id#fmt_tokens' src/
+  ctsq -q 'id#fmt_tokens' -C 3 src/tree.rs
+  # Where does some text appear? id# only matches identifiers, literal# matches strings.
+  ctsq -q 'literal#/valid kinds/' src/compiler
+  # Outline a file, then pull one body.
+  ctsq tree src/tree.rs
+  ctsq -q '*function#count_items' --body src/tree.rs
+  # Who calls it? Which files mention both names?
+  ctsq callers count_items src/
+  ctsq files -q 'id#DefIndex' -q 'id#CallGraph' src/
 
 STDIN
   Pipe file paths (language detected per file from extension):
