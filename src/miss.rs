@@ -120,6 +120,32 @@ pub fn query_error_report(query: &str, e: &QueryError) -> String {
     out
 }
 
+/// A `ctsq find <query> [key]` that matched nothing: the query, the key, each
+/// framework tried with the file its query came from, and the frameworks whose
+/// query exists but did not detect here.
+pub fn find_report(
+    query: &str,
+    key: Option<&str>,
+    tried: &[(String, String)],
+    not_detected: &[(String, String)],
+) -> String {
+    let what = match key {
+        Some(k) => format!("no {} matches {} here", query, k),
+        None => format!("no {} found here", query),
+    };
+    let mut out = if tried.is_empty() {
+        format!("{}, no framework with a {} query applies\n", what, query)
+    } else {
+        let list: Vec<String> = tried.iter().map(|(f, s)| format!("{} from {}", f, s)).collect();
+        format!("{} (tried {})\n", what, list.join(", "))
+    };
+    if !not_detected.is_empty() {
+        let list: Vec<String> = not_detected.iter().map(|(f, s)| format!("{} ({})", f, s)).collect();
+        out.push_str(&format!("not detected here: {}\n", list.join(", ")));
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Missing paths
 // ---------------------------------------------------------------------------
@@ -599,6 +625,22 @@ mod tests {
         let case = format!("{}/Main.rs", d.display());
         assert!(no_such_file(&case).contains("(did you mean ") && no_such_file(&case).contains("main.rs"), "{}", no_such_file(&case));
         let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_find_miss_names_the_query_key_frameworks_and_sources() {
+        let tried = vec![("solid-routes".to_string(), "built-in queries/solid-routes.toml".to_string())];
+        let missing = vec![("react-router".to_string(), "built-in queries/react-router.toml".to_string())];
+        assert_eq!(
+            find_report("route", Some("/nope"), &tried, &missing),
+            "no route matches /nope here (tried solid-routes from built-in queries/solid-routes.toml)\n\
+             not detected here: react-router (built-in queries/react-router.toml)\n"
+        );
+        assert_eq!(
+            find_report("route", None, &[], &missing),
+            "no route found here, no framework with a route query applies\n\
+             not detected here: react-router (built-in queries/react-router.toml)\n"
+        );
     }
 
     #[test]

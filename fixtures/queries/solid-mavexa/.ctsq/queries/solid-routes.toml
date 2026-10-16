@@ -1,0 +1,12 @@
+# This repo keeps its Solid routes in one array of lazy imports, a shape the
+# built-in solid-routes query misses (its component is an identifier). This
+# file replaces the built-in [route] for framework solid-routes. The target is
+# the imported module, the match itself, since its default export is what
+# serves the route.
+framework = "solid-routes"
+langs     = ["ts", "tsx"]
+detect    = { import = ["@solidjs/router"] }
+
+[route]
+match  = "(pair.key(property_identifier#path).value(string @key)) ~ (pair.key(property_identifier#component).value(call_expression.arguments(arguments > (arrow_function > call_expression.arguments(arguments > (string @target))))))"
+target = "self"

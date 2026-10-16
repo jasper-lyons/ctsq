@@ -6,7 +6,8 @@
 //!   2. `$XDG_CONFIG_HOME/ctsq` else `~/.config/ctsq`
 //!   3. `$XDG_CACHE_HOME/ctsq` else `~/.cache/ctsq`
 //!   4. built-in defaults compiled into the binary
-//! Under each root: `languages/<lang>.toml` and `models/<lang>/*.toml`.
+//! Under each root: `languages/<lang>.toml`, `models/<lang>/*.toml` and
+//! `queries/<framework>.toml` (named queries, see `queries`).
 //!
 //! Public API for later packages:
 //!   `load(repo_root, lang) -> Result<LangConfig, ConfigError>`
@@ -18,6 +19,7 @@
 pub mod gomod;
 pub mod mechanics;
 pub mod models;
+pub mod queries;
 
 use gomod::GoVersion;
 pub use mechanics::Mechanics;
@@ -128,6 +130,12 @@ const BUILTIN_LANGUAGES: &[(&str, &str)] = &[
     ("rust", include_str!("../../config/languages/rust.toml")),
     ("c", include_str!("../../config/languages/c.toml")),
     ("cpp", include_str!("../../config/languages/cpp.toml")),
+];
+
+/// Built-in named queries, `queries/<file>` beside `languages/`.
+const BUILTIN_QUERIES: &[(&str, &str)] = &[
+    ("react-router.toml", include_str!("../../config/queries/react-router.toml")),
+    ("solid-routes.toml", include_str!("../../config/queries/solid-routes.toml")),
 ];
 
 /// The merged `[tests]` table for `lang`: built-in, then cache, config and repo
@@ -437,7 +445,8 @@ pub fn run(args: &[String]) -> i32 {
     let root = find_repo_root(&cwd);
     match args.first().map(String::as_str) {
         Some("path") if args.len() == 1 => {
-            print!("{}", path_report(&Roots::from_env(&root)));
+            let roots = Roots::from_env(&root);
+            print!("{}{}", path_report(&roots), queries::path_report(&roots));
             0
         }
         // The same aliases as -l, so `dump ts` reads typescript.toml.

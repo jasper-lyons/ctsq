@@ -1,0 +1,16 @@
+# Routes declared with @solidjs/router (and its old name, solid-app-router).
+# The key is the path string, the target is the component, resolved with def.
+# A repo whose routes take another shape (such as lazy imports) overrides
+# [route] in .ctsq/queries/<any name>.toml with framework = "solid-routes".
+framework = "solid-routes"
+langs     = ["tsx", "ts", "jsx", "js"]
+detect    = { import = ["@solidjs/router", "solid-app-router"] }
+
+[route]
+match = [
+  # <Route path="/about" component={About} />
+  "(jsx_attribute > (property_identifier#path) + (string @key)) ~ (jsx_attribute > (property_identifier#component) + (jsx_expression > (identifier @target)))",
+  # { path: "/about", component: About }
+  "(pair.key(property_identifier#path).value(string @key)) ~ (pair.key(property_identifier#component).value(identifier @target))",
+]
+target = "def"

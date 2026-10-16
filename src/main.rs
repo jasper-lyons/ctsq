@@ -3,6 +3,7 @@ mod cooccur;
 mod example;
 mod explain;
 mod files;
+mod find;
 mod footer;
 mod miss;
 mod query;
@@ -118,6 +119,9 @@ EXAMPLES (a question as a comment, the call, then the next call)
   ctsq def hide_rows src/
   ctsq scopeof src/footer.rs:30
   ctsq scopeof src/footer.rs:30 --up 1 --siblings
+  # Which named questions (routes, labels) does this repo answer? Then ask one.
+  ctsq find
+  ctsq find route /about
 
 STDIN
   Pipe file paths (language detected per file from extension):
@@ -149,6 +153,8 @@ SUBCOMMANDS
   ctsq def Foo::method src/             resolve a qualified path or method to its definition
   ctsq scopeof src/a.rs:40 src/b.rs:9   the reverse of def: the function or class holding each line, with its body
   ctsq files -q 'id#A' -q 'id#B' src/   files where every one of several queries matches
+  ctsq find                             the named queries (route, ...) that apply in this directory
+  ctsq find route /library              a named query: each route matching the key, and its component
   ctsq imports src/main.rs src/         what files this file imports (down the import tree)
   ctsq importers src/files.rs src/      what files import this file (up the import tree)
   ctsq importgraph src/                 full import graph in DOT format (pipe to dot -Tpng)
@@ -405,6 +411,33 @@ did, 2 when an argument is not a coordinate.")]
         #[arg(long, default_value = "150", value_parser = clap::value_parser!(u64).range(1..))]
         budget: u64,
     },
+    /// Run a named query (route, ...) for the frameworks detected here, or list them
+    #[command(after_help = "A named query answers a question whose shape is fixed per framework, such as
+which component serves a route. With no arguments, find lists every named
+query that applies in the current directory and why:
+
+  ctsq find
+  ctsq find route
+  ctsq find route /library
+  ctsq find route '/^/w/'
+
+Each match prints path:LINE, the key, the target and the target's path:LINE
+(? when def finds no definition), then one count line per framework naming
+the file the query came from. A key matches as a case-insensitive substring,
+or as a regex when written /.../. The search root is the current directory,
+and tests are hidden as everywhere else (--tests shows them).
+
+Queries are TOML files in queries/ beside languages/, looked up in repo
+.ctsq/, then $XDG_CONFIG_HOME/ctsq, then $XDG_CACHE_HOME/ctsq, then built-in
+(ctsq config path lists the directories). A repo file with the same framework
+and query name replaces the built-in one. Exit 0 when anything matched, 1 when
+nothing did, 2 for an unknown query or a query file that does not compile.")]
+    Find {
+        /// Query name, such as route. Omit to list the queries that apply here
+        query: Option<String>,
+        /// Key filter: a case-insensitive substring, or /regex/
+        key: Option<String>,
+    },
     /// Find all usage sites of a name (complement of def)
     Refs {
         /// Identifier name to find references to
@@ -535,9 +568,10 @@ Exit codes: 0 routes found, 1 no routes or an unknown kind, 2 usage or query err
         expand: bool,
     },
     /// Show where config and model files are read from, or the merged result for a language
-    #[command(after_help = "Language mechanics and outside-call models are TOML files, looked up in order:
-repo .ctsq/, then $XDG_CONFIG_HOME/ctsq (default ~/.config/ctsq), then
-$XDG_CACHE_HOME/ctsq (default ~/.cache/ctsq), then built-in defaults.
+    #[command(after_help = "Language mechanics, outside-call models and named queries are TOML files,
+looked up in order: repo .ctsq/, then $XDG_CONFIG_HOME/ctsq (default
+~/.config/ctsq), then $XDG_CACHE_HOME/ctsq (default ~/.cache/ctsq), then
+built-in defaults. `path` lists each root, then the queries/ directory in each.
 
   ctsq config path
   ctsq config dump go")]
@@ -656,6 +690,9 @@ fn main() {
             eprint!("{}", r.err);
             print!("{}", r.out);
             std::process::exit(r.code);
+        }
+        Some(Commands::Find { query, key }) => {
+            std::process::exit(find::run(query.as_deref(), key.as_deref(), cli.no_ignore, &hide));
         }
         Some(Commands::Refs { name, path, scope }) => {
             run_refs(&name, &path, cli.lang.as_deref(), cli.no_ignore, &hide, scope.opts());

@@ -355,6 +355,59 @@ pub fn def_rows(
 /// const inside a component or a closure bound to a local. Neither the
 /// call-graph index nor the outline holds those, so this asks the query engine
 /// for any function, class, type or variable declaration of that name.
+/// `def_rows` for many names over the same jobs, quiet, with the index and the
+/// outline fallback built once. `find` resolves every route target with it.
+pub struct DefLookup {
+    jobs: Vec<(String, &'static str)>,
+    index: DefIndex,
+    /// (file, name, line) of every outline entry, read on the first miss.
+    locs: Option<Vec<(String, String, usize)>>,
+}
+
+impl DefLookup {
+    pub fn new(jobs: &[(String, &'static str)]) -> DefLookup {
+        let mut index = DefIndex::default();
+        for (file, lang) in jobs {
+            let Ok(source) = std::fs::read(file) else { continue };
+            for def in resolver_for(lang).collect_defs(file, &source) {
+                index.push(def);
+            }
+        }
+        DefLookup { jobs: jobs.to_vec(), index, locs: None }
+    }
+
+    /// The same rows `def_rows` gives for `expr`, in the same order.
+    pub fn find(&mut self, expr: &str) -> Vec<(String, usize, Confidence)> {
+        let rows: Vec<(String, usize, Confidence)> = resolve_def_query(expr, &self.index)
+            .into_iter()
+            .map(|(i, conf)| (self.index.defs[i].id.file.clone(), self.index.defs[i].id.line, conf))
+            .collect();
+        if !rows.is_empty() {
+            return rows;
+        }
+        let jobs = &self.jobs;
+        let locs = self.locs.get_or_insert_with(|| {
+            jobs.iter()
+                .flat_map(|(file, lang)| {
+                    crate::tree::collect_def_locs(file, lang)
+                        .into_iter()
+                        .map(move |(_, name, line)| (file.clone(), name, line))
+                })
+                .collect()
+        });
+        let bare = crate::explain::bare_name(expr);
+        let mut found: Vec<(String, usize)> =
+            locs.iter().filter(|(_, n, _)| n == bare).map(|(f, _, l)| (f.clone(), *l)).collect();
+        found.sort();
+        found.dedup();
+        if found.is_empty() {
+            found = nested_def_sites(bare, &self.jobs);
+        }
+        let conf = if found.len() == 1 { Confidence::Exact } else { Confidence::Guess };
+        found.into_iter().map(|(f, l)| (f, l, conf)).collect()
+    }
+}
+
 fn nested_def_sites(name: &str, jobs: &[(String, &'static str)]) -> Vec<(String, usize)> {
     let queries: Vec<crate::query::ast::Query> = ["function", "variable", "class", "type"]
         .iter()
