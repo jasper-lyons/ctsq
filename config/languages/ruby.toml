@@ -1,0 +1,4 @@
+[tests]
+files  = ["*_test.rb", "*_spec.rb"]
+dirs   = ["test", "spec"]
+scopes = []

@@ -1,13 +1,22 @@
 use crate::compiler::lang;
 use tree_sitter::{Node, Parser};
 
-pub fn run(path: &str, lang_name: Option<&str>) {
-    print!("{}", report(path, lang_name));
+/// One file's outline and what it left out.
+pub struct Outline {
+    /// Header line and entries, or empty when the whole file is hidden.
+    pub text: String,
+    /// Entries printed.
+    pub entries: usize,
+    /// Entries left out: every entry of a hidden file, or a test scope with
+    /// everything nested in it.
+    pub hidden: crate::footer::Hidden,
 }
 
-/// The whole outline as text: one header line, then the entries. Split out from
-/// `run` so tests can assert on it without capturing stdout.
-pub fn report(path: &str, lang_name: Option<&str>) -> String {
+/// The whole outline as text: one header line, then the entries. Returned
+/// rather than printed so tests can assert on it without capturing stdout.
+/// `hider` decides which files and test scopes are left out, and the caller
+/// prints the summed footer once (BUILD.md A11).
+pub fn report(path: &str, lang_name: Option<&str>, hider: &mut crate::files::Hider) -> Outline {
     let source = match std::fs::read(path) {
         Ok(s) => s,
         Err(e) => { eprintln!("Failed to read {}: {}", path, e); std::process::exit(1); }
@@ -33,7 +42,17 @@ pub fn report(path: &str, lang_name: Option<&str>) -> String {
     let tree = parser.parse(&source, None).expect("parse failed");
 
     let root = tree.root_node();
-    let items = collect_items(root, &source, lang_name);
+    let mut items = collect_items(root, &source, lang_name);
+    let mut hidden = crate::footer::Hidden::default();
+
+    if let Some(why) = hider.file(path) {
+        hidden.count(why, count_items(&items));
+        return Outline { text: String::new(), entries: 0, hidden };
+    }
+    let scopes = hider.scope_lines(path, Some(&source));
+    if !scopes.is_empty() {
+        hidden.tests += drop_scoped(&mut items, &scopes);
+    }
 
     let line_count = String::from_utf8_lossy(&source).lines().count();
     let entries = count_items(&items);
@@ -47,7 +66,23 @@ pub fn report(path: &str, lang_name: Option<&str>) -> String {
         if entries == 1 { "entry" } else { "entries" },
     );
     push_items(&mut out, &items, "");
-    out
+    Outline { text: out, entries, hidden }
+}
+
+/// Remove the items that start inside a test scope, and return how many
+/// entries went with them, nested ones included.
+fn drop_scoped(items: &mut Vec<Item>, scopes: &[(usize, usize)]) -> usize {
+    let mut dropped = 0;
+    items.retain_mut(|it| {
+        if scopes.iter().any(|(a, b)| *a <= it.line && it.line <= *b) {
+            dropped += 1 + count_items(&it.children);
+            false
+        } else {
+            dropped += drop_scoped(&mut it.children, scopes);
+            true
+        }
+    });
+    dropped
 }
 
 /// Rough token count, the way mdq reports it: bytes over four, thousands
@@ -614,7 +649,7 @@ mod tests {
     }
 
     fn outline(name: &str) -> String {
-        report(&fixture(name), None)
+        report(&fixture(name), None, &mut crate::files::Hider::none()).text
     }
 
     #[test]
@@ -680,10 +715,56 @@ mod tests {
         let path = dir.join("long.go");
         let long = format!("package main\n\nfunc F({}) {{\n}}\n", "a, b string, ".repeat(20));
         std::fs::write(&path, long).unwrap();
-        let out = report(path.to_str().unwrap(), None);
+        let out = report(path.to_str().unwrap(), None, &mut crate::files::Hider::none()).text;
         let entry = out.lines().nth(1).unwrap();
         assert!(entry.contains("..."), "expected a cut marker: {}", entry);
         assert!(entry.len() < 160, "signature must stay on one readable line: {}", entry);
+    }
+
+    #[test]
+    fn test_scopes_are_left_out_and_counted_with_what_they_hold() {
+        let dir = std::env::temp_dir().join(format!("ctsq_tree_scopes_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lib.rs");
+        std::fs::write(
+            &path,
+            "fn real() {}\n\n#[cfg(test)]\nfn helper() {}\n\n#[cfg(test)]\nmod tests {\n    fn a() {}\n    fn b() {}\n}\n",
+        )
+        .unwrap();
+        let root = dir.to_str().unwrap();
+        let file = path.to_str().unwrap();
+        let jobs = crate::files::resolve_jobs(root, None, true);
+        let mut hider = crate::files::Hider::new(&Default::default());
+        hider.add_jobs(root, &jobs);
+        let o = report(file, None, &mut hider);
+        assert!(o.text.contains("fn real()"), "{}", o.text);
+        assert!(!o.text.contains("mod tests"), "{}", o.text);
+        assert!(!o.text.contains("helper"), "{}", o.text);
+        assert_eq!(o.entries, 1);
+        assert_eq!(o.hidden.tests, 4, "helper, mod tests and its two functions");
+        assert!(o.text.lines().next().unwrap().ends_with(" 1 entry"), "{}", o.text);
+
+        let mut all = crate::files::Hider::new(&crate::files::HideOpts { tests: true, exclude: vec![] });
+        all.add_jobs(root, &jobs);
+        let o = report(file, None, &mut all);
+        assert!(o.text.contains("mod tests"), "--tests keeps them: {}", o.text);
+        assert_eq!(o.hidden, Default::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hidden_file_prints_nothing_and_counts_its_entries() {
+        let dir = std::env::temp_dir().join(format!("ctsq_tree_hidden_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a_test.go"), "package a\n\nfunc A() {}\nfunc B() {}\n").unwrap();
+        let root = dir.to_str().unwrap();
+        let jobs = crate::files::resolve_jobs(root, None, true);
+        let mut hider = crate::files::Hider::new(&Default::default());
+        hider.add_jobs(root, &jobs);
+        let o = report(&jobs[0].0, None, &mut hider);
+        assert_eq!(o.text, "");
+        assert_eq!(o.hidden.tests, 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

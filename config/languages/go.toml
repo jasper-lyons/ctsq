@@ -67,3 +67,9 @@ blank        = ["_"]
 declare      = [":="]
 # Operators whose result is about the data but is not the data.
 clear_ops    = ["==", "!=", "<", "<=", ">", ">="]
+
+# Test detection: globs on the file name, directory names, and scope selectors.
+[tests]
+files  = ["*_test.go"]
+dirs   = ["testdata"]
+scopes = []

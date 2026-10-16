@@ -10,6 +10,7 @@
   - where is a method called: `ctsq -q 'call#Name' src/` matches the last segment, so `pkg.Name(...)` and `x.Name(...)` both hit. `comment#/text/` finds comments. Scripts with no extension are read by their shebang, no `--lang` needed
   - files where several names occur: `ctsq files -q 'id#A' -q 'id#B' src/`
   - where is it defined: `ctsq def Name src/`. Functions that use a constant: `ctsq -q '(*function @f).body(id#CONST)' file.cpp`
+  - tests are hidden by default and counted on the last line, `hidden: N in tests (--tests)`. Before deleting or renaming a name, rerun with `--tests` to see every use. `--exclude GLOB` hides more paths
   - restrict by language with `-l cpp`. Unsure of the query syntax: `ctsq example '$X.send(msg)' -l js`
 - prefer mdq over cat/sed/grep for any markdown file (.md): run `mdq tree` first, then `mdq section` for the part you need, never read a markdown file whole to find one section:
   - `mdq tree file.md`                        replaces `cat file.md` / `head -100 file.md`

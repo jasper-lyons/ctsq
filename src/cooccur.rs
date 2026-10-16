@@ -6,15 +6,29 @@
 
 use crate::compiler::{self, lang};
 use crate::files;
+use crate::footer::{footer, Hidden};
 use crate::query;
 use crate::runner;
 use std::collections::HashMap;
 
 /// Files where every query in `queries` matches at least once, each with the
-/// per-query match count in query order.
+/// per-query match count in query order. Hides nothing.
+#[cfg(test)]
 pub fn matching_files(
     queries: &[String],
     jobs: &[(String, &'static str)],
+) -> Result<Vec<(String, Vec<usize>)>, String> {
+    matching_files_hiding(queries, jobs, &mut files::Hider::none(), &mut Hidden::default())
+}
+
+/// `matching_files` with what `hider` hides left out. A test file that would
+/// be listed counts once in `hidden`, and so does a file that is listed only
+/// when the matches inside its test scopes count.
+pub fn matching_files_hiding(
+    queries: &[String],
+    jobs: &[(String, &'static str)],
+    hider: &mut files::Hider,
+    hidden: &mut Hidden,
 ) -> Result<Vec<(String, Vec<usize>)>, String> {
     let mut asts = Vec::new();
     for q in queries {
@@ -32,30 +46,44 @@ pub fn matching_files(
             .entry(lang_name)
             .or_insert_with(|| lang::for_name(lang_name).expect("lang_name always valid here"));
         let Ok(source) = std::fs::read(file) else { continue };
+        let whole = hider.file(file);
+        let mut scopes: Option<Vec<(usize, usize)>> = None;
 
+        // counts with every match, and with the scoped ones left out
         let mut counts = Vec::with_capacity(asts.len());
+        let mut visible = Vec::with_capacity(asts.len());
         for (i, ast) in asts.iter().enumerate() {
             let compiled = cache
                 .entry((lang_name, i))
                 .or_insert_with(|| compiler::compile(ast, lang_box.as_ref()));
-            let n = runner::run(compiled, lang_box.as_ref(), &source, false)
-                .map(|m| m.len())
-                .unwrap_or(0);
-            if n == 0 {
+            let rows = runner::run_rows(compiled, lang_box.as_ref(), &source, false).unwrap_or_default();
+            if rows.is_empty() {
                 break;
             }
-            counts.push(n);
+            counts.push(rows.len());
+            if whole.is_none() {
+                let s = scopes.get_or_insert_with(|| hider.scope_lines(file, Some(&source)));
+                visible.push(rows.iter().filter(|r| !s.iter().any(|(a, b)| *a <= r.line && r.line <= *b)).count());
+            }
         }
-        if counts.len() == asts.len() {
-            out.push((file.clone(), counts));
+        if counts.len() != asts.len() {
+            continue;
+        }
+        match whole {
+            Some(why) => hidden.count(why, 1),
+            None if visible.iter().all(|n| *n > 0) => out.push((file.clone(), visible)),
+            None => hidden.count(files::Hide::Test, 1),
         }
     }
     Ok(out)
 }
 
-pub fn run(queries: &[String], path: &str, lang_name: Option<&str>, no_ignore: bool) {
+pub fn run(queries: &[String], path: &str, lang_name: Option<&str>, no_ignore: bool, hide: &files::HideOpts) {
     let jobs = files::resolve_jobs(path, lang_name, no_ignore);
-    let hits = match matching_files(queries, &jobs) {
+    let mut hider = files::Hider::new(hide);
+    hider.add_jobs(path, &jobs);
+    let mut hidden = Hidden::default();
+    let hits = match matching_files_hiding(queries, &jobs, &mut hider, &mut hidden) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("{}", e);
@@ -63,6 +91,10 @@ pub fn run(queries: &[String], path: &str, lang_name: Option<&str>, no_ignore: b
         }
     };
 
+    if hits.is_empty() && hidden.any() {
+        print!("{}", footer(0, "file", &hidden));
+        std::process::exit(1);
+    }
     if hits.is_empty() {
         println!(
             "no file matches all {} queries in {} ({} files scanned)",
@@ -73,10 +105,12 @@ pub fn run(queries: &[String], path: &str, lang_name: Option<&str>, no_ignore: b
         std::process::exit(1);
     }
 
+    let shown = hits.len();
     for (file, counts) in hits {
         let counts: Vec<String> = counts.iter().map(|c| c.to_string()).collect();
         println!("{}  {}", file, counts.join(" "));
     }
+    print!("{}", footer(shown, "file", &hidden));
 }
 
 #[cfg(test)]

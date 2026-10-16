@@ -105,6 +105,321 @@ pub fn resolve_jobs(path: &str, lang_name: Option<&str>, no_ignore: bool) -> Vec
     }
 }
 
+// ---------------------------------------------------------------------------
+// Hiding tests and excluded paths
+// ---------------------------------------------------------------------------
+
+/// Why a file or a match is hidden from output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hide {
+    /// A test file, or a test scope inside a file (`--tests` shows it).
+    Test,
+    /// A path an `--exclude` glob names.
+    Excluded,
+}
+
+/// The two global flags that decide what is hidden.
+#[derive(Debug, Clone, Default)]
+pub struct HideOpts {
+    /// `--tests`: hide nothing for being a test.
+    pub tests: bool,
+    /// `--exclude GLOB`, repeatable.
+    pub exclude: Vec<String>,
+}
+
+/// One language's `[tests]` table, with its globs compiled.
+struct LangTests {
+    files: Vec<regex::Regex>,
+    dirs: Vec<String>,
+    /// Scope selectors compiled for this language. A selector the language has
+    /// no kind for is left out, with one note on stderr.
+    scopes: Vec<(Box<dyn lang::Lang>, crate::compiler::CompiledQuery)>,
+}
+
+/// Decides, per file and per line, what a command hides, and remembers the
+/// search root each file was found under.
+///
+/// A test path is judged relative to the search root given on the command line,
+/// so `ctsq -q X tests/` searches inside tests/ as usual. A file named directly
+/// on the command line is never hidden as a file, though test scopes inside it
+/// still are. Use: `add_jobs(root, &jobs)` once per path argument, then `file`
+/// for a whole file and `site` for one line, or `keep` to split a list.
+pub struct Hider {
+    show_tests: bool,
+    exclude: Vec<(bool, regex::Regex)>,
+    /// file -> (search root, language)
+    jobs: std::collections::HashMap<String, (String, &'static str)>,
+    tests: std::collections::HashMap<(std::path::PathBuf, &'static str), std::rc::Rc<LangTests>>,
+    scopes: std::collections::HashMap<String, Vec<(usize, usize)>>,
+    /// search root -> repo root, where the config lookup starts
+    repos: std::collections::HashMap<String, std::path::PathBuf>,
+}
+
+impl Hider {
+    pub fn new(opts: &HideOpts) -> Hider {
+        Hider {
+            show_tests: opts.tests,
+            exclude: opts.exclude.iter().map(|g| (g.contains('/'), glob_regex(g))).collect(),
+            jobs: Default::default(),
+            tests: Default::default(),
+            scopes: Default::default(),
+            repos: Default::default(),
+        }
+    }
+
+    /// A Hider that hides nothing, for tests that want every match.
+    #[cfg(test)]
+    pub fn none() -> Hider {
+        Hider::new(&HideOpts { tests: true, exclude: vec![] })
+    }
+
+    /// Record the jobs one path argument produced, so each file is judged
+    /// against that root.
+    pub fn add_jobs(&mut self, root: &str, jobs: &[(String, &'static str)]) {
+        for (f, l) in jobs {
+            self.jobs.entry(f.clone()).or_insert_with(|| (root.to_string(), *l));
+        }
+    }
+
+    fn tests_for(&mut self, root: &str, lang_name: &'static str) -> std::rc::Rc<LangTests> {
+        let repo = self
+            .repos
+            .entry(root.to_string())
+            .or_insert_with(|| crate::config::find_repo_root(std::path::Path::new(root)))
+            .clone();
+        let key = (repo.clone(), lang_name);
+        if let Some(t) = self.tests.get(&key) {
+            return t.clone();
+        }
+        let table = match crate::config::load_tests(&repo, lang_name) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(2);
+            }
+        };
+        let mut scopes = Vec::new();
+        for sel in &table.scopes {
+            let compiled = crate::query::parse(sel).ok().and_then(|ast| {
+                let l = lang::for_name(lang_name)?;
+                crate::compiler::validate(&ast, l.as_ref(), lang_name).ok()?;
+                let c = crate::compiler::compile(&ast, l.as_ref());
+                Some((l, c))
+            });
+            match compiled {
+                Some(c) => scopes.push(c),
+                None => eprintln!("[tests] scope '{}' does not compile for {}, skipped", sel, lang_name),
+            }
+        }
+        let t = std::rc::Rc::new(LangTests {
+            files: table.files.iter().map(|g| glob_regex(g)).collect(),
+            dirs: table.dirs.clone(),
+            scopes,
+        });
+        self.tests.insert(key, t.clone());
+        t
+    }
+
+    /// Why `file` is hidden as a whole, if it is. A file no `add_jobs` call
+    /// recorded, and a file named directly on the command line, are never hidden.
+    pub fn file(&mut self, file: &str) -> Option<Hide> {
+        let (root, lang_name) = self.jobs.get(file)?.clone();
+        if file == "-" || std::path::Path::new(&root).is_file() {
+            return None;
+        }
+        let rel = relative(&root, file);
+        let segs: Vec<&str> = rel.split('/').filter(|s| !s.is_empty() && *s != ".").collect();
+        let Some((name, dirs)) = segs.split_last() else { return None };
+        if self.exclude.iter().any(|(slash, re)| {
+            if *slash { re.is_match(&rel) } else { segs.iter().any(|s| re.is_match(s)) }
+        }) {
+            return Some(Hide::Excluded);
+        }
+        if self.show_tests {
+            return None;
+        }
+        let t = self.tests_for(&root, lang_name);
+        let by_name = t.files.iter().any(|re| re.is_match(name) || re.is_match(&rel));
+        let by_dir = dirs.iter().any(|d| t.dirs.iter().any(|td| td == d));
+        (by_name || by_dir).then_some(Hide::Test)
+    }
+
+    /// Whether `file` has test scopes to look for, so callers can skip reading it.
+    fn has_scopes(&mut self, file: &str) -> bool {
+        if self.show_tests {
+            return false;
+        }
+        let Some((root, lang_name)) = self.jobs.get(file).cloned() else { return false };
+        lang_name == "rust" || !self.tests_for(&root, lang_name).scopes.is_empty()
+    }
+
+    /// Test scopes in `file` as inclusive 1-based line ranges, cached per file.
+    /// `source` saves a read when the caller already holds the bytes.
+    pub fn scope_lines(&mut self, file: &str, source: Option<&[u8]>) -> Vec<(usize, usize)> {
+        if !self.has_scopes(file) {
+            return vec![];
+        }
+        if let Some(s) = self.scopes.get(file) {
+            return s.clone();
+        }
+        let owned;
+        let source = match source {
+            Some(s) => s,
+            None => match std::fs::read(file) {
+                Ok(s) => {
+                    owned = s;
+                    &owned
+                }
+                Err(_) => return vec![],
+            },
+        };
+        let (root, lang_name) = self.jobs[file].clone();
+        let t = self.tests_for(&root, lang_name);
+        let mut ranges = Vec::new();
+        for (l, c) in &t.scopes {
+            if let Ok(rows) = crate::runner::run_rows(c, l.as_ref(), source, false) {
+                for r in rows {
+                    ranges.push((line_at(source, r.start_byte), line_at(source, r.end_byte.saturating_sub(1).max(r.start_byte))));
+                }
+            }
+        }
+        if lang_name == "rust" {
+            ranges.extend(rust_cfg_test_ranges(source));
+        }
+        ranges.sort_unstable();
+        ranges.dedup();
+        self.scopes.insert(file.to_string(), ranges.clone());
+        ranges
+    }
+
+    /// Why the match at `file:line` is hidden, if it is: the whole file, or a
+    /// test scope around the line.
+    pub fn site(&mut self, file: &str, line: usize) -> Option<Hide> {
+        if let Some(h) = self.file(file) {
+            return Some(h);
+        }
+        self.scope_lines(file, None)
+            .iter()
+            .any(|(a, b)| *a <= line && line <= *b)
+            .then_some(Hide::Test)
+    }
+
+    /// Split `items` into the ones shown and a count of the ones hidden, by the
+    /// `file:line` each one sits at.
+    pub fn keep<T>(
+        &mut self,
+        items: Vec<T>,
+        at: impl Fn(&T) -> (String, usize),
+        hidden: &mut crate::footer::Hidden,
+    ) -> Vec<T> {
+        let mut out = Vec::new();
+        for it in items {
+            let (f, l) = at(&it);
+            match self.site(&f, l) {
+                Some(h) => hidden.count(h, 1),
+                None => out.push(it),
+            }
+        }
+        out
+    }
+}
+
+/// `file` relative to `root`, with `/` separators. A file outside the root is
+/// judged by its own path.
+fn relative(root: &str, file: &str) -> String {
+    let p = std::path::Path::new(file);
+    let rel = p.strip_prefix(root).unwrap_or(p);
+    rel.to_string_lossy().replace('\\', "/")
+}
+
+/// 1-based line holding byte `at`.
+fn line_at(source: &[u8], at: usize) -> usize {
+    source[..at.min(source.len())].iter().filter(|b| **b == b'\n').count() + 1
+}
+
+/// A glob as an anchored regex. `*` and `?` stay inside one path segment, `**`
+/// crosses segments, `{a,b}` is either, `[...]` is a character class.
+pub fn glob_regex(glob: &str) -> regex::Regex {
+    let chars: Vec<char> = glob.chars().collect();
+    let mut re = String::from("^");
+    let mut i = 0;
+    let mut braces = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '*' if chars.get(i + 1) == Some(&'*') => {
+                if chars.get(i + 2) == Some(&'/') {
+                    re.push_str("(?:.*/)?");
+                    i += 3;
+                } else {
+                    re.push_str(".*");
+                    i += 2;
+                }
+                continue;
+            }
+            '*' => re.push_str("[^/]*"),
+            '?' => re.push_str("[^/]"),
+            '{' => {
+                braces += 1;
+                re.push_str("(?:");
+            }
+            '}' if braces > 0 => {
+                braces -= 1;
+                re.push(')');
+            }
+            ',' if braces > 0 => re.push('|'),
+            '[' => match chars[i..].iter().position(|ch| *ch == ']') {
+                Some(end) if end > 1 => {
+                    let class: String = chars[i + 1..i + end].iter().collect();
+                    let class = class.strip_prefix('!').map(|r| format!("^{}", r)).unwrap_or(class);
+                    re.push_str(&format!("[{}]", class.replace('\\', "\\\\")));
+                    i += end + 1;
+                    continue;
+                }
+                _ => re.push_str("\\["),
+            },
+            _ => re.push_str(&regex::escape(&c.to_string())),
+        }
+        i += 1;
+    }
+    re.push('$');
+    regex::Regex::new(&re).unwrap_or_else(|_| regex::Regex::new(&format!("^{}$", regex::escape(glob))).unwrap())
+}
+
+/// Rust items under `#[cfg(test)]`, from the attribute line to the item's end.
+/// Found in code because a selector has no way to say "the item after this
+/// attribute" (BUILD.md A09).
+fn rust_cfg_test_ranges(source: &[u8]) -> Vec<(usize, usize)> {
+    let Some(l) = lang::for_name("rust") else { return vec![] };
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&l.ts_language()).is_err() {
+        return vec![];
+    }
+    let Some(tree) = parser.parse(source, None) else { return vec![] };
+    let mut out = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        let children: Vec<tree_sitter::Node> = node.named_children(&mut cursor).collect();
+        for (i, child) in children.iter().enumerate() {
+            if child.kind() == "attribute_item" {
+                let text: String = child.utf8_text(source).unwrap_or("").chars().filter(|c| !c.is_whitespace()).collect();
+                if text == "#[cfg(test)]" {
+                    let item = children[i + 1..]
+                        .iter()
+                        .find(|n| !matches!(n.kind(), "attribute_item" | "line_comment" | "block_comment"));
+                    if let Some(item) = item {
+                        out.push((child.start_position().row + 1, item.end_position().row + 1));
+                    }
+                }
+            } else if child.child_count() > 0 {
+                stack.push(*child);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,6 +497,132 @@ mod tests {
         let gone = d.join("b.js");
         assert!(resolve_jobs_lenient(gone.to_str().unwrap(), None, true).is_empty());
         assert_eq!(resolve_jobs_lenient(d.to_str().unwrap(), None, true).len(), 1);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    fn hider_over(d: &std::path::Path, opts: &HideOpts) -> (Hider, Vec<(String, &'static str)>) {
+        let root = d.to_str().unwrap();
+        let jobs = resolve_jobs(root, None, true);
+        let mut h = Hider::new(opts);
+        h.add_jobs(root, &jobs);
+        (h, jobs)
+    }
+
+    fn name_of(f: &str, d: &std::path::Path) -> String {
+        relative(d.to_str().unwrap(), f)
+    }
+
+    #[test]
+    fn test_files_are_judged_by_name_and_directory_per_language() {
+        let d = scratch("hide");
+        for (p, src) in [
+            ("pkg/server.go", "package pkg\n"),
+            ("pkg/server_test.go", "package pkg\n"),
+            ("pkg/testdata/x.go", "package x\n"),
+            ("web/App.tsx", "const a = 1;\n"),
+            ("web/App.test.tsx", "const a = 1;\n"),
+            ("web/__tests__/b.ts", "const b = 1;\n"),
+            ("py/test_a.py", "a = 1\n"),
+            ("py/a.py", "a = 1\n"),
+            ("py/conftest.py", "a = 1\n"),
+            ("src/lib.rs", "fn a() {}\n"),
+            ("tests/cli.rs", "fn a() {}\n"),
+            ("rb/a_spec.rb", "x = 1\n"),
+        ] {
+            let f = d.join(p);
+            fs::create_dir_all(f.parent().unwrap()).unwrap();
+            fs::write(f, src).unwrap();
+        }
+        let (mut h, jobs) = hider_over(&d, &HideOpts::default());
+        let mut hidden: Vec<String> = jobs
+            .iter()
+            .filter(|(f, _)| h.file(f) == Some(Hide::Test))
+            .map(|(f, _)| name_of(f, &d))
+            .collect();
+        hidden.sort();
+        assert_eq!(
+            hidden,
+            vec![
+                "pkg/server_test.go",
+                "pkg/testdata/x.go",
+                "py/conftest.py",
+                "py/test_a.py",
+                "rb/a_spec.rb",
+                "tests/cli.rs",
+                "web/App.test.tsx",
+                "web/__tests__/b.ts",
+            ]
+        );
+        let (mut all, jobs) = hider_over(&d, &HideOpts { tests: true, exclude: vec![] });
+        assert!(jobs.iter().all(|(f, _)| all.file(f).is_none()), "--tests hides no file");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_test_directory_given_as_the_root_is_searched_normally() {
+        let d = scratch("root");
+        fs::create_dir_all(d.join("tests")).unwrap();
+        fs::write(d.join("tests/cli.rs"), "fn a() {}\n").unwrap();
+        let (mut h, jobs) = hider_over(&d.join("tests"), &HideOpts::default());
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(h.file(&jobs[0].0), None, "the segment above the root does not count");
+        // Named directly, even a test file is shown.
+        let f = d.join("tests/cli.rs");
+        let mut named = Hider::new(&HideOpts::default());
+        named.add_jobs(f.to_str().unwrap(), &resolve_jobs(f.to_str().unwrap(), None, true));
+        assert_eq!(named.file(f.to_str().unwrap()), None);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn exclude_globs_hide_paths_relative_to_the_root() {
+        let d = scratch("exclude");
+        for p in ["vendor/a.go", "gen/b.pb.go", "main.go", "deep/vendor/c.go"] {
+            let f = d.join(p);
+            fs::create_dir_all(f.parent().unwrap()).unwrap();
+            fs::write(f, "package x\n").unwrap();
+        }
+        let opts = HideOpts { tests: false, exclude: vec!["vendor".into(), "gen/*.pb.go".into()] };
+        let (mut h, jobs) = hider_over(&d, &opts);
+        let mut ex: Vec<String> = jobs
+            .iter()
+            .filter(|(f, _)| h.file(f) == Some(Hide::Excluded))
+            .map(|(f, _)| name_of(f, &d))
+            .collect();
+        ex.sort();
+        assert_eq!(ex, vec!["deep/vendor/c.go", "gen/b.pb.go", "vendor/a.go"]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn globs_keep_star_inside_one_segment() {
+        assert!(glob_regex("*_test.go").is_match("a_test.go"));
+        assert!(!glob_regex("*_test.go").is_match("pkg/a_test.go"));
+        assert!(glob_regex("**/*.go").is_match("a/b/c.go"));
+        assert!(glob_regex("**/*.go").is_match("c.go"));
+        assert!(glob_regex("*.{ts,tsx}").is_match("a.tsx"));
+        assert!(glob_regex("test_?.py").is_match("test_a.py"));
+        assert!(glob_regex("[ab].go").is_match("b.go") && !glob_regex("[ab].go").is_match("c.go"));
+        assert!(glob_regex("a.b").is_match("a.b") && !glob_regex("a.b").is_match("axb"));
+    }
+
+    #[test]
+    fn rust_test_scopes_are_mod_tests_and_cfg_test_items() {
+        let d = scratch("scopes");
+        let src = "fn real() {}\n\n#[cfg(test)]\nfn helper() {\n}\n\nmod tests {\n    fn t() {}\n}\n\n#[cfg(test)]\nmod other {\n    fn u() {}\n}\n";
+        fs::write(d.join("lib.rs"), src).unwrap();
+        let (mut h, jobs) = hider_over(&d, &HideOpts::default());
+        let f = &jobs[0].0;
+        assert_eq!(h.scope_lines(f, None), vec![(3, 5), (7, 9), (11, 14)]);
+        assert_eq!(h.site(f, 1), None);
+        assert_eq!(h.site(f, 8), Some(Hide::Test));
+        assert_eq!(h.site(f, 13), Some(Hide::Test));
+        let mut hidden = crate::footer::Hidden::default();
+        let kept = h.keep(vec![(f.clone(), 1), (f.clone(), 4), (f.clone(), 8)], |(f, l)| (f.clone(), *l), &mut hidden);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(hidden.tests, 2);
+        let (mut all, _) = hider_over(&d, &HideOpts { tests: true, exclude: vec![] });
+        assert!(all.scope_lines(f, None).is_empty(), "--tests finds no scopes");
         let _ = fs::remove_dir_all(&d);
     }
 

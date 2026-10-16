@@ -17,7 +17,7 @@ Question: show me the function `fmt_tokens`.
 
 ```
 ctsq -q '*function#fmt_tokens' --body src/tree.rs
-src/tree.rs:55-61: fn fmt_tokens(n: usize) -> String {
+src/tree.rs:90-96: fn fmt_tokens(n: usize) -> String {
     if n >= 1000 {
         format!("{:.1}k", n as f64 / 1000.0)
 ...
@@ -31,9 +31,9 @@ Question: show me `fmt_tokens` and `count_items` together.
 
 ```
 ctsq -q '*function#/^(fmt_tokens|count_items)$/' --body src/tree.rs
-src/tree.rs:55-61: fn fmt_tokens(n: usize) -> String {
+src/tree.rs:90-96: fn fmt_tokens(n: usize) -> String {
 ...
-src/tree.rs:63-65: fn count_items(items: &[Item]) -> usize {
+src/tree.rs:98-100: fn count_items(items: &[Item]) -> usize {
     items.iter().map(|i| 1 + count_items(&i.children)).sum()
 }
 ```
@@ -46,13 +46,13 @@ Question: where is `fmt_tokens` used?
 
 ```
 ctsq -q 'id#fmt_tokens' src/
-src/tree.rs:45: fmt_tokens(source.len() / 4),
-src/tree.rs:55: fn fmt_tokens(n: usize) -> String {
-src/tree.rs:691: assert_eq!(fmt_tokens(907), "907");
-src/tree.rs:692: assert_eq!(fmt_tokens(3400), "3.4k");
+src/tree.rs:64: fmt_tokens(source.len() / 4),
+src/tree.rs:90: fn fmt_tokens(n: usize) -> String {
+2 matches
+hidden: 2 in tests (--tests)
 ```
 
-Each hit is `path:LINE: the source line`, so you rarely need to open the file. Add `-C 3` for three lines of context. Next: pull the function around line 45 with `ctsq -q '*function#report' --body src/tree.rs`.
+Each hit is `path:LINE: the source line`, so you rarely need to open the file. Add `-C 3` for three lines of context. The last two lines say two more hits sit in tests, which are hidden by default (example 12). Next: pull the function around line 64 with `ctsq -q '*function#report' --body src/tree.rs`.
 
 ### 4. Find where some text appears
 
@@ -61,7 +61,8 @@ Question: where does the message "valid kinds" come from?
 ```
 ctsq -q 'literal#/valid kinds/' src/compiler
 src/compiler/mod.rs:216: "unknown kind '{}' for {}, valid kinds: {}",
-src/compiler/mod.rs:1036: assert!(err.starts_with("unknown kind 'bogus' for typescript, valid kinds: "), "{}", err);
+1 match
+hidden: 1 in tests (--tests)
 ```
 
 `id#` only matches identifiers, so text inside a string needs `literal#`. Next: pull the function that line 216 sits in.
@@ -78,19 +79,22 @@ Question: what is in `src/tree.rs`, and what does `count_items` do?
 
 ```
 ctsq tree src/tree.rs
-src/tree.rs  694 lines  ~7.3k tokens  39 entries
-├── pub fn run(path: &str, lang_name: Option<&str>) {  :4
-├── pub fn report(path: &str, lang_name: Option<&str>) -> String {  :10  (42 lines)
-├── fn fmt_tokens(n: usize) -> String {  :55
-├── fn count_items(items: &[Item]) -> usize {  :63
+src/tree.rs  775 lines  ~8.2k tokens  29 entries
+├── pub struct Outline {  :5
+├── pub fn report(path: &str, lang_name: Option<&str>, hider: &mut crate::files::Hider) -> Outline {  :19  (52 lines)
+├── fn drop_scoped(items: &mut Vec<Item>, scopes: &[(usize, usize)]) -> usize {  :74  (13 lines)
+├── fn fmt_tokens(n: usize) -> String {  :90
+├── fn count_items(items: &[Item]) -> usize {  :98
 ...
+29 entries
+hidden: 13 in tests (--tests)
 ```
 
-The header gives the file size, so you know whether a whole Read is sensible. Next: pull only the entry you want.
+The header gives the file size, so you know whether a whole Read is sensible. The `mod tests` block is left out and counted on the last line. Next: pull only the entry you want.
 
 ```
 ctsq -q '*function#count_items' --body src/tree.rs
-src/tree.rs:63-65: fn count_items(items: &[Item]) -> usize {
+src/tree.rs:98-100: fn count_items(items: &[Item]) -> usize {
     items.iter().map(|i| 1 + count_items(&i.children)).sum()
 }
 ```
@@ -102,10 +106,11 @@ Question: what calls `count_items`?
 ```
 ctsq callers count_items src/
 count_items()
-├── report()  [tree.rs:10]
-│   ├── outline()  [tree.rs:616]
+├── report()  [tree.rs:19]
 ...
-└── count_items()  [tree.rs:63] (cycle)
+└── count_items()  [tree.rs:98] (cycle)
+7 callers
+hidden: 8 in tests (--tests)
 ```
 
 The tree reads upward through every level. `callees` goes down and `callgraph` shows both. Next: pull the nearest caller with `ctsq -q '*function#report' --body src/tree.rs`.
@@ -137,13 +142,13 @@ Question: what is `count_items` and how is it used?
 ctsq explain count_items src/
 SYMBOL count_items (1 definition)
 
-DEFINITION src/tree.rs:63  function
+DEFINITION src/tree.rs:98  function
 fn count_items(items: &[Item]) -> usize {
     items.iter().map(|i| 1 + count_items(&i.children)).sum()
 }
 
 CALLERS (1 level)
-  src/tree.rs:39  report()  [tree.rs:10]  let entries = count_items(&items);
+  src/tree.rs:49  report()  [tree.rs:19]  hidden.count(why, count_items(&items));
 ...
 ```
 
@@ -180,12 +185,34 @@ Question: where does the message "Cannot detect" come from? The first try used `
 ctsq -q 'id#/Cannot detect/' src/tree.rs
 no identifier matches id#/Cannot detect/ in src/tree.rs (1 file)
 found as string literal:
-src/tree.rs:24: None => { eprintln!("Cannot detect language; use --lang"); std::process::exit(1); }
+src/tree.rs:33: None => { eprintln!("Cannot detect language; use --lang"); std::process::exit(1); }
 try: ctsq -q 'string#/Cannot detect/' src/tree.rs
 [exit 1]
 ```
 
 When an `id#` query matches nothing, ctsq reruns the name as a substring (or your regex) over string literals, JSX text and comments in the same files and prints one `found as` block per kind it finds, then a `try:` line whose query matches those rows. A definition query that matches nothing, such as `*function#Server` when `Server` is a type, says `Server is defined as a type here: path:line` with a `try:` line for that kind. A path that does not exist prints `no such file: X (did you mean Y)` on stderr and the other paths still run. A query that cannot parse prints the query with a caret under the fault and exits 2. A miss exits 1. Next: run the `try:` line.
+
+### 12. Hidden tests, and how to show them
+
+Question: where is `HiddenLimit` used, tests included? Before deleting a name you need every use.
+
+```
+ctsq refs HiddenLimit fixtures/hidden
+fixtures/hidden/limit.go:5: "HiddenLimit"
+fixtures/hidden/limit.go:7: "HiddenLimit"
+2 references
+hidden: 2 in tests (--tests)
+```
+
+Test files and test scopes are hidden by default from `tree`, `-q`, `def`, `refs`, `callers`, `callees`, `explain` and `files`. Whatever a command hides is counted on a last `hidden:` line, after a count of what it showed, with the flag that brings it back. Output that hid nothing has no such lines. What counts as a test is set per language: Go `*_test.go` and `testdata/`, JS and TS `*.test.*`, `*.spec.*`, `__tests__/`, `test/`, `tests/`, `e2e/`, Python `test_*.py`, `*_test.py`, `conftest.py`, `tests/`, Ruby `*_test.rb`, `*_spec.rb`, `test/`, `spec/`, C and C++ `*_test.*`, `test_*.*`, `test/`, `tests/`, and Rust `tests/`, `mod tests` and anything under `#[cfg(test)]`. Paths are judged from the path you search, so `ctsq -q X tests/` searches inside tests/ as usual, and a file you name directly is never hidden. `ctsq config dump go` shows the table, and a repo `.ctsq/languages/go.toml` with a `[tests]` table changes it. `--exclude GLOB` hides more paths the same way, counted as `in excluded paths`. When everything matched was hidden the count line reads `0 matches` and the exit is 1. Next: add `--tests`.
+
+```
+ctsq refs HiddenLimit fixtures/hidden --tests
+fixtures/hidden/limit.go:5: "HiddenLimit"
+fixtures/hidden/limit.go:7: "HiddenLimit"
+fixtures/hidden/limit_test.go:3: "HiddenLimit"
+fixtures/hidden/limit_test.go:5: "HiddenLimit"
+```
 
 ## Reference
 
@@ -275,6 +302,10 @@ ctsq tree src/winsys.cpp
 
 Use it on a file you are **not** about to edit. For a file you are about to
 edit, Read it whole instead.
+
+Test files and test scopes (Rust `mod tests`, `#[cfg(test)]` items) are left
+out, and the run ends with a count of the entries shown and a `hidden:` line
+counting the entries left out. `--tests` keeps them.
 
 Supports C, C++, Python, JavaScript, TypeScript, Rust, Go, Ruby. Language inferred from extension; override with `--lang`.
 

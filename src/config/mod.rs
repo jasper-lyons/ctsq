@@ -120,7 +120,58 @@ const BUILTIN_MODELS: &[BuiltinModel] = &[BuiltinModel {
 const BUILTIN_LANGUAGES: &[(&str, &str)] = &[
     ("go", include_str!("../../config/languages/go.toml")),
     ("gotmpl", include_str!("../../config/languages/gotmpl.toml")),
+    ("typescript", include_str!("../../config/languages/typescript.toml")),
+    ("tsx", include_str!("../../config/languages/tsx.toml")),
+    ("javascript", include_str!("../../config/languages/javascript.toml")),
+    ("python", include_str!("../../config/languages/python.toml")),
+    ("ruby", include_str!("../../config/languages/ruby.toml")),
+    ("rust", include_str!("../../config/languages/rust.toml")),
+    ("c", include_str!("../../config/languages/c.toml")),
+    ("cpp", include_str!("../../config/languages/cpp.toml")),
 ];
+
+/// The merged `[tests]` table for `lang`: built-in, then cache, config and repo
+/// layers, higher layers winning per key. Lighter than `load_with`: no go.mod,
+/// no models, and no other table is read. A language with no file anywhere has
+/// no tests table, which is not an error.
+pub fn load_tests_with(roots: &Roots, lang: &str) -> Result<mechanics::Tests, ConfigError> {
+    let mut merged = toml::Table::new();
+    if let Some((_, text)) = BUILTIN_LANGUAGES.iter().find(|(l, _)| *l == lang) {
+        let label = format!("<built-in>/languages/{}.toml", lang);
+        if let Some(toml::Value::Table(t)) = parse_table(&label, text)?.get("tests") {
+            merge_tables(&mut merged, t);
+        }
+    }
+    if !(lang.is_empty() || lang.contains(['/', '\\']) || lang.starts_with('.')) {
+        for root in roots.ordered().into_iter().rev() {
+            let p = root.join("languages").join(format!("{}.toml", lang));
+            if p.is_file() {
+                let label = p.display().to_string();
+                if let Some(toml::Value::Table(t)) = parse_table(&label, &read(&p)?)?.get("tests") {
+                    merge_tables(&mut merged, t);
+                }
+            }
+        }
+    }
+    merged
+        .try_into()
+        .map_err(|e: toml::de::Error| ConfigError::new(&format!("languages/{}.toml", lang), None, Some("tests".into()), e.message().trim()))
+}
+
+/// `load_tests_with` with roots from the environment, cached once per repo root
+/// and language for the run.
+pub fn load_tests(repo_root: &Path, lang: &str) -> Result<mechanics::Tests, ConfigError> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<(PathBuf, String), mechanics::Tests>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (repo_root.to_path_buf(), lang.to_string());
+    if let Some(t) = cache.lock().unwrap().get(&key) {
+        return Ok(t.clone());
+    }
+    let t = load_tests_with(&Roots::from_env(repo_root), lang)?;
+    cache.lock().unwrap().insert(key, t.clone());
+    Ok(t)
+}
 
 /// Models for qualified names, first definition wins.
 #[derive(Debug, Default)]
@@ -389,7 +440,11 @@ pub fn run(args: &[String]) -> i32 {
             print!("{}", path_report(&Roots::from_env(&root)));
             0
         }
-        Some("dump") if args.len() == 2 => match load(&root, &args[1]) {
+        // The same aliases as -l, so `dump ts` reads typescript.toml.
+        Some("dump") if args.len() == 2 => match load(
+            &root,
+            crate::compiler::lang::lang_for_name_canonical(&args[1]).unwrap_or(&args[1]),
+        ) {
             Ok(cfg) => {
                 print!("{}", dump_report(&cfg));
                 0
@@ -532,6 +587,48 @@ mod tests {
         let d = tmp();
         assert!(load_with(&roots(&d), &d, "cobol").is_err());
         assert!(load_with(&roots(&d), &d, "../x").is_err());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn every_language_has_built_in_test_defaults() {
+        let d = tmp();
+        let r = roots(&d);
+        let go = load_tests_with(&r, "go").unwrap();
+        assert_eq!(go.files, vec!["*_test.go"]);
+        assert_eq!(go.dirs, vec!["testdata"]);
+        let ts = load_tests_with(&r, "typescript").unwrap();
+        assert_eq!(ts.files, vec!["*.test.*", "*.spec.*"]);
+        assert_eq!(ts.dirs, vec!["__tests__", "test", "tests", "e2e"]);
+        assert_eq!(load_tests_with(&r, "tsx").unwrap(), ts);
+        assert_eq!(load_tests_with(&r, "javascript").unwrap(), ts);
+        let py = load_tests_with(&r, "python").unwrap();
+        assert_eq!(py.files, vec!["test_*.py", "*_test.py", "conftest.py"]);
+        assert_eq!(load_tests_with(&r, "ruby").unwrap().dirs, vec!["test", "spec"]);
+        let rs = load_tests_with(&r, "rust").unwrap();
+        assert!(rs.files.is_empty());
+        assert_eq!(rs.scopes, vec!["module#tests"]);
+        assert_eq!(load_tests_with(&r, "cpp").unwrap(), load_tests_with(&r, "c").unwrap());
+        assert_eq!(load_tests_with(&r, "gotmpl").unwrap(), Default::default());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_repo_tests_table_overrides_per_key() {
+        let d = tmp();
+        write(&d.join(".ctsq/languages/go.toml"), "[tests]\ndirs = [\"fixtures\"]\n");
+        let t = load_tests_with(&roots(&d), "go").unwrap();
+        assert_eq!(t.dirs, vec!["fixtures"]);
+        assert_eq!(t.files, vec!["*_test.go"], "a key the repo leaves out keeps the built-in");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn dump_shows_the_merged_tests_table() {
+        let d = tmp();
+        let s = dump_report(&load_with(&roots(&d), &d, "typescript").unwrap());
+        assert!(s.contains("[tests]\n"), "{}", s);
+        assert!(s.contains("\"*.spec.*\""), "{}", s);
         std::fs::remove_dir_all(&d).ok();
     }
 

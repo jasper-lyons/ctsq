@@ -250,12 +250,17 @@ pub fn resolver_for(lang_name: &str) -> Box<dyn Resolver> {
 /// call-graph definition index first, then the `tree` outline. The index only
 /// holds callable definitions, so without the outline step a struct, class,
 /// type alias or top-level variable resolved by `explain` reported nothing here.
-pub fn run_def(expr: &str, path: &str, lang_name: Option<&str>, no_ignore: bool) {
+pub fn run_def(expr: &str, path: &str, lang_name: Option<&str>, no_ignore: bool, hide: &crate::files::HideOpts) {
     let jobs = crate::files::resolve_jobs(path, lang_name, no_ignore);
     let mut all_names: Vec<String> = Vec::new();
     let rows = def_rows(expr, &jobs, &mut all_names);
+    let found_any = !rows.is_empty();
+    let mut hider = crate::files::Hider::new(hide);
+    hider.add_jobs(path, &jobs);
+    let mut hidden = crate::footer::Hidden::default();
+    let rows = hider.keep(rows, |(f, l, _)| (f.clone(), *l), &mut hidden);
 
-    if rows.is_empty() {
+    if !found_any {
         println!(
             "no definition for '{}' in {} ({} files scanned)",
             expr,
@@ -269,6 +274,7 @@ pub fn run_def(expr: &str, path: &str, lang_name: Option<&str>, no_ignore: bool)
         std::process::exit(1);
     }
 
+    let shown = rows.len();
     for (file, line, conf) in rows {
         let line_text = std::fs::read_to_string(&file)
             .ok()
@@ -276,6 +282,11 @@ pub fn run_def(expr: &str, path: &str, lang_name: Option<&str>, no_ignore: bool)
             .unwrap_or_default();
         let mark = if conf == Confidence::Guess { "  ?" } else { "" };
         println!("{}:{}: {}{}", file, line, line_text, mark);
+    }
+    // Every definition hidden: the footer says where they are, and exit 1.
+    print!("{}", crate::footer::footer(shown, "definition", &hidden));
+    if shown == 0 {
+        std::process::exit(1);
     }
 }
 

@@ -7,6 +7,7 @@
 //! query for everything left over. Those parts keep their own behaviour.
 
 use crate::calltree::short_path;
+use crate::footer::{footer, Hidden};
 use crate::compiler::{self, lang};
 use crate::files;
 use crate::resolve::graph::{self, CallGraph, NodeKey};
@@ -29,25 +30,54 @@ impl Default for Options {
     }
 }
 
-pub fn run(symbol: &str, path: &str, lang_name: Option<&str>, opts: &Options, no_ignore: bool) {
+pub fn run(symbol: &str, path: &str, lang_name: Option<&str>, opts: &Options, no_ignore: bool, hide: &files::HideOpts) {
     let jobs = files::resolve_jobs(path, lang_name, no_ignore);
-    print!("{}", report(symbol, &jobs, opts));
+    let mut hider = files::Hider::new(hide);
+    hider.add_jobs(path, &jobs);
+    print!("{}", report_hiding(symbol, &jobs, opts, &mut hider));
 }
 
 // ── Report ───────────────────────────────────────────────────────────────────
 
-/// Build the whole report as text. Split out from `run` so tests can assert on
-/// it without capturing stdout.
+/// Build the whole report as text, hiding nothing. Split out from `run` so
+/// tests can assert on it without capturing stdout.
+#[cfg(test)]
 pub fn report(symbol: &str, jobs: &[(String, &'static str)], opts: &Options) -> String {
+    report_hiding(symbol, jobs, opts, &mut files::Hider::none())
+}
+
+/// `report` with the definitions, callers and references `hider` hides left
+/// out, and the footer counting them at the end. The call graph is still built
+/// over every file, so hiding a test never changes how a call resolves.
+pub fn report_hiding(
+    symbol: &str,
+    jobs: &[(String, &'static str)],
+    opts: &Options,
+    hider: &mut files::Hider,
+) -> String {
+    let mut hidden = Hidden::default();
+    let mut out = body(symbol, jobs, opts, hider, &mut hidden);
+    let shown = out.matches("\nDEFINITION ").count();
+    out.push_str(&footer(shown, "definition", &hidden));
+    out
+}
+
+fn body(
+    symbol: &str,
+    jobs: &[(String, &'static str)],
+    opts: &Options,
+    hider: &mut files::Hider,
+    hidden: &mut Hidden,
+) -> String {
     let mut out = String::new();
     let mut lines = LineCache::default();
 
     let g = graph::build(jobs);
-    let sites = definition_sites(symbol, &g, jobs);
+    let sites = hider.keep(definition_sites(symbol, &g, jobs), |s| (s.file.clone(), s.line), hidden);
 
     if sites.is_empty() {
         out.push_str(&format!("SYMBOL {} (no definition resolved)\n", symbol));
-        push_reference_list(&mut out, symbol, jobs, opts, &mut lines);
+        push_reference_list(&mut out, symbol, jobs, opts, hider, hidden);
         return out;
     }
 
@@ -116,12 +146,17 @@ pub fn report(symbol: &str, jobs: &[(String, &'static str)], opts: &Options) -> 
     let mut caller_keys = keys.clone();
     caller_keys.push(NodeKey::External(bare_name(symbol).to_string()));
 
-    push_walk(&mut out, "CALLERS", Direction::Up, &g, &caller_keys, opts, &mut lines, &mut listed);
-    push_walk(&mut out, "CALLEES", Direction::Down, &g, &keys, opts, &mut lines, &mut listed);
+    {
+        let mut ctx = WalkCtx { lines: &mut lines, listed: &mut listed, hider: &mut *hider, hidden: &mut *hidden };
+        push_walk(&mut out, "CALLERS", Direction::Up, &g, &caller_keys, opts, &mut ctx);
+        push_walk(&mut out, "CALLEES", Direction::Down, &g, &keys, opts, &mut ctx);
+    }
 
-    let remaining = references(symbol, jobs)
+    let remaining: Vec<_> = references(symbol, jobs)
         .into_iter()
-        .filter(|(file, line, _)| !listed.contains(&(file.clone(), *line)));
+        .filter(|(file, line, _)| !listed.contains(&(file.clone(), *line)))
+        .collect();
+    let remaining = hider.keep(remaining, |(f, l, _)| (f.clone(), *l), hidden);
     let mut by_file: BTreeMap<String, usize> = BTreeMap::new();
     let mut total = 0usize;
     for (file, _, _) in remaining {
@@ -267,7 +302,15 @@ enum Direction {
     Down,
 }
 
-#[allow(clippy::too_many_arguments)]
+/// What a walk carries down: the source line cache, the file:line pairs shown
+/// so far, and what is hidden.
+struct WalkCtx<'a> {
+    lines: &'a mut LineCache,
+    listed: &'a mut HashSet<(String, usize)>,
+    hider: &'a mut files::Hider,
+    hidden: &'a mut Hidden,
+}
+
 fn push_walk(
     out: &mut String,
     heading: &str,
@@ -275,8 +318,7 @@ fn push_walk(
     g: &CallGraph,
     roots: &[NodeKey],
     opts: &Options,
-    lines: &mut LineCache,
-    listed: &mut HashSet<(String, usize)>,
+    ctx: &mut WalkCtx,
 ) {
     let levels = if opts.depth == 1 { "1 level".to_string() } else { format!("{} levels", opts.depth) };
     out.push_str(&format!("\n{} ({})\n", heading, levels));
@@ -289,7 +331,7 @@ fn push_walk(
         }
         let mut visited: HashSet<NodeKey> = HashSet::new();
         visited.insert(root.clone());
-        walk(out, dir, g, root, 0, opts.depth, 1, &mut visited, lines, listed);
+        walk(out, dir, g, root, 0, opts.depth, 1, &mut visited, ctx);
     }
     if out.len() == before {
         out.push_str("  (none)\n");
@@ -308,8 +350,7 @@ fn walk(
     max_depth: usize,
     indent: usize,
     visited: &mut HashSet<NodeKey>,
-    lines: &mut LineCache,
-    listed: &mut HashSet<(String, usize)>,
+    ctx: &mut WalkCtx,
 ) {
     if depth >= max_depth {
         return;
@@ -351,18 +392,20 @@ fn walk(
     }
     rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
     rows.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
+    // A call written in a test is hidden with everything above it.
+    let rows = ctx.hider.keep(rows, |r| (r.0.clone(), r.1), ctx.hidden);
 
     for (site_file, site_line, name, loc, guess, next) in rows {
-        listed.insert((site_file.clone(), site_line));
+        ctx.listed.insert((site_file.clone(), site_line));
         let where_defined = match &loc {
             Some((f, l)) => {
-                listed.insert((f.clone(), *l));
+                ctx.listed.insert((f.clone(), *l));
                 format!("[{}:{}]", short_path(f), l)
             }
             None => "[external]".to_string(),
         };
         let cycle = next.as_ref().map_or(false, |k| visited.contains(k));
-        let text = lines.text(&site_file, site_line);
+        let text = ctx.lines.text(&site_file, site_line);
         out.push_str(&format!(
             "{}{}:{}  {}()  {}{}{}  {}\n",
             "  ".repeat(indent),
@@ -377,7 +420,7 @@ fn walk(
         if let Some(next_key) = next {
             if !cycle {
                 visited.insert(next_key.clone());
-                walk(out, dir, g, &next_key, depth + 1, max_depth, indent + 1, visited, lines, listed);
+                walk(out, dir, g, &next_key, depth + 1, max_depth, indent + 1, visited, ctx);
                 visited.remove(&next_key);
             }
         }
@@ -420,9 +463,10 @@ fn push_reference_list(
     symbol: &str,
     jobs: &[(String, &'static str)],
     opts: &Options,
-    _lines: &mut LineCache,
+    hider: &mut files::Hider,
+    hidden: &mut Hidden,
 ) {
-    let refs = references(symbol, jobs);
+    let refs = hider.keep(references(symbol, jobs), |(f, l, _)| (f.clone(), *l), hidden);
     out.push_str(&format!("\nREFERENCES ({})\n", refs.len()));
     for (file, line, text) in refs.iter().take(opts.max_lines) {
         out.push_str(&format!("  {}:{}  {}\n", file, line, text));

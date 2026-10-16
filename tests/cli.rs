@@ -429,3 +429,122 @@ fn the_types_table_lists_the_new_aliases() {
     let call = text.lines().find(|l| l.trim_start().starts_with("call ")).unwrap();
     assert!(call.contains("call_expression"), "call is mapped, not empty: {}", call);
 }
+
+// ── Hidden tests and the footer ───────────────────────────────────────────────
+
+#[test]
+fn refs_hides_test_callers_and_counts_them_in_the_footer() {
+    let dir = fixture("hidden");
+    let out = ctsq(&["refs", "HiddenLimit", &dir]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!text.contains("limit_test.go"), "{}", text);
+    assert!(text.ends_with("2 references\nhidden: 2 in tests (--tests)\n"), "{}", text);
+
+    let all = stdout(&ctsq(&["refs", "HiddenLimit", &dir, "--tests"]));
+    assert!(all.contains("limit_test.go:3:"), "{}", all);
+    assert!(!all.contains("hidden:"), "nothing hidden, no footer: {}", all);
+}
+
+#[test]
+fn a_query_hides_rust_test_scopes() {
+    let out = ctsq(&["-q", "id#HIDDEN_MAX", &fixture("hidden")]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(text.contains("lib.rs:4: HIDDEN_MAX"), "{}", text);
+    assert!(!text.contains("lib.rs:8:") && !text.contains("lib.rs:15:"), "{}", text);
+    assert!(text.ends_with("2 matches\nhidden: 3 in tests (--tests)\n"), "{}", text);
+}
+
+#[test]
+fn a_query_whose_only_matches_are_hidden_prints_the_footer_and_exits_1() {
+    let out = ctsq(&["-q", "id#limitSeen", &fixture("hidden")]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stdout(&out), "0 matches\nhidden: 1 in tests (--tests)\n");
+    let shown = ctsq(&["-q", "id#limitSeen", &fixture("hidden"), "--tests"]);
+    assert!(shown.status.success(), "{}", stdout(&shown));
+}
+
+#[test]
+fn a_test_file_named_directly_is_never_hidden() {
+    let f = fixture("hidden/limit_test.go");
+    let out = ctsq(&["-q", "id#limitSeen", &f]);
+    assert!(out.status.success(), "{}", stdout(&out));
+    assert_eq!(stdout(&out), format!("{}:3: var limitSeen = HiddenLimit\n", f));
+}
+
+#[test]
+fn output_that_hides_nothing_has_no_footer() {
+    let text = stdout(&ctsq(&["-q", "id#NewServer", &fixture("example.go")]));
+    assert!(!text.contains("hidden:") && !text.contains("matches"), "{}", text);
+    let tree = stdout(&ctsq(&["tree", &fixture("example.go")]));
+    assert!(!tree.contains("hidden:"), "{}", tree);
+}
+
+#[test]
+fn exclude_hides_paths_and_names_its_own_reason() {
+    let out = ctsq(&["-q", "id#HiddenLimit", &fixture("hidden"), "--exclude", "limit.go"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        stdout(&out),
+        "0 matches\nhidden: 2 in tests (--tests), 2 in excluded paths (drop --exclude)\n"
+    );
+}
+
+#[test]
+fn tree_leaves_out_test_scopes_and_sums_the_count_once() {
+    let out = ctsq(&["tree", &fixture("hidden")]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!text.contains("mod tests") && !text.contains("HIDDEN_DOUBLE"), "{}", text);
+    assert!(!text.contains("limit_test.go"), "{}", text);
+    assert!(text.ends_with("2 entries\nhidden: 3 in tests (--tests)\n"), "{}", text);
+    assert_eq!(text.matches("hidden:").count(), 1, "{}", text);
+    let all = stdout(&ctsq(&["tree", &fixture("hidden"), "--tests"]));
+    assert!(all.contains("mod tests {") && all.contains("limit_test.go"), "{}", all);
+}
+
+#[test]
+fn def_and_files_hide_tests_too() {
+    let dir = fixture("hidden");
+    let def = ctsq(&["def", "max_is_three", &dir]);
+    assert_eq!(def.status.code(), Some(1));
+    assert_eq!(stdout(&def), "0 definitions\nhidden: 1 in tests (--tests)\n");
+    assert!(stdout(&ctsq(&["def", "max_is_three", &dir, "--tests"])).contains("lib.rs:14:"));
+
+    let files = ctsq(&["files", "-q", "id#HiddenLimit", "-q", "id#limitSeen", &dir]);
+    assert_eq!(files.status.code(), Some(1));
+    assert_eq!(stdout(&files), "0 files\nhidden: 1 in tests (--tests)\n");
+}
+
+#[test]
+fn callers_and_explain_hide_a_caller_written_in_a_test() {
+    let d = std::env::temp_dir().join(format!("ctsq-cli-callers-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(
+        d.join("calc.go"),
+        "package calc\n\nfunc Add(a, b int) int { return a + b }\n\nfunc Twice(a int) int { return Add(a, a) }\n",
+    )
+    .unwrap();
+    std::fs::write(d.join("calc_test.go"), "package calc\n\nfunc TestAdd() { Add(1, 2) }\n").unwrap();
+    let dir = d.to_str().unwrap();
+    let text = stdout(&ctsq(&["callers", "Add", dir]));
+    assert!(text.contains("Twice()") && !text.contains("TestAdd"), "{}", text);
+    assert!(text.ends_with("1 caller\nhidden: 1 in tests (--tests)\n"), "{}", text);
+    let all = stdout(&ctsq(&["callers", "Add", dir, "--tests"]));
+    assert!(all.contains("TestAdd()") && !all.contains("hidden:"), "{}", all);
+    let explain = stdout(&ctsq(&["explain", "Add", dir]));
+    assert!(!explain.contains("TestAdd"), "{}", explain);
+    assert!(explain.ends_with("1 definition\nhidden: 2 in tests (--tests)\n"), "{}", explain);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn config_dump_takes_the_lang_aliases_and_shows_tests() {
+    let out = ctsq(&["config", "dump", "ts"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.starts_with("language: typescript\n"), "{}", text);
+    assert!(text.contains("[tests]\nfiles = [\"*.test.*\", \"*.spec.*\"]\n"), "{}", text);
+}

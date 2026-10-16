@@ -3,6 +3,7 @@ mod cooccur;
 mod example;
 mod explain;
 mod files;
+mod footer;
 mod miss;
 mod query;
 mod runner;
@@ -73,6 +74,13 @@ OUTPUT
   Y)` on stderr and the other paths still run. A query that does not parse
   prints the query with a caret under the fault and exits 2.
 
+  Test files and test scopes (such as Rust mod tests) are hidden from tree, -q,
+  def, refs, callers, callees, explain and files. Output that hid something
+  ends with a count of what it showed and a hidden: line naming each count and
+  the flag that shows it, such as `hidden: 2 in tests (--tests)`. --exclude GLOB
+  hides more paths, judged from the searched path. A file named directly is
+  never hidden. When every match was hidden the count reads 0 and the exit is 1.
+
   -C N (--context N) adds N source lines either side of each match, like
   grep -C: matched lines keep path:LINE:, context lines use path-LINE-, groups
   are separated by --, and lines keep their indentation. Not valid with --node.
@@ -95,6 +103,9 @@ EXAMPLES (a question as a comment, the call, then the next call)
   ctsq -q 'comment#/shebang/' src/files.rs
   # A wrong path is named on stderr and the other paths still run.
   ctsq -q 'id#fmt_tokens' src/tre.rs src/tree.rs
+  # Tests are hidden and counted on a last line. Show them, or hide more paths.
+  ctsq refs HiddenLimit fixtures/hidden --tests
+  ctsq tree src/ --exclude semantic
   # Who calls it? Which files mention both names?
   ctsq callers count_items src/
   ctsq files -q 'id#DefIndex' -q 'id#CallGraph' src/
@@ -192,6 +203,14 @@ struct Cli {
     /// Ignore .gitignore and .ignore files (search all files)
     #[arg(long, global = true)]
     no_ignore: bool,
+
+    /// Show test files and test scopes, which are hidden by default and counted in the footer
+    #[arg(long, global = true)]
+    tests: bool,
+
+    /// Hide paths matching GLOB, judged relative to the search root (repeatable)
+    #[arg(long, global = true, value_name = "GLOB")]
+    exclude: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -455,11 +474,12 @@ fn reset_sigpipe() {}
 fn main() {
     reset_sigpipe();
     let cli = Cli::parse();
+    let hide = files::HideOpts { tests: cli.tests, exclude: cli.exclude.clone() };
 
     match cli.command {
         Some(Commands::Explain { symbol, path, depth, max_lines, no_body }) => {
             let opts = explain::Options { depth, max_lines, no_body };
-            explain::run(&symbol, &path, cli.lang.as_deref(), &opts, cli.no_ignore);
+            explain::run(&symbol, &path, cli.lang.as_deref(), &opts, cli.no_ignore, &hide);
             return;
         }
         Some(Commands::Tree { paths, body }) => {
@@ -467,25 +487,45 @@ fn main() {
                 eprintln!("tree has no --body, use ctsq -q '*function#Name' --body FILE");
                 std::process::exit(2);
             }
-            let jobs: Vec<_> = paths.iter()
-                .flat_map(|p| files::resolve_jobs_lenient(p, cli.lang.as_deref(), cli.no_ignore))
-                .collect();
+            let mut hider = files::Hider::new(&hide);
+            let mut jobs = Vec::new();
+            for p in &paths {
+                let found = files::resolve_jobs_lenient(p, cli.lang.as_deref(), cli.no_ignore);
+                hider.add_jobs(p, &found);
+                jobs.extend(found);
+            }
             if jobs.is_empty() {
                 std::process::exit(1);
             }
-            let multiple = jobs.len() > 1;
-            for (i, (file, lang_name)) in jobs.iter().enumerate() {
-                if multiple && i > 0 { println!(); }
-                tree::run(file, Some(lang_name));
+            // Each file is outlined on its own. The hidden counts are summed
+            // here and printed once, after the last file (BUILD.md A11).
+            let mut hidden = footer::Hidden::default();
+            let mut entries = 0usize;
+            let mut printed = 0usize;
+            for (file, lang_name) in &jobs {
+                let outline = tree::report(file, Some(lang_name), &mut hider);
+                hidden.tests += outline.hidden.tests;
+                hidden.excluded += outline.hidden.excluded;
+                if outline.text.is_empty() {
+                    continue;
+                }
+                if printed > 0 { println!(); }
+                printed += 1;
+                entries += outline.entries;
+                print!("{}", outline.text);
+            }
+            print!("{}", footer::footer(entries, "entry", &hidden));
+            if printed == 0 {
+                std::process::exit(1);
             }
             return;
         }
         Some(Commands::Callers { function, path, depth }) => {
-            calltree::callers(&function, &path, cli.lang.as_deref(), depth, cli.no_ignore);
+            calltree::callers(&function, &path, cli.lang.as_deref(), depth, cli.no_ignore, &hide);
             return;
         }
         Some(Commands::Callees { function, path, depth }) => {
-            calltree::callees(&function, &path, cli.lang.as_deref(), depth, cli.no_ignore);
+            calltree::callees(&function, &path, cli.lang.as_deref(), depth, cli.no_ignore, &hide);
             return;
         }
         Some(Commands::Callgraph { path, format }) => {
@@ -493,15 +533,15 @@ fn main() {
             return;
         }
         Some(Commands::Files { query, path }) => {
-            cooccur::run(&query, &path, cli.lang.as_deref(), cli.no_ignore);
+            cooccur::run(&query, &path, cli.lang.as_deref(), cli.no_ignore, &hide);
             return;
         }
         Some(Commands::Def { name_or_expr, path }) => {
-            resolve::run_def(&name_or_expr, &path, cli.lang.as_deref(), cli.no_ignore);
+            resolve::run_def(&name_or_expr, &path, cli.lang.as_deref(), cli.no_ignore, &hide);
             return;
         }
         Some(Commands::Refs { name, path }) => {
-            run_refs(&name, &path, cli.lang.as_deref(), cli.no_ignore);
+            run_refs(&name, &path, cli.lang.as_deref(), cli.no_ignore, &hide);
             return;
         }
         Some(Commands::Imports { file, path, depth }) => {
@@ -632,6 +672,7 @@ fn main() {
     };
 
     let mut jobs: Vec<(String, &'static str)> = Vec::new();
+    let mut hider = files::Hider::new(&hide);
     for path in effective_files {
         if path == "-" {
             let lang_name = match &cli.lang {
@@ -655,8 +696,13 @@ fn main() {
         if files_from_stdin && std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false) {
             continue;
         }
-        jobs.extend(files::resolve_jobs_lenient(path, cli.lang.as_deref(), cli.no_ignore));
+        let found = files::resolve_jobs_lenient(path, cli.lang.as_deref(), cli.no_ignore);
+        // Paths piped on stdin were not named on the command line, so they are
+        // judged from the current directory.
+        hider.add_jobs(if files_from_stdin { "." } else { path }, &found);
+        jobs.extend(found);
     }
+    let mut hidden = footer::Hidden::default();
 
     let multiple = jobs.len() > 1;
     let mut total_matches = 0usize;
@@ -726,7 +772,8 @@ fn main() {
         let display = if file == "-" { "<stdin>" } else { file.as_str() };
 
         let result = runner::run_rows(compiled, lang_box.as_ref(), &source, cli.body).map(|rows| {
-            semantic::attrs::filter_rows(rows, &attrs, lang_name, &lang_box.ts_language(), &source)
+            let rows = semantic::attrs::filter_rows(rows, &attrs, lang_name, &lang_box.ts_language(), &source);
+            hide_rows(&mut hider, file, &source, rows, true, &mut hidden)
         });
         match result {
             Ok(rows) if rows.is_empty() => {
@@ -768,15 +815,68 @@ fn main() {
         }
     }
 
-    if total_matches == 0 {
+    // A query whose only matches were hidden prints the footer, not a miss
+    // report, so the reader sees what is hidden and how to show it.
+    if total_matches == 0 && !hidden.any() {
         let where_ = if files_from_stdin {
             "the files on stdin".to_string()
         } else {
             effective_files.join(" ")
         };
-        print!("{}", miss::report_for(&ast, query_str, &where_, &jobs));
+        let shown: Vec<(String, &'static str)> =
+            jobs.iter().filter(|(f, _)| hider.file(f).is_none()).cloned().collect();
+        print!("{}", miss::report_for(&ast, query_str, &where_, &shown));
         std::process::exit(1);
     }
+    print!("{}", footer::footer(total_matches, "match", &hidden));
+    if total_matches == 0 {
+        std::process::exit(1);
+    }
+}
+
+/// Drop the rows `hider` hides, counting them in `hidden`. With `per_line` a
+/// hidden row counts once per line, the way `-q` prints one line per match.
+/// Without it every row counts, the way `refs` prints every row.
+fn hide_rows(
+    hider: &mut files::Hider,
+    file: &str,
+    source: &[u8],
+    rows: Vec<runner::MatchRow>,
+    per_line: bool,
+    hidden: &mut footer::Hidden,
+) -> Vec<runner::MatchRow> {
+    if rows.is_empty() {
+        return rows;
+    }
+    let count = |cut: &[usize]| {
+        if per_line {
+            cut.iter().collect::<std::collections::HashSet<_>>().len()
+        } else {
+            cut.len()
+        }
+    };
+    if let Some(why) = hider.file(file) {
+        let lines: Vec<usize> = rows.iter().map(|r| r.line).collect();
+        hidden.count(why, count(&lines));
+        return vec![];
+    }
+    let scopes = hider.scope_lines(file, Some(source));
+    if scopes.is_empty() {
+        return rows;
+    }
+    let mut cut = Vec::new();
+    let kept = rows
+        .into_iter()
+        .filter(|r| {
+            let inside = scopes.iter().any(|(a, b)| *a <= r.line && r.line <= *b);
+            if inside {
+                cut.push(r.line);
+            }
+            !inside
+        })
+        .collect();
+    hidden.count(files::Hide::Test, count(&cut));
+    kept
 }
 
 /// `-C N` output, modelled on grep -C: every match prints with the N source
@@ -862,7 +962,7 @@ fn with_path(display: &str, node_text: &str) -> String {
     }
 }
 
-fn run_refs(name: &str, path: &str, lang_override: Option<&str>, no_ignore: bool) {
+fn run_refs(name: &str, path: &str, lang_override: Option<&str>, no_ignore: bool, hide: &files::HideOpts) {
     let query_str = format!("id#{}", name);
     let ast = match query::parse(&query_str) {
         Ok(q) => q,
@@ -873,6 +973,10 @@ fn run_refs(name: &str, path: &str, lang_override: Option<&str>, no_ignore: bool
     if jobs.is_empty() {
         return;
     }
+    let mut hider = files::Hider::new(hide);
+    hider.add_jobs(path, &jobs);
+    let mut hidden = footer::Hidden::default();
+    let mut shown = 0usize;
     let mut compiled_cache: HashMap<&'static str, (Box<dyn lang::Lang>, compiler::CompiledQuery)> =
         HashMap::new();
 
@@ -886,14 +990,19 @@ fn run_refs(name: &str, path: &str, lang_override: Option<&str>, no_ignore: bool
             Ok(s) => s,
             Err(e) => { eprintln!("Failed to read {}: {}", file, e); continue; }
         };
-        match runner::run(compiled, lang_box.as_ref(), &source, false) {
-            Ok(matches) => {
-                for m in &matches {
-                    println!("{}", with_path(file, m));
+        match runner::run_rows(compiled, lang_box.as_ref(), &source, false) {
+            Ok(rows) => {
+                for r in &hide_rows(&mut hider, file, &source, rows, false, &mut hidden) {
+                    shown += 1;
+                    println!("{}", with_path(file, &r.node_text));
                 }
             }
             Err(e) => eprintln!("Runner error in {}: {}", file, e),
         }
+    }
+    print!("{}", footer::footer(shown, "reference", &hidden));
+    if shown == 0 && hidden.any() {
+        std::process::exit(1);
     }
 }
 

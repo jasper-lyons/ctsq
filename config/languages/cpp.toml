@@ -1,0 +1,4 @@
+[tests]
+files  = ["*_test.*", "test_*.*"]
+dirs   = ["test", "tests"]
+scopes = []

@@ -1,0 +1,4 @@
+[tests]
+files  = ["test_*.py", "*_test.py", "conftest.py"]
+dirs   = ["tests"]
+scopes = []

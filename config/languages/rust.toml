@@ -1,0 +1,5 @@
+[tests]
+files  = []
+dirs   = ["tests"]
+# Items under #[cfg(test)] are found in code as well.
+scopes = ["module#tests"]

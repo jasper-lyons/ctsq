@@ -1,61 +1,93 @@
 use crate::files;
+use crate::footer::{footer, Hidden};
 use crate::resolve::graph::{self, CallGraph, NodeKey};
 use crate::resolve::Confidence;
 use std::collections::HashSet;
 
 // ── Public entry points ───────────────────────────────────────────────────────
 
-pub fn callees(function: &str, path: &str, lang_name: Option<&str>, max_depth: usize, no_ignore: bool) {
+pub fn callees(function: &str, path: &str, lang_name: Option<&str>, max_depth: usize, no_ignore: bool, hide: &files::HideOpts) {
+    run(Direction::Down, function, path, lang_name, max_depth, no_ignore, hide);
+}
+
+pub fn callers(function: &str, path: &str, lang_name: Option<&str>, max_depth: usize, no_ignore: bool, hide: &files::HideOpts) {
+    run(Direction::Up, function, path, lang_name, max_depth, no_ignore, hide);
+}
+
+fn run(dir: Direction, function: &str, path: &str, lang_name: Option<&str>, max_depth: usize, no_ignore: bool, hide: &files::HideOpts) {
     let jobs = files::resolve_jobs(path, lang_name, no_ignore);
-    let g = graph::build(&jobs);
-    let roots = g.index.by_name.get(function).cloned().unwrap_or_default();
-    if roots.is_empty() {
-        println!("{}()", function);
-        return;
-    }
-    let multiple = roots.len() > 1;
-    for (i, &r) in roots.iter().enumerate() {
-        if i > 0 { println!(); }
-        let id = g.index.defs[r].id.clone();
-        if multiple {
-            println!("{}()  [{}:{}]", function, short_path(&id.file), id.line);
-        } else {
-            println!("{}()", function);
-        }
-        let key = NodeKey::Def(id);
-        let mut visited = HashSet::new();
-        visited.insert(key.clone());
-        walk_down(&g, &key, max_depth, 0, "", &mut visited);
+    let mut hider = files::Hider::new(hide);
+    hider.add_jobs(path, &jobs);
+    let (text, code) = report(dir, function, &jobs, max_depth, &mut hider);
+    print!("{}", text);
+    if code != 0 {
+        std::process::exit(code);
     }
 }
 
-pub fn callers(function: &str, path: &str, lang_name: Option<&str>, max_depth: usize, no_ignore: bool) {
-    let jobs = files::resolve_jobs(path, lang_name, no_ignore);
-    let g = graph::build(&jobs);
-    let roots = g.index.by_name.get(function).cloned().unwrap_or_default();
-    if roots.is_empty() {
-        // external/undefined name — its callers are still in the graph
-        println!("{}()", function);
-        let key = NodeKey::External(function.to_string());
-        let mut visited = HashSet::new();
-        visited.insert(key.clone());
-        walk_up(&g, &key, max_depth, 0, "", &mut visited);
-        return;
+#[derive(Clone, Copy, PartialEq)]
+pub enum Direction {
+    /// `callers`: walk up the call chain.
+    Up,
+    /// `callees`: walk down it.
+    Down,
+}
+
+/// The whole `callers` or `callees` tree as text, with the footer when
+/// something was hidden, and the exit code: 1 when every row was hidden.
+///
+/// The call graph is built over every file, so a test never changes how a call
+/// resolves. A definition of `function` that sits in a test is left out as a
+/// root, and a row whose call is written in a test is left out with everything
+/// above it. Each one counts once in the footer.
+pub fn report(
+    dir: Direction,
+    function: &str,
+    jobs: &[(String, &'static str)],
+    max_depth: usize,
+    hider: &mut files::Hider,
+) -> (String, i32) {
+    let g = graph::build(jobs);
+    let mut w = Walk { g: &g, max_depth, out: String::new(), shown: 0, hider, hidden: Hidden::default() };
+    let all_roots = g.index.by_name.get(function).cloned().unwrap_or_default();
+    let had_roots = !all_roots.is_empty();
+    let roots = w.hider.keep(
+        all_roots,
+        |&r| (g.index.defs[r].id.file.clone(), g.index.defs[r].id.line),
+        &mut w.hidden,
+    );
+    if !had_roots {
+        w.out.push_str(&format!("{}()\n", function));
+        if dir == Direction::Up {
+            // external/undefined name: its callers are still in the graph
+            let key = NodeKey::External(function.to_string());
+            let mut visited = HashSet::new();
+            visited.insert(key.clone());
+            w.up(&key, 0, "", &mut visited);
+        }
     }
     let multiple = roots.len() > 1;
     for (i, &r) in roots.iter().enumerate() {
-        if i > 0 { println!(); }
+        if i > 0 { w.out.push('\n'); }
         let id = g.index.defs[r].id.clone();
         if multiple {
-            println!("{}()  [{}:{}]", function, short_path(&id.file), id.line);
+            w.out.push_str(&format!("{}()  [{}:{}]\n", function, short_path(&id.file), id.line));
         } else {
-            println!("{}()", function);
+            w.out.push_str(&format!("{}()\n", function));
         }
         let key = NodeKey::Def(id);
         let mut visited = HashSet::new();
         visited.insert(key.clone());
-        walk_up(&g, &key, max_depth, 0, "", &mut visited);
+        match dir {
+            Direction::Up => w.up(&key, 0, "", &mut visited),
+            Direction::Down => w.down(&key, 0, "", &mut visited),
+        }
     }
+    let noun = if dir == Direction::Up { "caller" } else { "callee" };
+    let code = if w.shown == 0 && w.hidden.any() { 1 } else { 0 };
+    let mut out = w.out;
+    out.push_str(&footer(w.shown, noun, &w.hidden));
+    (out, code)
 }
 
 pub fn callgraph(path: &str, lang_name: Option<&str>, no_ignore: bool, format: &str) {
@@ -121,72 +153,89 @@ pub(crate) fn collect_edges(g: &CallGraph) -> Vec<(String, String, String, Strin
 
 // ── Tree walkers ──────────────────────────────────────────────────────────────
 
-fn walk_down(
-    g: &CallGraph,
-    key: &NodeKey,
+/// One `callers` or `callees` walk: the rows printed so far and what was hidden.
+struct Walk<'a> {
+    g: &'a CallGraph,
     max_depth: usize,
-    depth: usize,
-    prefix: &str,
-    visited: &mut HashSet<NodeKey>,
-) {
-    if depth >= max_depth { return; }
-    let Some(edges) = g.fwd.get(key) else { return };
-    let n = edges.len();
-    for (i, &e) in edges.iter().enumerate() {
-        let rc = &g.calls[e];
-        let is_last = i == n - 1;
-        let connector = if is_last { "└── " } else { "├── " };
-        match rc.target {
-            Some((t, conf)) => {
-                let d = &g.index.defs[t];
-                let mark = if conf == Confidence::Guess { " ?" } else { "" };
-                let loc = format!("[{}:{}]", short_path(&d.id.file), d.id.line);
-                let tk = NodeKey::Def(d.id.clone());
-                if visited.contains(&tk) {
-                    println!("{}{}{}()  {}{} (cycle)", prefix, connector, rc.callee_display, loc, mark);
-                } else {
-                    println!("{}{}{}()  {}{}", prefix, connector, rc.callee_display, loc, mark);
-                    visited.insert(tk.clone());
-                    let child_prefix = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
-                    walk_down(g, &tk, max_depth, depth + 1, &child_prefix, visited);
-                    visited.remove(&tk);
-                }
-            }
-            None => println!("{}{}{}()", prefix, connector, rc.callee_display),
-        }
-    }
+    out: String,
+    shown: usize,
+    hider: &'a mut files::Hider,
+    hidden: Hidden,
 }
 
-fn walk_up(
-    g: &CallGraph,
-    key: &NodeKey,
-    max_depth: usize,
-    depth: usize,
-    prefix: &str,
-    visited: &mut HashSet<NodeKey>,
-) {
-    if depth >= max_depth { return; }
-    let Some(edges) = g.rev.get(key) else { return };
-    let n = edges.len();
-    for (i, &e) in edges.iter().enumerate() {
-        let rc = &g.calls[e];
-        let d = &g.index.defs[rc.caller];
-        let is_last = i == n - 1;
-        let connector = if is_last { "└── " } else { "├── " };
-        let mark = match rc.target {
-            Some((_, Confidence::Guess)) => " ?",
-            _ => "",
-        };
-        let loc = format!("[{}:{}]", short_path(&d.id.file), d.id.line);
-        let tk = NodeKey::Def(d.id.clone());
-        if visited.contains(&tk) {
-            println!("{}{}{}()  {}{} (cycle)", prefix, connector, d.name, loc, mark);
-        } else {
-            println!("{}{}{}()  {}{}", prefix, connector, d.name, loc, mark);
-            visited.insert(tk.clone());
-            let child_prefix = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
-            walk_up(g, &tk, max_depth, depth + 1, &child_prefix, visited);
-            visited.remove(&tk);
+impl Walk<'_> {
+    /// The edges whose call is not written in a hidden place.
+    fn visible(&mut self, edges: &[usize]) -> Vec<usize> {
+        let g = self.g;
+        self.hider.keep(
+            edges.to_vec(),
+            |&e| {
+                let rc = &g.calls[e];
+                (g.index.defs[rc.caller].id.file.clone(), rc.line)
+            },
+            &mut self.hidden,
+        )
+    }
+
+    fn down(&mut self, key: &NodeKey, depth: usize, prefix: &str, visited: &mut HashSet<NodeKey>) {
+        let g = self.g;
+        if depth >= self.max_depth { return; }
+        let Some(edges) = g.fwd.get(key) else { return };
+        let edges = self.visible(edges);
+        let n = edges.len();
+        for (i, &e) in edges.iter().enumerate() {
+            self.shown += 1;
+            let rc = &g.calls[e];
+            let is_last = i == n - 1;
+            let connector = if is_last { "└── " } else { "├── " };
+            match rc.target {
+                Some((t, conf)) => {
+                    let d = &g.index.defs[t];
+                    let mark = if conf == Confidence::Guess { " ?" } else { "" };
+                    let loc = format!("[{}:{}]", short_path(&d.id.file), d.id.line);
+                    let tk = NodeKey::Def(d.id.clone());
+                    if visited.contains(&tk) {
+                        self.out.push_str(&format!("{}{}{}()  {}{} (cycle)\n", prefix, connector, rc.callee_display, loc, mark));
+                    } else {
+                        self.out.push_str(&format!("{}{}{}()  {}{}\n", prefix, connector, rc.callee_display, loc, mark));
+                        visited.insert(tk.clone());
+                        let child_prefix = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
+                        self.down(&tk, depth + 1, &child_prefix, visited);
+                        visited.remove(&tk);
+                    }
+                }
+                None => self.out.push_str(&format!("{}{}{}()\n", prefix, connector, rc.callee_display)),
+            }
+        }
+    }
+
+    fn up(&mut self, key: &NodeKey, depth: usize, prefix: &str, visited: &mut HashSet<NodeKey>) {
+        let g = self.g;
+        if depth >= self.max_depth { return; }
+        let Some(edges) = g.rev.get(key) else { return };
+        let edges = self.visible(edges);
+        let n = edges.len();
+        for (i, &e) in edges.iter().enumerate() {
+            self.shown += 1;
+            let rc = &g.calls[e];
+            let d = &g.index.defs[rc.caller];
+            let is_last = i == n - 1;
+            let connector = if is_last { "└── " } else { "├── " };
+            let mark = match rc.target {
+                Some((_, Confidence::Guess)) => " ?",
+                _ => "",
+            };
+            let loc = format!("[{}:{}]", short_path(&d.id.file), d.id.line);
+            let tk = NodeKey::Def(d.id.clone());
+            if visited.contains(&tk) {
+                self.out.push_str(&format!("{}{}{}()  {}{} (cycle)\n", prefix, connector, d.name, loc, mark));
+            } else {
+                self.out.push_str(&format!("{}{}{}()  {}{}\n", prefix, connector, d.name, loc, mark));
+                visited.insert(tk.clone());
+                let child_prefix = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
+                self.up(&tk, depth + 1, &child_prefix, visited);
+                visited.remove(&tk);
+            }
         }
     }
 }
@@ -216,6 +265,44 @@ mod tests {
     fn pairs(jobs: &Jobs) -> Vec<(String, String, bool)> {
         let g = graph::build(jobs);
         collect_edges(&g).into_iter().map(|(a, b, _, _, gss)| (a, b, gss)).collect()
+    }
+
+    fn go_pair(name: &str) -> (std::path::PathBuf, Jobs, files::Hider) {
+        let d = std::env::temp_dir().join(format!("ctsq_calltree_{}_{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("calc.go"), "package calc\n\nfunc Add(a, b int) int { return a + b }\n\nfunc Twice(a int) int { return Add(a, a) }\n").unwrap();
+        std::fs::write(d.join("calc_test.go"), "package calc\n\nfunc TestAdd() { Twice(1) }\n").unwrap();
+        let root = d.to_str().unwrap();
+        let jobs = files::resolve_jobs(root, None, true);
+        let mut h = files::Hider::new(&Default::default());
+        h.add_jobs(root, &jobs);
+        (d, jobs, h)
+    }
+
+    #[test]
+    fn callers_leave_out_a_test_caller_and_its_subtree() {
+        let (d, jobs, mut h) = go_pair("up");
+        let (text, code) = report(Direction::Up, "Add", &jobs, 3, &mut h);
+        assert_eq!(code, 0);
+        assert!(text.starts_with("Add()\n└── Twice()  [calc.go:5]\n"), "{}", text);
+        assert!(!text.contains("TestAdd"), "{}", text);
+        assert!(text.ends_with("1 caller\nhidden: 1 in tests (--tests)\n"), "{}", text);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_function_defined_only_in_tests_is_hidden_with_exit_1() {
+        let (d, jobs, mut h) = go_pair("root");
+        let (text, code) = report(Direction::Down, "TestAdd", &jobs, 3, &mut h);
+        assert_eq!(code, 1);
+        assert_eq!(text, "0 callees\nhidden: 1 in tests (--tests)\n");
+        let mut all = files::Hider::new(&files::HideOpts { tests: true, exclude: vec![] });
+        all.add_jobs(d.to_str().unwrap(), &jobs);
+        let (text, code) = report(Direction::Down, "TestAdd", &jobs, 3, &mut all);
+        assert_eq!(code, 0);
+        assert!(text.contains("Twice()") && !text.contains("hidden:"), "{}", text);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

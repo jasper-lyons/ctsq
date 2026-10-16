@@ -11,6 +11,21 @@ pub struct Mechanics {
     pub fields: Fields,
     /// Token texts the flow engine compares against.
     pub tokens: Tokens,
+    /// What counts as a test, hidden by default from search output.
+    pub tests: Tests,
+}
+
+/// Test detection for one language.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct Tests {
+    /// Globs on the file name, such as `*_test.go`. A glob holding a `/` is
+    /// matched against the path relative to the search root instead.
+    pub files: Vec<String>,
+    /// Directory names: a file under any path segment named so is a test.
+    pub dirs: Vec<String>,
+    /// Selectors whose matches are test scopes inside non-test files.
+    pub scopes: Vec<String>,
 }
 
 impl Mechanics {
