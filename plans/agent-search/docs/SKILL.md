@@ -231,11 +231,11 @@ fixtures/scope/Asset.tsx:11: const saveAssetNow = () => props.asset  ?
 
 ```
 ctsq -q 'id#hide_rows' --scope src/
-src/main.rs:949: hide_rows(&mut hider, file, &source, rows, true, &mut hidden)
-  in src/main.rs:601-1013  fn main() {
-src/main.rs:1018: fn hide_rows(
-src/main.rs:1181: for r in &hide_rows(&mut hider, file, &source, rows, false, &mut hidden) {
-  in src/main.rs:1143-1198  fn run_refs(
+src/main.rs:961: hide_rows(&mut hider, file, &source, rows, true, &mut hidden)
+  in src/main.rs:613-1032  fn main() {
+src/main.rs:1037: fn hide_rows(
+src/main.rs:1200: for r in &hide_rows(&mut hider, file, &source, rows, false, &mut hidden) {
+  in src/main.rs:1162-1217  fn run_refs(
 3 matches
 ```
 
@@ -276,8 +276,8 @@ Question: which component renders the `/about` page? A route lives in a framewor
 
 ```
 ctsq find
-built-in queries/react-router.toml:9: route  react-router  (import react-router in fixtures/queries/react-router/src/App.tsx)
-built-in queries/solid-routes.toml:9: route  solid-routes  (import @solidjs/router in fixtures/queries/solid-mavexa/frontend/src/routesConfig.ts)
+built-in queries/react-router.toml:9: route       react-router   (import react-router in fixtures/queries/react-router/src/App.tsx)
+built-in queries/solid-routes.toml:9: route       solid-routes   (import @solidjs/router in fixtures/queries/solid-mavexa/frontend/src/routesConfig.ts)
 ```
 
 Each row names the file and line the query is defined at, the query, the framework, and why it applies here. Then ask one, with a key:
@@ -306,6 +306,49 @@ fixtures/queries/go-chi/main.go:24  /users/{id}  createUser  fixtures/queries/go
 ```
 
 The target is the handler as `def` finds it, and `h.Show` gives `Show`. A Go 1.22 key keeps its method (`GET /api/healthz`). Rails reads `config/routes.rb`: `get '/about', to: 'static#about'` is rewritten to `StaticController#about` (the `rewrite` key, with the `${1:pascal}` case filter), then resolved to the controller file and the action inside it, `?` when nothing defines it. A `resources :gigs` line is one row, `/gigs`, aimed at `GigsController`. Next.js `app/**/page.tsx` files are routes whose key comes from the directory (`paths` and `key_from_path`) and whose target is the file's default export. A repo that names a module in its routes can use `target = "default-export"`, which resolves the module specifier with the tsconfig aliases and names the default export.
+
+### 17. Which component renders this text
+
+Question: which component shows "Welcome back"? `find text` reads the text between JSX tags and names the component or function that renders it. `find label` does the same for the string props a user reads (label, title, placeholder, alt, aria-label, aria-description, helperText, tooltip), and `find component` lists the functions that return JSX:
+
+```
+ctsq find text 'Welcome back'
+fixtures/queries/jsx/src/Card.tsx:6  Welcome back  Card  fixtures/queries/jsx/src/Card.tsx:3
+1 text (jsx-text, from built-in queries/jsx-text.toml)
+```
+
+The first column is where the text is, the last is where the component starts. A key is a case-insensitive substring, or a regex when written `/.../`.
+
+### 18. Which function emits this error message
+
+Question: a log says `failed to load pipeline 12: open x: no such file`. Which function emits it? Paste the rendered message. The code holds the format string, so `find error` turns `%s %v %d %w %q %x %f %T %+v` and `${...}` into wildcards and matches the pattern anywhere in your text. A fragment of the literal text works too, in any case:
+
+```
+ctsq find error 'failed to load pipeline 12: open x: no such file'
+fixtures/queries/errors/go/load.go:14  failed to load pipeline %s: %w  Load  fixtures/queries/errors/go/load.go:10
+1 error (go-error, from built-in queries/error-go.toml)
+```
+
+The target is the function that emits the error. The packs read `errors.New` and `fmt.Errorf` in Go, `new Error`, subclasses ending in Error and `throw "..."` in TypeScript and JavaScript, and `raise` in Ruby. A message built by concatenation (`"a " + name`) is not followed.
+
+### 19. A product word that is named differently in code
+
+Question: where is "the pipeline page" handled, when the code calls it `Pipeline`? A repo can map product words to code names in `.ctsq/glossary.toml` at its root, keys matched case-insensitively as whole phrases and values either names or `/regex/` filters:
+
+```
+.ctsq/glossary.toml
+"pipeline page" = ["Pipeline"]
+"brief sync"    = ["sync_merged", "cmd_sync"]
+"supplies"      = ["/resource|stock/"]
+```
+
+`find`, `def` and a missed `-q` search then also search the mapped names, and the last line says so (this block is not run by the example checker, because the repo root has no glossary, `cargo test` covers it on `fixtures/glossary`):
+
+```
+$ ctsq def 'pipeline page' src
+src/pipeline.go:5: func Pipeline() error {
+.ctsq/glossary.toml:2: "pipeline page" also searched as Pipeline
+```
 
 ## Reference
 

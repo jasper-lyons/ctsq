@@ -123,6 +123,9 @@ EXAMPLES (a question as a comment, the call, then the next call)
   ctsq find
   ctsq find route /about
   ctsq find route '/users/{id}'
+  # Which component shows this text? Which function emits this logged error?
+  ctsq find text 'Welcome back'
+  ctsq find error 'failed to load pipeline 12: open x: no such file'
 
 STDIN
   Pipe file paths (language detected per file from extension):
@@ -156,6 +159,7 @@ SUBCOMMANDS
   ctsq files -q 'id#A' -q 'id#B' src/   files where every one of several queries matches
   ctsq find                             the named queries (route, ...) that apply in this directory
   ctsq find route /library              a named query: each route matching the key, and its component
+  ctsq find text|label|component|error  UI text, labels, components and error messages, each with the function holding it
   ctsq imports src/main.rs src/         what files this file imports (down the import tree)
   ctsq importers src/files.rs src/      what files import this file (up the import tree)
   ctsq importgraph src/                 full import graph in DOT format (pipe to dot -Tpng)
@@ -421,6 +425,14 @@ query that applies in the current directory and why:
   ctsq find route
   ctsq find route /library
   ctsq find route '/^/w/'
+
+  ctsq find text 'Welcome back'
+  ctsq find error 'failed to load pipeline 12: open x: no such file'
+
+An error key is a format string, so %s %v %d %w %q %x %f %T %+v and ${...} match
+any text and a message copied from a log finds it. A repo glossary,
+.ctsq/glossary.toml at the repo root, maps product words to code names. A key
+holding one of its terms also finds rows by those names, and a last line says so.
 
 Each match prints path:LINE, the key, the target and the target's path:LINE
 (? when def finds no definition), then one count line per framework naming
