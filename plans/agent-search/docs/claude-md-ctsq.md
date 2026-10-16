@@ -11,6 +11,7 @@
   - what function or class holds a hit: add `--scope` to `def`, `refs`, `callers`, `callees`, `files` or `-q`. A row under each hit gives the holder's `path:START-END` and signature, so no window Read follows. `--scope --body` adds the holder's body
   - what holds this file:line (from a stack trace, a compiler error or grep): `ctsq scopeof path:LINE`, the reverse of `def`. It returns the function or class with its body, no window Read needed. `--up 1` for the class, `--siblings`, `--callers`, `--budget N`
   - files where several names occur: `ctsq files -q 'id#A' -q 'id#B' src/`
+  - which component serves a route, or another framework question: `ctsq find` lists the named queries that apply in this directory, then `ctsq find route /path` prints each route's `path:LINE`, key, component and its definition. A miss names the query file, override it in `.ctsq/queries/`
   - where is it defined: `ctsq def Name src/`. Functions that use a constant: `ctsq -q '(*function @f).body(id#CONST)' file.cpp`
   - tests are hidden by default and counted on the last line, `hidden: N in tests (--tests)`. Before deleting or renaming a name, rerun with `--tests` to see every use. `--exclude GLOB` hides more paths
   - restrict by language with `-l cpp`. Unsure of the query syntax: `ctsq example '$X.send(msg)' -l js`

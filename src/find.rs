@@ -239,6 +239,16 @@ fn target_name(text: &str) -> String {
     if name.is_empty() { first.to_string() } else { name }
 }
 
+/// How many leading directories two paths share.
+fn shared_dirs(a: &str, b: &str) -> usize {
+    let dirs = |p: &str| -> Vec<String> {
+        let mut v: Vec<String> = p.split('/').map(str::to_string).collect();
+        v.pop();
+        v
+    };
+    dirs(a).iter().zip(dirs(b).iter()).take_while(|(x, y)| x == y).count()
+}
+
 /// One printed match.
 struct Hit {
     file: String,
@@ -387,10 +397,11 @@ fn run_query(
                         let name = target_name(text);
                         let l = lookup.get_or_insert_with(|| DefLookup::new(&jobs));
                         let defs = l.find(&name);
-                        let pick = defs
-                            .iter()
-                            .find(|(f, line, _)| hider.site(f, *line).is_none())
-                            .or_else(|| defs.first());
+                        // Several candidates: a shown one before a hidden one, then
+                        // the one nearest the route's file (longest shared directory).
+                        let pick = defs.iter().min_by_key(|(f, line, _)| {
+                            (hider.site(f, *line).is_some(), std::cmp::Reverse(shared_dirs(file, f)))
+                        });
                         let loc = match pick {
                             Some((f, line, _)) => format!("{}:{}", shown(f), line),
                             None => "?".to_string(),

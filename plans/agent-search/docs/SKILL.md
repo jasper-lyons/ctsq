@@ -231,11 +231,11 @@ fixtures/scope/Asset.tsx:11: const saveAssetNow = () => props.asset  ?
 
 ```
 ctsq -q 'id#hide_rows' --scope src/
-src/main.rs:911: hide_rows(&mut hider, file, &source, rows, true, &mut hidden)
-  in src/main.rs:566-975  fn main() {
-src/main.rs:980: fn hide_rows(
-src/main.rs:1143: for r in &hide_rows(&mut hider, file, &source, rows, false, &mut hidden) {
-  in src/main.rs:1105-1160  fn run_refs(
+src/main.rs:948: hide_rows(&mut hider, file, &source, rows, true, &mut hidden)
+  in src/main.rs:600-1012  fn main() {
+src/main.rs:1017: fn hide_rows(
+src/main.rs:1180: for r in &hide_rows(&mut hider, file, &source, rows, false, &mut hidden) {
+  in src/main.rs:1142-1197  fn run_refs(
 3 matches
 ```
 
@@ -269,6 +269,30 @@ showing lines 392-397 of 372-402, --budget 31 for all
 ```
 
 `--up N` climbs N enclosing scopes (past the outermost it stops there and says `only K enclosing scopes`). `--siblings` adds the other scopes in the same parent as `path:LINE: signature` rows, `--callers` adds one level of callers, `--block` returns the innermost block (an `if` or loop body) instead. A scope longer than `--budget` (default 150) prints a window of that many lines centred on your line, then a `showing lines` footer whose `--budget` value shows it all. A line outside every named scope prints `path:LINE  at top level` and a window of the file. A missing file or a line past the end goes to stderr and the other coordinates still run. Test hiding does not apply, since you named the file and line.
+
+### 15. Which component serves this route
+
+Question: which component renders the `/about` page? A route lives in a framework's own shape (a `<Route>` element, a route object), so a name search does not find it. Ask what named queries this repo answers:
+
+```
+ctsq find
+built-in queries/react-router.toml:9: route  react-router  (import react-router in fixtures/queries/react-router/src/App.tsx)
+built-in queries/solid-routes.toml:9: route  solid-routes  (import @solidjs/router in fixtures/queries/solid-mavexa/frontend/src/routesConfig.ts)
+```
+
+Each row names the file and line the query is defined at, the query, the framework, and why it applies here. Then ask one, with a key:
+
+```
+ctsq find route about
+fixtures/queries/react-router/src/main.tsx:6  /about       About    fixtures/queries/react-router/src/pages.tsx:5
+fixtures/queries/solid/src/App.tsx:8          /about       About    fixtures/queries/solid/src/pages/About.tsx:1
+fixtures/queries/solid/src/routes.ts:6        /about/team  Nowhere  ?
+1 route (react-router, from built-in queries/react-router.toml)
+2 routes (solid-routes, from built-in queries/solid-routes.toml)
+hidden: 1 in tests (--tests)
+```
+
+Each match is the route's `path:LINE`, the key, the component and where `def` finds it (`?` when it finds nothing). The key is a case-insensitive substring, or a regex written `/.../`. With no key every route prints. The count line per framework names the file the query came from: when a query misses a repo's shape, copy that file to `.ctsq/queries/` in the repo, keep the `framework` name, and edit the `match` selectors, each of which also runs as a plain `-q` query. `ctsq config path` lists the queries directories. The search root is the current directory, and tests are hidden as everywhere else.
 
 ## Reference
 

@@ -13,7 +13,7 @@ match = [
   # { path: "/about", element: <Layout>...</Layout> }
   "(pair.key(property_identifier#path).value(string @key)) ~ (pair.key(property_identifier#element).value(jsx_element.open_tag(jsx_opening_element.name(@target))))",
   # { path: "/about", Component: About }
-  "(pair.key(property_identifier#path).value(string @key)) ~ (pair.key(property_identifier#/^(Component|component)$/).value(identifier @target))",
+  "(pair.key(property_identifier#path).value(string @key)) ~ (pair.key(property_identifier#Component).value(identifier @target))",
   # <Route path="/about" element={<About />} />
   "(jsx_attribute > (property_identifier#path) + (string @key)) ~ (jsx_attribute > (property_identifier#element) + (jsx_expression > jsx_self_closing_element.name(@target)))",
   # <Route path="/about" Component={About} />
