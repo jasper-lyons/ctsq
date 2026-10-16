@@ -31,3 +31,7 @@ Options:
 The plan's prose under Output format says "one line per reason", but its sample prints every reason on one line: `hidden: 6 in tests (--tests), 31 over --max 2 in 4 files (--max 40)`.
 
 I built the sample's shape: one `hidden:` line with the reasons separated by commas, printed after a count line such as `2 matches`. The wording lives in one shared function, so switching to one line per reason is a one-function change. Say if you want the other shape.
+
+## Note
+
+These questions could not be posted with `brief ask agent-search`. This repo has no `.queue` folder holding an `agent-search.md` brief, and creating one would have meant running `brief init` here. They are in the build report instead.
