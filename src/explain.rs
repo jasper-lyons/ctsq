@@ -30,8 +30,8 @@ impl Default for Options {
     }
 }
 
-pub fn run(names: &[String], jobs: &[(String, &'static str)], mut hider: files::Hider, opts: &Options) {
-    let r = report_many(names, jobs, opts, &mut hider);
+pub fn run(names: &[String], where_: &str, jobs: &[(String, &'static str)], mut hider: files::Hider, opts: &Options) {
+    let r = report_many(names, where_, jobs, opts, &mut hider);
     print!("{}", r.out);
     use std::io::Write;
     let _ = std::io::stdout().flush();
@@ -43,18 +43,23 @@ pub fn run(names: &[String], jobs: &[(String, &'static str)], mut hider: files::
 }
 
 /// `report_hiding` for several names, in order, a blank line between. With one
-/// name the text is exactly `report_hiding`'s. With several, a name that
-/// resolved to nothing prints no block and goes on the `not found:` stderr
-/// line instead. The footer counts every name, once, at the end. The code is 0
-/// when any name showed a definition or a reference.
+/// name the text is exactly `report_hiding`'s. A name that resolved to nothing
+/// prints no block on stdout and goes on the `not found:` stderr line, and when
+/// it is the one name asked for its `SYMBOL X (no definition resolved)` block
+/// goes to stderr too. When nothing was shown because everything was hidden,
+/// stdout is empty and stderr says so (BUILD.md A20). The footer counts every
+/// name, once, at the end. The code is 0 when any name showed a definition or a
+/// reference.
 pub fn report_many(
     names: &[String],
+    where_: &str,
     jobs: &[(String, &'static str)],
     opts: &Options,
     hider: &mut files::Hider,
 ) -> crate::resolve::NamesOut {
     let mut hidden = Hidden::default();
     let mut out = String::new();
+    let mut miss_text = String::new();
     let mut missing: Vec<String> = Vec::new();
     let mut any = false;
     for symbol in names {
@@ -64,22 +69,32 @@ pub fn report_many(
             any = true;
         } else if hidden.tests + hidden.excluded == before {
             missing.push(symbol.clone());
-            if names.len() > 1 {
-                continue;
+            if names.len() == 1 {
+                miss_text = text;
             }
+            continue;
         }
         if !out.is_empty() {
             out.push('\n');
         }
         out.push_str(&text);
     }
-    let shown = out.matches("\nDEFINITION ").count();
-    out.push_str(&footer(shown, "definition", &hidden));
-    crate::resolve::NamesOut {
-        out,
-        err: crate::resolve::not_found_line(&missing, jobs),
-        code: if any { 0 } else { 1 },
+    crate::footer::settle(&mut hidden);
+    let mut err = miss_text;
+    if !any && hidden.any() {
+        out.clear();
+        err.push_str(&crate::footer::nothing_shown(
+            &format!("no definition to {}", names.join(", ")),
+            where_,
+            jobs.len(),
+            &hidden,
+        ));
+    } else if any {
+        let shown = out.matches("\nDEFINITION ").count();
+        out.push_str(&footer(shown, "definition", &hidden));
     }
+    err.push_str(&crate::resolve::not_found_line(&missing, jobs));
+    crate::resolve::NamesOut { out, err, code: if any { 0 } else { 1 } }
 }
 
 // ── Report ───────────────────────────────────────────────────────────────────
@@ -215,7 +230,9 @@ fn body(
     }
     out.push_str(&format!("\nREFERENCES ({} more)\n", total));
     for (file, count) in by_file {
-        out.push_str(&format!("  {}: {}\n", file, count));
+        if crate::footer::take(&file) {
+            out.push_str(&format!("  {}: {}\n", file, count));
+        }
     }
 
     (out, true)
@@ -543,6 +560,7 @@ fn push_reference_list(
     seen: &mut HashSet<(String, usize)>,
 ) -> usize {
     let refs = keep_once(hider, references(symbol, jobs), |(f, l, _)| (f.clone(), *l), hidden, seen);
+    let refs: Vec<_> = refs.into_iter().filter(|(f, _, _)| crate::footer::take(f)).collect();
     out.push_str(&format!("\nREFERENCES ({})\n", refs.len()));
     for (file, line, text) in refs.iter().take(opts.max_lines) {
         out.push_str(&format!("  {}:{}  {}\n", file, line, text));

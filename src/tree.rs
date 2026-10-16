@@ -54,8 +54,14 @@ pub fn report(path: &str, lang_name: Option<&str>, hider: &mut crate::files::Hid
         hidden.tests += drop_scoped(&mut items, &scopes);
     }
 
-    let line_count = String::from_utf8_lossy(&source).lines().count();
+    let before_cap = count_items(&items);
+    limit_items(&mut items, path);
     let entries = count_items(&items);
+    if entries == 0 && before_cap > 0 {
+        // --max-matches ran out in an earlier file: this one prints nothing.
+        return Outline { text: String::new(), entries: 0, hidden };
+    }
+    let line_count = String::from_utf8_lossy(&source).lines().count();
     let mut out = format!(
         "{}  {} {}  ~{} tokens  {} {}\n",
         path,
@@ -67,6 +73,21 @@ pub fn report(path: &str, lang_name: Option<&str>, hider: &mut crate::files::Hid
     );
     push_items(&mut out, &items, "");
     Outline { text: out, entries, hidden }
+}
+
+/// Keep the first entries `--max-matches` allows, in the order they print, and
+/// count the rest (nested ones included) as cut.
+fn limit_items(items: &mut Vec<Item>, path: &str) {
+    let mut kept = Vec::new();
+    for mut it in std::mem::take(items) {
+        if crate::footer::take(path) {
+            limit_items(&mut it.children, path);
+            kept.push(it);
+        } else {
+            crate::footer::cut(path, count_items(&it.children));
+        }
+    }
+    *items = kept;
 }
 
 /// Remove the items that start inside a test scope, and return how many

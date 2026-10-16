@@ -4,11 +4,12 @@
 //! that hid nothing gets no footer, so it is unchanged.
 //!
 //! Every command words its footer through `footer`, so the wording lives here.
+//! `--max-matches` is a process-wide cap kept here too: a command asks `take`
+//! before it prints a row, and `settle` copies what was cut into the `Hidden`.
 
 use crate::files::Hide;
 
-/// Matches cut by a cap such as `--max`. Not set by any command yet: the flag
-/// is held (BUILD.md A14), the reason is here so adding it is small.
+/// Matches cut by `--max-matches` (BUILD.md A18).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct OverMax {
     /// Matches not shown.
@@ -68,16 +69,22 @@ pub fn footer(shown: usize, noun: &str, hidden: &Hidden) -> String {
     if !hidden.any() {
         return String::new();
     }
-    let mut reasons = Vec::new();
+    format!("{} {}\n{}", shown, plural(noun, shown), hidden_lines(hidden))
+}
+
+/// The `hidden:` lines, one per reason in the order tests, excluded paths, over
+/// the cap, each ending in a newline. Empty when nothing was hidden.
+pub fn hidden_lines(hidden: &Hidden) -> String {
+    let mut out = String::new();
     if hidden.tests > 0 {
-        reasons.push(format!("{} in tests (--tests)", hidden.tests));
+        out.push_str(&format!("hidden: {} in tests (--tests)\n", hidden.tests));
     }
     if hidden.excluded > 0 {
-        reasons.push(format!("{} in excluded paths (drop --exclude)", hidden.excluded));
+        out.push_str(&format!("hidden: {} in excluded paths (drop --exclude)\n", hidden.excluded));
     }
     if let Some(m) = hidden.over_max.as_ref().filter(|m| m.count > 0) {
-        reasons.push(format!(
-            "{} over --max {} in {} {} (--max {})",
+        out.push_str(&format!(
+            "hidden: {} over --max-matches {} in {} {} (--max-matches {})\n",
             m.count,
             m.max,
             m.files,
@@ -85,7 +92,97 @@ pub fn footer(shown: usize, noun: &str, hidden: &Hidden) -> String {
             m.suggest
         ));
     }
-    format!("{} {}\nhidden: {}\n", shown, plural(noun, shown), reasons.join(", "))
+    out
+}
+
+/// What a call says on stderr when every match was hidden: `phrase` is the
+/// command's miss wording up to the hiding reason (`no caller to X`, `no match
+/// for Q`), then `outside tests`, where it looked and how many files, then the
+/// `hidden:` lines. Stdout gets nothing (BUILD.md A20).
+pub fn nothing_shown(phrase: &str, where_: &str, files: usize, hidden: &Hidden) -> String {
+    let mut reasons = Vec::new();
+    if hidden.tests > 0 {
+        reasons.push("tests");
+    }
+    if hidden.excluded > 0 {
+        reasons.push("excluded paths");
+    }
+    let outside = if reasons.is_empty() { String::new() } else { format!(" outside {}", reasons.join(" and ")) };
+    format!("{}{} in {} ({} {})\n{}", phrase, outside, where_, files, plural("file", files), hidden_lines(hidden))
+}
+
+/// The `--max-matches` cap: how many rows were let through, and what was cut.
+#[derive(Debug)]
+pub struct Cap {
+    max: Option<usize>,
+    taken: usize,
+    cut: usize,
+    files: std::collections::BTreeSet<String>,
+}
+
+impl Cap {
+    pub const fn with(max: Option<usize>) -> Cap {
+        Cap { max, taken: 0, cut: 0, files: std::collections::BTreeSet::new() }
+    }
+
+    /// Whether a row in `file` may print. Past the cap it is counted as cut.
+    pub fn take(&mut self, file: &str) -> bool {
+        match self.max {
+            Some(m) if self.taken >= m => {
+                self.cut += 1;
+                self.files.insert(file.to_string());
+                false
+            }
+            Some(_) => {
+                self.taken += 1;
+                true
+            }
+            None => true,
+        }
+    }
+
+    /// Count `n` rows in `file` as cut without asking.
+    pub fn cut(&mut self, file: &str, n: usize) {
+        if self.max.is_some() && n > 0 {
+            self.cut += n;
+            self.files.insert(file.to_string());
+        }
+    }
+
+    /// The over-cap reason, when something was cut.
+    pub fn over(&self) -> Option<OverMax> {
+        let max = self.max?;
+        (self.cut > 0).then(|| OverMax {
+            count: self.cut,
+            max,
+            files: self.files.len(),
+            suggest: self.taken + self.cut,
+        })
+    }
+}
+
+static CAP: std::sync::Mutex<Cap> = std::sync::Mutex::new(Cap::with(None));
+
+/// Set the process-wide cap from `--max-matches`.
+pub fn set_max(max: Option<usize>) {
+    *CAP.lock().unwrap() = Cap::with(max);
+}
+
+/// Whether a row in `file` may print under the process-wide cap.
+pub fn take(file: &str) -> bool {
+    CAP.lock().unwrap().take(file)
+}
+
+/// Count `n` rows in `file` as cut under the process-wide cap.
+pub fn cut(file: &str, n: usize) {
+    CAP.lock().unwrap().cut(file, n)
+}
+
+/// Copy what the process-wide cap cut into `hidden`, ahead of the footer.
+pub fn settle(hidden: &mut Hidden) {
+    if let Some(o) = CAP.lock().unwrap().over() {
+        hidden.over_max = Some(o);
+    }
 }
 
 /// The last lines of a command's output. With `count` (`--scope` asks for it)
@@ -128,7 +225,7 @@ mod tests {
         };
         assert_eq!(
             footer(2, "match", &h),
-            "2 matches\nhidden: 6 in tests (--tests), 31 over --max 2 in 4 files (--max 40)\n"
+            "2 matches\nhidden: 6 in tests (--tests)\nhidden: 31 over --max-matches 2 in 4 files (--max-matches 40)\n"
         );
     }
 
@@ -137,8 +234,33 @@ mod tests {
         let h = Hidden { tests: 1, excluded: 5, over_max: Some(OverMax { count: 2, max: 10, files: 1, suggest: 12 }) };
         assert_eq!(
             footer(1, "match", &h),
-            "1 match\nhidden: 1 in tests (--tests), 5 in excluded paths (drop --exclude), 2 over --max 10 in 1 file (--max 12)\n"
+            "1 match\nhidden: 1 in tests (--tests)\nhidden: 5 in excluded paths (drop --exclude)\nhidden: 2 over --max-matches 10 in 1 file (--max-matches 12)\n"
         );
+    }
+
+    #[test]
+    fn the_cap_lets_n_rows_through_and_counts_the_rest_by_file() {
+        let mut c = Cap::with(Some(2));
+        assert!(c.take("a.rs") && c.take("a.rs"));
+        assert!(!c.take("b.rs") && !c.take("c.rs") && !c.take("b.rs"));
+        assert_eq!(c.over(), Some(OverMax { count: 3, max: 2, files: 2, suggest: 5 }));
+        assert_eq!(Cap::with(None).over(), None);
+        let mut roomy = Cap::with(Some(9));
+        assert!(roomy.take("a.rs"));
+        assert_eq!(roomy.over(), None);
+    }
+
+    #[test]
+    fn everything_hidden_reads_as_a_stderr_report_with_the_hidden_lines() {
+        let mut h = Hidden::default();
+        h.count(Hide::Test, 3);
+        assert_eq!(
+            nothing_shown("no caller to run", "src/", 4, &h),
+            "no caller to run outside tests in src/ (4 files)\nhidden: 3 in tests (--tests)\n"
+        );
+        h.count(Hide::Excluded, 1);
+        assert!(nothing_shown("no match for id#x", "src/", 1, &h)
+            .starts_with("no match for id#x outside tests and excluded paths in src/ (1 file)\n"));
     }
 
     #[test]

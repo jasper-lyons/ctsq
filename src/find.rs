@@ -192,7 +192,8 @@ pub fn list_report(queries: &[NamedQuery], scan: &mut Scan) -> Report {
     for (q, w) in queries.iter().zip(&why) {
         match w {
             Some(w) => rows.push(vec![
-                format!("{}:{}: {}", q.source, q.line, q.name),
+                format!("{}:{}:", q.source, q.line),
+                q.name.clone(),
                 q.framework.clone(),
                 format!("({})", w),
             ]),
@@ -827,17 +828,24 @@ pub fn report_with(
             counts.push((0, format!("0 {} ({}, from {})", footer::plural(name, 0), q.framework, q.source)));
             continue;
         }
-        counts.push((hits.len(), format!(
+        // The count line counts the rows printed, so --max-matches shows in it.
+        let before = rows.len();
+        for h in hits {
+            if !footer::take(&h.file) {
+                continue;
+            }
+            rows.push(vec![format!("{}:{}", shown(&scan.prefix, &h.file), h.line), cap_key(&h.key), h.target, h.target_loc]);
+        }
+        let n = rows.len() - before;
+        counts.push((n, format!(
             "{} {} ({}, from {})",
-            hits.len(),
-            footer::plural(name, hits.len()),
+            n,
+            footer::plural(name, n),
             q.framework,
             q.source
         )));
-        for h in hits {
-            rows.push(vec![format!("{}:{}", shown(&scan.prefix, &h.file), h.line), cap_key(&h.key), h.target, h.target_loc]);
-        }
     }
+    footer::settle(&mut hidden);
 
     let shown_n = rows.len();
     if shown_n == 0 && !hidden.any() {
@@ -846,6 +854,14 @@ pub fn report_with(
             out.push_str(n);
             out.push('\n');
         }
+        return Report { out, code: 1 };
+    }
+    if shown_n == 0 {
+        let phrase = match key {
+            Some(k) => format!("no {} to {}", name, k),
+            None => format!("no {}", name),
+        };
+        let out = footer::nothing_shown(&phrase, &scan.root.display().to_string(), scan.jobs.len(), &hidden);
         return Report { out, code: 1 };
     }
     let mut out = columns(&rows);
@@ -865,15 +881,9 @@ pub fn report_with(
     }
     if hidden.any() {
         // The footer's own count line repeats what the count lines said.
-        let f = footer::footer(shown_n, name, &hidden);
-        if shown_n == 0 {
-            out.push_str(&f);
-        } else if let Some(last) = f.lines().last() {
-            out.push_str(last);
-            out.push('\n');
-        }
+        out.push_str(&footer::hidden_lines(&hidden));
     }
-    Report { out, code: if shown_n == 0 { 1 } else { 0 } }
+    Report { out, code: 0 }
 }
 
 /// Entry for the CLI: loads the queries for the current directory and runs
@@ -899,7 +909,8 @@ pub fn run(name: Option<&str>, key: Option<&str>, no_ignore: bool, hide: &files:
         None => list_report(&queries, &mut scan),
         Some(n) => report_with(&queries, n, key, &mut scan, hide, glossary.as_ref()),
     };
-    if r.code == 2 {
+    // A miss, a usage error and an everything-hidden report go to stderr.
+    if r.code != 0 {
         eprint!("{}", r.out);
     } else {
         print!("{}", r.out);
@@ -966,7 +977,12 @@ mod tests {
         assert!(r.out.starts_with("src/routes.test.ts:3  /about/test-only  Home  src/pages/Home.tsx:1\n"), "{}", r.out);
         let hidden = run("solid", Some("test-only"), &hide());
         assert_eq!(hidden.code, 1);
-        assert_eq!(hidden.out, "0 routes\nhidden: 1 in tests (--tests)\n");
+        assert!(
+            hidden.out.starts_with("no route to test-only outside tests in ")
+                && hidden.out.ends_with("\nhidden: 1 in tests (--tests)\n"),
+            "{}",
+            hidden.out
+        );
     }
 
     #[test]
@@ -1121,17 +1137,17 @@ mod tests {
         assert_eq!(r.code, 0);
         assert_eq!(
             r.out,
-            "built-in queries/jsx-component.toml:8: component  jsx-component  (always)\n\
-             built-in queries/error-js.toml:7: error           js-error       (always)\n\
-             built-in queries/jsx-label.toml:8: label          jsx-label      (always)\n\
-             built-in queries/solid-routes.toml:9: route       solid-routes   (import @solidjs/router in src/App.tsx)\n\
-             built-in queries/jsx-text.toml:7: text            jsx-text       (always)\n\
+            "built-in queries/jsx-component.toml:8:  component  jsx-component  (always)\n\
+             built-in queries/error-js.toml:7:       error      js-error       (always)\n\
+             built-in queries/jsx-label.toml:8:      label      jsx-label      (always)\n\
+             built-in queries/solid-routes.toml:9:   route      solid-routes   (import @solidjs/router in src/App.tsx)\n\
+             built-in queries/jsx-text.toml:7:       text       jsx-text       (always)\n\
              not detected here: error (go-error), error (ruby-error), route (chi), route (net-http), route (next-app), route (rails-routes), route (react-router)\n"
         );
         let dir = fixture("solid-mavexa");
         let r = list_report(&queries_in(&dir), &mut Scan::new(&dir, false));
         assert!(
-            r.out.contains(".ctsq/queries/solid-routes.toml:10: route         solid-routes   (import @solidjs/router in frontend/src/routesConfig.ts)\n"),
+            r.out.contains(".ctsq/queries/solid-routes.toml:10:     route      solid-routes   (import @solidjs/router in frontend/src/routesConfig.ts)\n"),
             "{}",
             r.out
         );

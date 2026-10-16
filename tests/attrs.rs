@@ -71,7 +71,8 @@ fn slog_matches_by_local_name_and_by_full_path() {
 fn a_miss_after_filtering_exits_1() {
     let out = ctsq(&["-q", "&function#Printf[from=nope]", &fixture("logs.go")]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(stdout(&out).starts_with("no match for"));
+    assert!(stderr(&out).starts_with("no match for"));
+    assert_eq!(stdout(&out), "");
 }
 
 #[test]

@@ -42,10 +42,10 @@ fn a_route_prints_rows_with_call_lines_and_a_trailer() {
 
 #[test]
 fn max_limits_route_length_and_none_found_exits_1() {
-    let o = path_cmd("function#a --> function#c", &["--max", "1"]);
+    let o = path_cmd("function#a --> function#c", &["--max-depth", "1"]);
     assert_eq!(code(&o), 1, "{}", out(&o));
     assert!(out(&o).contains("0 routes"));
-    let o = path_cmd("function#a --> function#c", &["--max", "2"]);
+    let o = path_cmd("function#a --> function#c", &["--max-depth", "2"]);
     assert_eq!(code(&o), 0);
     assert!(out(&o).trim_end().ends_with("2 routes"));
 }

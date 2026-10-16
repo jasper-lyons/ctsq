@@ -6,7 +6,7 @@
 
 use crate::compiler::{self, lang};
 use crate::files;
-use crate::footer::{footer, tail, Hidden};
+use crate::footer::{nothing_shown, tail, Hidden};
 use crate::scope;
 use crate::query;
 use crate::runner;
@@ -132,11 +132,14 @@ pub fn run(
     };
 
     if hits.is_empty() && hidden.any() {
-        print!("{}", footer(0, "file", &hidden));
+        eprint!(
+            "{}",
+            nothing_shown(&format!("no file matches all {} queries", queries.len()), path, jobs.len(), &hidden)
+        );
         std::process::exit(1);
     }
     if hits.is_empty() {
-        println!(
+        eprintln!(
             "no file matches all {} queries in {} ({} files scanned)",
             queries.len(),
             path,
@@ -145,9 +148,13 @@ pub fn run(
         std::process::exit(1);
     }
 
-    let shown = hits.len();
+    let mut shown = 0usize;
     let mut printer = scope.map(|o| scope::Printer::new(o, &jobs));
     for (file, counts) in hits {
+        if !crate::footer::take(&file) {
+            continue;
+        }
+        shown += 1;
         let counts: Vec<String> = counts.iter().map(|c| c.to_string()).collect();
         println!("{}  {}", file, counts.join(" "));
         if let Some(p) = printer.as_mut() {
@@ -157,6 +164,7 @@ pub fn run(
             }
         }
     }
+    crate::footer::settle(&mut hidden);
     print!("{}", tail(shown, "file", &hidden, scope.is_some()));
 }
 

@@ -181,7 +181,7 @@ fixtures/example.go-21- }
 
 `-C` is rejected with exit 2 alongside `--node`, which already prints the whole node.
 
-A match with two or more captures, and a multi-line match under `--body`, keep the node-text form instead, because one source line cannot carry them. Those get no context. They still open with the file they came from, as `path:11-19: …` for a multi-line body and `path:@f:4: …, @call:6: …` for captures, so there is never a match without a file to open. Source read from stdin says `<stdin>`. Nothing matched prints a miss report on stdout and exits 1. For a lone `id#name` the report reruns the name over string literals, JSX text and comments, prints a `found as` block per kind and a `try:` line to run:
+A match with two or more captures, and a multi-line match under `--body`, keep the node-text form instead, because one source line cannot carry them. Those get no context. They still open with the file they came from, as `path:11-19: …` for a multi-line body and `path:@f:4: …, @call:6: …` for captures, so there is never a match without a file to open. Source read from stdin says `<stdin>`. Nothing matched prints a miss report on stderr, leaves stdout empty and exits 1. For a lone `id#name` the report reruns the name over string literals, JSX text and comments, prints a `found as` block per kind and a `try:` line to run:
 
 ```sh
 ctsq -q 'id#localhost' fixtures/example.go
@@ -234,7 +234,7 @@ fixtures/example.go:14: func NewServer(host string, port int) *Server {
 
 Test files and test scopes (Rust `mod tests` and `#[cfg(test)]` items, Go `_test.go` files and the like) are hidden by default in `tree`, `-q`, `def`, `refs`, `callers`, `callees`, `explain`, `files` and `find`. Which paths and scopes count as tests is set per language in the `[tests]` table of `config/languages/*.toml`, and `ctsq config dump go` shows the merged result. A file named directly on the command line is never hidden.
 
-When something was hidden, the output ends with a count line and a `hidden:` line naming each count and the flag that shows it. When everything was hidden the count reads 0 and the exit is 1.
+When something was hidden, the output ends with a count line and one `hidden:` line per reason, in the order tests, excluded paths, over `--max-matches`, each naming its count and the flag that shows it. When everything was hidden, stdout is empty, stderr says `no <noun> to X outside tests in PATH (N files)` followed by the `hidden:` lines, and the exit is 1.
 
 ```sh
 ctsq refs HiddenLimit fixtures/hidden
@@ -244,11 +244,24 @@ fixtures/hidden/limit.go:7: "HiddenLimit"
 hidden: 2 in tests (--tests)
 
 ctsq -q 'id#HiddenLimit' fixtures/hidden --exclude 'limit*'
-0 matches
-hidden: 4 in excluded paths (drop --exclude)
+no match for id#HiddenLimit outside tests and excluded paths in fixtures/hidden (3 files)
+hidden: 2 in tests (--tests)
+hidden: 2 in excluded paths (drop --exclude)
 ```
 
-`--tests` shows the test hits again. `--exclude GLOB` hides more paths and can be given more than once.
+The last block is stderr, and stdout is empty. `--tests` shows the test hits again. `--exclude GLOB` hides more paths and can be given more than once.
+
+`--max-matches N` is a global flag that prints at most N matches, rows or entries on `-q`, `def`, `refs`, `callers`, `callees`, `explain`, `files`, `find` and `tree`. The rest are counted on a footer line, where the last number is the N that shows everything:
+
+```sh
+ctsq -q 'id#run' src/ --max-matches 3
+src/calltree.rs:11: run(Direction::Down, names, where_, jobs, hider, max_depth, scope);
+src/calltree.rs:15: run(Direction::Up, names, where_, jobs, hider, max_depth, scope);
+src/calltree.rs:18: fn run(dir: Direction, names: &[String], where_: &str, jobs: &[(String, &'static str)], mut hider: files::Hider, max_depth: usize, scope: Option<scope::Opts>) {
+3 matches
+hidden: 51 in tests (--tests)
+hidden: 53 over --max-matches 3 in 13 files (--max-matches 56)
+```
 
 ### `tree [PATHS…]` — structural outline
 
@@ -277,7 +290,7 @@ helper()
 ├── main()  [example.js:1]
 └── main()  [example.js:10]
 
-ctsq callers Start fixtures/ --depth 5   # default depth: 3
+ctsq callers Start fixtures/ --max-depth 5   # default: 3 (--depth still works)
 Start()
 └── main()  [example.go:18]
 ```
@@ -325,7 +338,7 @@ ctsq def NewServer fixtures/
 fixtures/example.go:14: func NewServer(host string, port int) *Server {
 ```
 
-Resolution runs the two steps `explain` runs, in the same order: the call-graph definition index first, then the `tree` outline for the definitions the index cannot hold, such as a struct, a class or a type alias. Nothing found prints a miss report on stdout, with up to three names that look close, and exits 1:
+Resolution runs the two steps `explain` runs, in the same order: the call-graph definition index first, then the `tree` outline for the definitions the index cannot hold, such as a struct, a class or a type alias. Nothing found prints a miss report on stderr, with up to three names that look close, leaves stdout empty and exits 1:
 
 ```sh
 ctsq def NewServe fixtures/
@@ -387,7 +400,7 @@ ctsq files -q 'id#NewServer' -q 'id#host' fixtures/
 fixtures/example.go  2 3
 ```
 
-The trailing column is the per-query match count, in the order the `-q` flags were given. Repeat `-q` once per query. Nothing matching every query prints a miss report on stdout and exits 1.
+The trailing column is the per-query match count, in the order the `-q` flags were given. Repeat `-q` once per query. Nothing matching every query prints a miss report on stderr and exits 1.
 
 ### `imports FILE PATH` — import chain (down)
 

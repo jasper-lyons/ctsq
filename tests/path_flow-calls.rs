@@ -166,7 +166,7 @@ fn backward_with_no_matching_origin_exits_1_and_mixed_queries_exit_2() {
 
 #[test]
 fn max_bounds_the_depth_of_calls_followed() {
-    let o = path_cmd("function#handle variable#body ==> function#log.Printf", &["--max", "1"]);
+    let o = path_cmd("function#handle variable#body ==> function#log.Printf", &["--max-depth", "1"]);
     let t = out(&o);
     assert_eq!(code(&o), 0, "{t}");
     assert!(t.contains("func first(s string)"), "{t}");

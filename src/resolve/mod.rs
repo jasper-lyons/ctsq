@@ -325,10 +325,12 @@ pub fn run_def(
     }
 }
 
-/// `run_def` as text. With one name a miss keeps its stdout report. With
-/// several, a miss is only named on the `not found:` line, and the footer
-/// counts everything hidden across all names, once, at the end. The code is 0
-/// when any definition was shown, 1 otherwise.
+/// `run_def` as text. With one name a miss gets a report on stderr, ahead of
+/// the `not found:` line, and stdout stays empty. With several, a miss is only
+/// named on the `not found:` line. The footer counts everything hidden across
+/// all names, once, at the end. When every definition was hidden, stdout is
+/// empty and stderr says so (BUILD.md A20). The code is 0 when any definition
+/// was shown, 1 otherwise.
 pub fn def_report(
     names: &[String],
     where_: &str,
@@ -338,6 +340,7 @@ pub fn def_report(
     glossary: Option<&crate::config::glossary::Glossary>,
 ) -> NamesOut {
     let mut out = String::new();
+    let mut miss_text = String::new();
     let mut hidden = crate::footer::Hidden::default();
     let mut printer = scope.map(|o| crate::scope::Printer::new(o, jobs));
     let mut shown = 0usize;
@@ -360,7 +363,7 @@ pub fn def_report(
         if rows.is_empty() {
             missing.push(expr.clone());
             if names.len() == 1 {
-                out.push_str(&format!(
+                miss_text.push_str(&format!(
                     "no definition for '{}' in {} ({} {})\n",
                     expr,
                     where_,
@@ -369,15 +372,16 @@ pub fn def_report(
                 ));
                 let similar = similar_names(crate::explain::bare_name(expr), &all_names);
                 if !similar.is_empty() {
-                    out.push_str(&format!("similar names: {}\n", similar.join(", ")));
+                    miss_text.push_str(&format!("similar names: {}\n", similar.join(", ")));
                 }
             }
             for n in &notes {
-                out.push_str(&format!("{}\n", n));
+                miss_text.push_str(&format!("{}\n", n));
             }
             continue;
         }
         let rows = hider.keep(rows, |(f, l, _)| (f.clone(), *l), &mut hidden);
+        let rows: Vec<_> = rows.into_iter().filter(|(f, _, _)| crate::footer::take(f)).collect();
         shown += rows.len();
         for (file, line, conf) in rows {
             let line_text = std::fs::read_to_string(&file)
@@ -395,15 +399,22 @@ pub fn def_report(
             out.push_str(&format!("{}\n", n));
         }
     }
-    // Every definition hidden: the footer says where they are, and exit 1.
-    if missing.len() < names.len() {
+    crate::footer::settle(&mut hidden);
+    let mut err = miss_text;
+    if shown == 0 && hidden.any() {
+        // Every definition hidden: stderr says where they are, and exit 1.
+        out.clear();
+        err.push_str(&crate::footer::nothing_shown(
+            &format!("no definition to {}", names.join(", ")),
+            where_,
+            jobs.len(),
+            &hidden,
+        ));
+    } else if shown > 0 {
         out.push_str(&crate::footer::tail(shown, "definition", &hidden, scope.is_some()));
     }
-    NamesOut {
-        out,
-        err: not_found_line(&missing, jobs),
-        code: if shown == 0 { 1 } else { 0 },
-    }
+    err.push_str(&not_found_line(&missing, jobs));
+    NamesOut { out, err, code: if shown == 0 { 1 } else { 0 } }
 }
 
 /// Definition sites for `expr`, in the order `explain` resolves them: the
@@ -880,8 +891,9 @@ mod multi_name_tests {
     #[test]
     fn def_with_one_missing_name_keeps_its_report_and_exits_1() {
         let r = def_report(&names(&["Missing"]), "somewhere", &jobs(), &mut Hider::none(), None, None);
-        assert!(r.out.starts_with("no definition for 'Missing' in somewhere (1 file)\n"), "{}", r.out);
-        assert_eq!(r.err, "not found: Missing\n");
+        assert_eq!(r.out, "");
+        assert!(r.err.starts_with("no definition for 'Missing' in somewhere (1 file)\n"), "{}", r.err);
+        assert!(r.err.ends_with("not found: Missing\n"), "{}", r.err);
         assert_eq!(r.code, 1);
     }
 
@@ -907,20 +919,21 @@ mod multi_name_tests {
     #[test]
     fn callers_report_many_skips_a_missing_name_and_still_exits_0() {
         let up = crate::calltree::Direction::Up;
-        let r = crate::calltree::report_many(up, &names(&["NewServer", "Missing"]), &jobs(), 3, &mut Hider::none(), None);
+        let r = crate::calltree::report_many(up, &names(&["NewServer", "Missing"]), "x", &jobs(), 3, &mut Hider::none(), None);
         assert!(r.out.starts_with("NewServer()\n"), "{}", r.out);
         assert!(!r.out.contains("Missing"), "{}", r.out);
         assert_eq!(r.err, "not found: Missing\n");
         assert_eq!(r.code, 0);
-        let none = crate::calltree::report_many(up, &names(&["Missing"]), &jobs(), 3, &mut Hider::none(), None);
-        assert_eq!(none.out, "Missing()\n");
+        let none = crate::calltree::report_many(up, &names(&["Missing"]), "x", &jobs(), 3, &mut Hider::none(), None);
+        assert_eq!(none.out, "");
+        assert!(none.err.starts_with("Missing()\n"), "{}", none.err);
         assert_eq!(none.code, 1);
     }
 
     #[test]
     fn callers_report_many_separates_names_with_a_blank_line() {
         let up = crate::calltree::Direction::Up;
-        let r = crate::calltree::report_many(up, &names(&["NewServer", "Start"]), &jobs(), 3, &mut Hider::none(), None);
+        let r = crate::calltree::report_many(up, &names(&["NewServer", "Start"]), "x", &jobs(), 3, &mut Hider::none(), None);
         assert!(r.out.contains("\n\nStart()"), "{}", r.out);
         assert_eq!(r.err, "");
     }
@@ -928,13 +941,14 @@ mod multi_name_tests {
     #[test]
     fn explain_report_many_answers_each_name_and_names_the_miss() {
         let opts = crate::explain::Options::default();
-        let r = crate::explain::report_many(&names(&["NewServer", "Missing"]), &jobs(), &opts, &mut Hider::none());
+        let r = crate::explain::report_many(&names(&["NewServer", "Missing"]), "x", &jobs(), &opts, &mut Hider::none());
         assert!(r.out.starts_with("SYMBOL NewServer (1 definition)\n"), "{}", r.out);
         assert!(!r.out.contains("SYMBOL Missing"), "{}", r.out);
         assert_eq!(r.err, "not found: Missing\n");
         assert_eq!(r.code, 0);
-        let one = crate::explain::report_many(&names(&["Missing"]), &jobs(), &opts, &mut Hider::none());
-        assert!(one.out.starts_with("SYMBOL Missing (no definition resolved)\n"), "{}", one.out);
+        let one = crate::explain::report_many(&names(&["Missing"]), "x", &jobs(), &opts, &mut Hider::none());
+        assert_eq!(one.out, "");
+        assert!(one.err.starts_with("SYMBOL Missing (no definition resolved)\n"), "{}", one.err);
         assert_eq!(one.code, 1);
     }
 }

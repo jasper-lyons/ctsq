@@ -17,7 +17,7 @@ Question: show me the function `fmt_tokens`.
 
 ```
 ctsq -q '*function#fmt_tokens' --body src/tree.rs
-src/tree.rs:90-96: fn fmt_tokens(n: usize) -> String {
+src/tree.rs:111-117: fn fmt_tokens(n: usize) -> String {
     if n >= 1000 {
         format!("{:.1}k", n as f64 / 1000.0)
 ...
@@ -31,9 +31,9 @@ Question: show me `fmt_tokens` and `count_items` together.
 
 ```
 ctsq -q '*function#/^(fmt_tokens|count_items)$/' --body src/tree.rs
-src/tree.rs:90-96: fn fmt_tokens(n: usize) -> String {
+src/tree.rs:111-117: fn fmt_tokens(n: usize) -> String {
 ...
-src/tree.rs:98-100: fn count_items(items: &[Item]) -> usize {
+src/tree.rs:119-121: fn count_items(items: &[Item]) -> usize {
     items.iter().map(|i| 1 + count_items(&i.children)).sum()
 }
 ```
@@ -46,13 +46,13 @@ Question: where is `fmt_tokens` used?
 
 ```
 ctsq -q 'id#fmt_tokens' src/
-src/tree.rs:64: fmt_tokens(source.len() / 4),
-src/tree.rs:90: fn fmt_tokens(n: usize) -> String {
+src/tree.rs:70: fmt_tokens(source.len() / 4),
+src/tree.rs:111: fn fmt_tokens(n: usize) -> String {
 2 matches
 hidden: 2 in tests (--tests)
 ```
 
-Each hit is `path:LINE: the source line`, so you rarely need to open the file. Add `-C 3` for three lines of context. The last two lines say two more hits sit in tests, which are hidden by default (example 12). Next: pull the function around line 64 with `ctsq -q '*function#report' --body src/tree.rs`.
+Each hit is `path:LINE: the source line`, so you rarely need to open the file. Add `-C 3` for three lines of context. The last two lines say two more hits sit in tests, which are hidden by default (example 12). Next: pull the function around line 70 with `ctsq -q '*function#report' --body src/tree.rs`.
 
 ### 4. Find where some text appears
 
@@ -79,14 +79,14 @@ Question: what is in `src/tree.rs`, and what does `count_items` do?
 
 ```
 ctsq tree src/tree.rs
-src/tree.rs  775 lines  ~8.2k tokens  29 entries
+src/tree.rs  796 lines  ~8.4k tokens  30 entries
 ├── pub struct Outline {  :5
-├── pub fn report(path: &str, lang_name: Option<&str>, hider: &mut crate::files::Hider) -> Outline {  :19  (52 lines)
-├── fn drop_scoped(items: &mut Vec<Item>, scopes: &[(usize, usize)]) -> usize {  :74  (13 lines)
-├── fn fmt_tokens(n: usize) -> String {  :90
-├── fn count_items(items: &[Item]) -> usize {  :98
+├── pub fn report(path: &str, lang_name: Option<&str>, hider: &mut crate::files::Hider) -> Outline {  :19  (58 lines)
+├── fn drop_scoped(items: &mut Vec<Item>, scopes: &[(usize, usize)]) -> usize {  :95  (13 lines)
+├── fn fmt_tokens(n: usize) -> String {  :111
+├── fn count_items(items: &[Item]) -> usize {  :119
 ...
-29 entries
+30 entries
 hidden: 13 in tests (--tests)
 ```
 
@@ -94,7 +94,7 @@ The header gives the file size, so you know whether a whole Read is sensible. Th
 
 ```
 ctsq -q '*function#count_items' --body src/tree.rs
-src/tree.rs:98-100: fn count_items(items: &[Item]) -> usize {
+src/tree.rs:119-121: fn count_items(items: &[Item]) -> usize {
     items.iter().map(|i| 1 + count_items(&i.children)).sum()
 }
 ```
@@ -108,9 +108,9 @@ ctsq callers count_items src/
 count_items()
 ├── report()  [tree.rs:19]
 ...
-└── count_items()  [tree.rs:98] (cycle)
-7 callers
-hidden: 8 in tests (--tests)
+└── count_items()  [tree.rs:119] (cycle)
+11 callers
+hidden: 12 in tests (--tests)
 ```
 
 The tree reads upward through every level. `callees` goes down and `callgraph` shows both. Next: pull the nearest caller with `ctsq -q '*function#report' --body src/tree.rs`.
@@ -142,7 +142,7 @@ Question: what is `count_items` and how is it used?
 ctsq explain count_items src/
 SYMBOL count_items (1 definition)
 
-DEFINITION src/tree.rs:98  function
+DEFINITION src/tree.rs:119  function
 fn count_items(items: &[Item]) -> usize {
     items.iter().map(|i| 1 + count_items(&i.children)).sum()
 }
@@ -190,7 +190,7 @@ try: ctsq -q 'string#/Cannot detect/' src/tree.rs
 [exit 1]
 ```
 
-When an `id#` query matches nothing, ctsq reruns the name as a substring (or your regex) over string literals, JSX text and comments in the same files and prints one `found as` block per kind it finds, then a `try:` line whose query matches those rows. A definition query that matches nothing, such as `*function#Server` when `Server` is a type, says `Server is defined as a type here: path:line` with a `try:` line for that kind. A path that does not exist prints `no such file: X (did you mean Y)` on stderr and the other paths still run. A query that cannot parse prints the query with a caret under the fault and exits 2. A miss exits 1. Next: run the `try:` line.
+When an `id#` query matches nothing, ctsq reruns the name as a substring (or your regex) over string literals, JSX text and comments in the same files and prints one `found as` block per kind it finds, then a `try:` line whose query matches those rows. A definition query that matches nothing, such as `*function#Server` when `Server` is a type, says `Server is defined as a type here: path:line` with a `try:` line for that kind. A path that does not exist prints `no such file: X (did you mean Y)` on stderr and the other paths still run. A query that cannot parse prints the query with a caret under the fault and exits 2. A miss exits 1, and the whole report above goes to stderr with stdout left empty, which is why the output here shows it with no result rows. Next: run the `try:` line.
 
 ### 12. Hidden tests, and how to show them
 
@@ -204,7 +204,7 @@ fixtures/hidden/limit.go:7: "HiddenLimit"
 hidden: 2 in tests (--tests)
 ```
 
-Test files and test scopes are hidden by default from `tree`, `-q`, `def`, `refs`, `callers`, `callees`, `explain` and `files`. Whatever a command hides is counted on a last `hidden:` line, after a count of what it showed, with the flag that brings it back. Output that hid nothing has no such lines. What counts as a test is set per language: Go `*_test.go` and `testdata/`, JS and TS `*.test.*`, `*.spec.*`, `__tests__/`, `test/`, `tests/`, `e2e/`, Python `test_*.py`, `*_test.py`, `conftest.py`, `tests/`, Ruby `*_test.rb`, `*_spec.rb`, `test/`, `spec/`, C and C++ `*_test.*`, `test_*.*`, `test/`, `tests/`, and Rust `tests/`, `mod tests` and anything under `#[cfg(test)]`. Paths are judged from the path you search, so `ctsq -q X tests/` searches inside tests/ as usual, and a file you name directly is never hidden. `ctsq config dump go` shows the table, and a repo `.ctsq/languages/go.toml` with a `[tests]` table changes it. `--exclude GLOB` hides more paths the same way, counted as `in excluded paths`. When everything matched was hidden the count line reads `0 matches` and the exit is 1. Next: add `--tests`.
+Test files and test scopes are hidden by default from `tree`, `-q`, `def`, `refs`, `callers`, `callees`, `explain` and `files`. Whatever a command hides is counted on `hidden:` lines after a count of what it showed, one line per reason (tests, excluded paths, over `--max-matches`), each with the flag that brings it back. Output that hid nothing has no such lines. What counts as a test is set per language: Go `*_test.go` and `testdata/`, JS and TS `*.test.*`, `*.spec.*`, `__tests__/`, `test/`, `tests/`, `e2e/`, Python `test_*.py`, `*_test.py`, `conftest.py`, `tests/`, Ruby `*_test.rb`, `*_spec.rb`, `test/`, `spec/`, C and C++ `*_test.*`, `test_*.*`, `test/`, `tests/`, and Rust `tests/`, `mod tests` and anything under `#[cfg(test)]`. Paths are judged from the path you search, so `ctsq -q X tests/` searches inside tests/ as usual, and a file you name directly is never hidden. `ctsq config dump go` shows the table, and a repo `.ctsq/languages/go.toml` with a `[tests]` table changes it. `--exclude GLOB` hides more paths the same way, counted as `in excluded paths`. When everything matched was hidden, stdout is empty and stderr reads `no match for Q outside tests in PATH (N files)` followed by the `hidden:` lines, and the exit is 1. Next: add `--tests`.
 
 ```
 ctsq refs HiddenLimit fixtures/hidden --tests
@@ -231,11 +231,11 @@ fixtures/scope/Asset.tsx:11: const saveAssetNow = () => props.asset  ?
 
 ```
 ctsq -q 'id#hide_rows' --scope src/
-src/main.rs:998: hide_rows(&mut hider, file, &source, rows, true, &mut hidden)
-  in src/main.rs:645-1069  fn main() {
-src/main.rs:1074: fn hide_rows(
-src/main.rs:1366: for r in &hide_rows(&mut hider, file, &source, rows, false, &mut name_hidden) {
-  in src/main.rs:1326-1391  fn run_refs(
+src/main.rs:1023: hide_rows(&mut hider, file, &source, rows, true, &mut hidden)
+  in src/main.rs:660-1102  fn main() {
+src/main.rs:1107: fn hide_rows(
+src/main.rs:1404: for r in &hide_rows(&mut hider, file, &source, rows, false, &mut name_hidden) {
+  in src/main.rs:1363-1440  fn run_refs(
 3 matches
 ```
 
@@ -276,11 +276,11 @@ Question: which component renders the `/about` page? A route lives in a framewor
 
 ```
 ctsq find
-built-in queries/react-router.toml:9: route       react-router   (import react-router in fixtures/queries/react-router/src/App.tsx)
-built-in queries/solid-routes.toml:9: route       solid-routes   (import @solidjs/router in fixtures/queries/solid-mavexa/frontend/src/routesConfig.ts)
+built-in queries/react-router.toml:9:   route      react-router   (import react-router in fixtures/queries/react-router/src/App.tsx)
+built-in queries/solid-routes.toml:9:   route      solid-routes   (import @solidjs/router in fixtures/queries/solid-mavexa/frontend/src/routesConfig.ts)
 ```
 
-Each row names the file and line the query is defined at, the query, the framework, and why it applies here. Then ask one, with a key:
+Each row names the file and line the query is defined at, the query, the framework, and why it applies here, in columns that line up. Then ask one, with a key:
 
 ```
 ctsq find route about
@@ -356,13 +356,27 @@ Question: where are `fmt_tokens` and `count_items` defined, and is `Nothingness`
 
 ```
 ctsq def fmt_tokens count_items Nothingness src/
-src/tree.rs:90: fn fmt_tokens(n: usize) -> String {
-src/tree.rs:98: fn count_items(items: &[Item]) -> usize {
+src/tree.rs:111: fn fmt_tokens(n: usize) -> String {
+src/tree.rs:119: fn count_items(items: &[Item]) -> usize {
 not found: Nothingness
 [exit 0]
 ```
 
 The names that did not resolve are listed on one `not found:` line on stderr, with `(similar: x in path:line)` after a name when a near name exists. The exit is 0 when any name resolved and 1 when none did, so a chain of lookups no longer looks failed because one name missed. The test footer, if any, counts all names once at the end. An argument that exists on disk is a path, an argument with a `/` that does not exist prints `no such file: X (did you mean Y)` and is dropped, and `--` makes everything after it a path. A name that is also a file or directory here, such as `src`, is a usage error (exit 2) until you write `ctsq def src -- lib/`. For `-q` a regex name filter already covers several names: `*function#/^(A|B)$/`. Next: `ctsq explain fmt_tokens count_items src/`.
+
+### 21. Cap a long answer
+
+Question: a name has dozens of hits and you only need a taste. `--max-matches N` prints at most N matches, rows or entries on `-q`, `def`, `refs`, `callers`, `callees`, `explain`, `files`, `find` and `tree`, so there is no need to pipe into `head`.
+
+```
+ctsq -q 'id#fmt_tokens' src/ --max-matches 1
+src/tree.rs:70: fmt_tokens(source.len() / 4),
+1 match
+hidden: 2 in tests (--tests)
+hidden: 1 over --max-matches 1 in 1 file (--max-matches 2)
+```
+
+The cut part is counted on its own `hidden:` line, with the number of files it sits in and the `--max-matches` value that shows every hit. A cut call still exits 0 because it printed rows. Next: rerun with the suggested number.
 
 ## Reference
 
@@ -473,7 +487,7 @@ ctsq callers IntersectWindows src/
 ctsq callees Loading src/
 
 # Limit depth for large codebases
-ctsq callers ProcessMessages src/ --depth 2
+ctsq callers ProcessMessages src/ --max-depth 2
 
 # Whole-project graph: DOT by default, plain pairs with --format edges
 ctsq callgraph src/ --format edges
@@ -835,7 +849,7 @@ ctsq tree src/winsys.cpp
 ctsq callers IntersectWindows src/
 
 # What a function calls (limit depth for large codebases)
-ctsq callees Loading src/ --depth 2
+ctsq callees Loading src/ --max-depth 2
 
 # Files where two things both occur (grep cannot do this in one call)
 ctsq files -q 'id#itemCols' -q 'id#Tx' backend/internal/store/

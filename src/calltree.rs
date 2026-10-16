@@ -1,5 +1,5 @@
 use crate::files;
-use crate::footer::{tail, Hidden};
+use crate::footer::{self, tail, Hidden};
 use crate::resolve::graph::{self, CallGraph, NodeKey};
 use crate::resolve::Confidence;
 use crate::scope;
@@ -7,16 +7,16 @@ use std::collections::HashSet;
 
 // ── Public entry points ───────────────────────────────────────────────────────
 
-pub fn callees(names: &[String], jobs: &[(String, &'static str)], hider: files::Hider, max_depth: usize, scope: Option<scope::Opts>) {
-    run(Direction::Down, names, jobs, hider, max_depth, scope);
+pub fn callees(names: &[String], where_: &str, jobs: &[(String, &'static str)], hider: files::Hider, max_depth: usize, scope: Option<scope::Opts>) {
+    run(Direction::Down, names, where_, jobs, hider, max_depth, scope);
 }
 
-pub fn callers(names: &[String], jobs: &[(String, &'static str)], hider: files::Hider, max_depth: usize, scope: Option<scope::Opts>) {
-    run(Direction::Up, names, jobs, hider, max_depth, scope);
+pub fn callers(names: &[String], where_: &str, jobs: &[(String, &'static str)], hider: files::Hider, max_depth: usize, scope: Option<scope::Opts>) {
+    run(Direction::Up, names, where_, jobs, hider, max_depth, scope);
 }
 
-fn run(dir: Direction, names: &[String], jobs: &[(String, &'static str)], mut hider: files::Hider, max_depth: usize, scope: Option<scope::Opts>) {
-    let r = report_many(dir, names, jobs, max_depth, &mut hider, scope);
+fn run(dir: Direction, names: &[String], where_: &str, jobs: &[(String, &'static str)], mut hider: files::Hider, max_depth: usize, scope: Option<scope::Opts>) {
+    let r = report_many(dir, names, where_, jobs, max_depth, &mut hider, scope);
     print!("{}", r.out);
     use std::io::Write;
     let _ = std::io::stdout().flush();
@@ -74,13 +74,16 @@ pub fn report_scoped(
 }
 
 /// `report_scoped` for several names. Each name's tree prints in order with a
-/// blank line between. A name that resolved to nothing keeps its bare
-/// `name()` line only when it is the one name asked for, and otherwise goes on
-/// the `not found:` stderr line. The footer counts across all names, once. The
-/// code is 0 when any name resolved to a definition or had a row to show.
+/// blank line between. A name that resolved to nothing goes on the `not found:`
+/// stderr line, and when it is the one name asked for its bare `name()` line
+/// goes to stderr too, with stdout empty. When every row was hidden stdout is
+/// empty and stderr says so (BUILD.md A20). The footer counts across all names,
+/// once. The code is 0 when any name resolved to a definition or had a row to
+/// show.
 pub fn report_many(
     dir: Direction,
     names: &[String],
+    where_: &str,
     jobs: &[(String, &'static str)],
     max_depth: usize,
     hider: &mut files::Hider,
@@ -114,13 +117,28 @@ pub fn report_many(
         }
     }
     let noun = if dir == Direction::Up { "caller" } else { "callee" };
+    footer::settle(&mut w.hidden);
+    let mut err = String::new();
     let mut out = w.out;
-    out.push_str(&tail(w.shown, noun, &w.hidden, scope.is_some()));
-    crate::resolve::NamesOut {
-        out,
-        err: crate::resolve::not_found_line(&missing, jobs),
-        code: if resolved { 0 } else { 1 },
+    if !resolved {
+        // Nothing to print on stdout: a hidden-everything report or the miss.
+        if w.hidden.any() {
+            out.clear();
+            err.push_str(&footer::nothing_shown(
+                &format!("no {} to {}", noun, names.join(", ")),
+                where_,
+                jobs.len(),
+                &w.hidden,
+            ));
+        } else {
+            err.push_str(&out);
+            out.clear();
+        }
+    } else {
+        out.push_str(&tail(w.shown, noun, &w.hidden, scope.is_some()));
     }
+    err.push_str(&crate::resolve::not_found_line(&missing, jobs));
+    crate::resolve::NamesOut { out, err, code: if resolved { 0 } else { 1 } }
 }
 
 /// One name's tree, appended to `w.out`. True when a definition of the name
@@ -269,8 +287,13 @@ impl Walk<'_> {
         let edges = self.visible(edges);
         let n = edges.len();
         for (i, &e) in edges.iter().enumerate() {
-            self.shown += 1;
             let rc = &g.calls[e];
+            // Past --max-matches a row is counted, not printed, and so is
+            // everything below it.
+            let print = footer::take(&g.index.defs[rc.caller].id.file);
+            if print {
+                self.shown += 1;
+            }
             let is_last = i == n - 1;
             let connector = if is_last { "└── " } else { "├── " };
             let child_prefix = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
@@ -281,19 +304,25 @@ impl Walk<'_> {
                     let loc = format!("[{}:{}]", short_path(&d.id.file), d.id.line);
                     let tk = NodeKey::Def(d.id.clone());
                     if visited.contains(&tk) {
-                        self.out.push_str(&format!("{}{}{}()  {}{} (cycle)\n", prefix, connector, rc.callee_display, loc, mark));
-                        self.scope_rows(e, &child_prefix);
+                        if print {
+                            self.out.push_str(&format!("{}{}{}()  {}{} (cycle)\n", prefix, connector, rc.callee_display, loc, mark));
+                            self.scope_rows(e, &child_prefix);
+                        }
                     } else {
-                        self.out.push_str(&format!("{}{}{}()  {}{}\n", prefix, connector, rc.callee_display, loc, mark));
-                        self.scope_rows(e, &child_prefix);
+                        if print {
+                            self.out.push_str(&format!("{}{}{}()  {}{}\n", prefix, connector, rc.callee_display, loc, mark));
+                            self.scope_rows(e, &child_prefix);
+                        }
                         visited.insert(tk.clone());
                         self.down(&tk, depth + 1, &child_prefix, visited);
                         visited.remove(&tk);
                     }
                 }
                 None => {
-                    self.out.push_str(&format!("{}{}{}()\n", prefix, connector, rc.callee_display));
-                    self.scope_rows(e, &child_prefix);
+                    if print {
+                        self.out.push_str(&format!("{}{}{}()\n", prefix, connector, rc.callee_display));
+                        self.scope_rows(e, &child_prefix);
+                    }
                 }
             }
         }
@@ -306,9 +335,12 @@ impl Walk<'_> {
         let edges = self.visible(edges);
         let n = edges.len();
         for (i, &e) in edges.iter().enumerate() {
-            self.shown += 1;
             let rc = &g.calls[e];
             let d = &g.index.defs[rc.caller];
+            let print = footer::take(&d.id.file);
+            if print {
+                self.shown += 1;
+            }
             let is_last = i == n - 1;
             let connector = if is_last { "└── " } else { "├── " };
             let mark = match rc.target {
@@ -319,11 +351,15 @@ impl Walk<'_> {
             let tk = NodeKey::Def(d.id.clone());
             let child_prefix = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
             if visited.contains(&tk) {
-                self.out.push_str(&format!("{}{}{}()  {}{} (cycle)\n", prefix, connector, d.name, loc, mark));
-                self.scope_rows(e, &child_prefix);
+                if print {
+                    self.out.push_str(&format!("{}{}{}()  {}{} (cycle)\n", prefix, connector, d.name, loc, mark));
+                    self.scope_rows(e, &child_prefix);
+                }
             } else {
-                self.out.push_str(&format!("{}{}{}()  {}{}\n", prefix, connector, d.name, loc, mark));
-                self.scope_rows(e, &child_prefix);
+                if print {
+                    self.out.push_str(&format!("{}{}{}()  {}{}\n", prefix, connector, d.name, loc, mark));
+                    self.scope_rows(e, &child_prefix);
+                }
                 visited.insert(tk.clone());
                 self.up(&tk, depth + 1, &child_prefix, visited);
                 visited.remove(&tk);

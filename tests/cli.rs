@@ -77,12 +77,13 @@ fn stdin_source_keeps_its_own_name_in_the_node_form() {
 }
 
 #[test]
-fn a_query_that_matches_nothing_says_so_on_stdout() {
+fn a_query_that_matches_nothing_says_so_on_stderr() {
     let f = fixture("example.go");
     let out = ctsq(&["-q", "id#no_such_name_anywhere", &f]);
-    let text = stdout(&out);
+    let text = stderr(&out);
     assert!(text.starts_with("no identifier matches id#no_such_name_anywhere in "), "{}", text);
     assert!(text.contains("(1 file)"), "{}", text);
+    assert_eq!(stdout(&out), "", "a miss leaves stdout empty");
     assert_eq!(out.status.code(), Some(1), "a miss exits 1 like grep");
 }
 
@@ -90,7 +91,8 @@ fn a_query_that_matches_nothing_says_so_on_stdout() {
 fn a_query_other_than_a_lone_id_keeps_the_no_match_header() {
     let f = fixture("example.go");
     let out = ctsq(&["-q", "function#no_such_name_anywhere variable#x", &f]);
-    let text = stdout(&out);
+    let text = stderr(&out);
+    assert_eq!(stdout(&out), "");
     assert!(text.starts_with("no match for function#no_such_name_anywhere variable#x in "), "{}", text);
     assert!(text.contains("(1 file)"), "{}", text);
     assert_eq!(out.status.code(), Some(1));
@@ -100,7 +102,8 @@ fn a_query_other_than_a_lone_id_keeps_the_no_match_header() {
 fn an_id_miss_reports_where_the_name_is_a_string_literal() {
     let f = fixture("example.go");
     let out = ctsq(&["-q", "id#/starting/", &f]);
-    let text = stdout(&out);
+    let text = stderr(&out);
+    assert_eq!(stdout(&out), "");
     assert_eq!(out.status.code(), Some(1));
     assert!(text.starts_with(&format!("no identifier matches id#/starting/ in {} (1 file)\n", f)), "{}", text);
     assert!(text.contains("found as string literal:\n"), "{}", text);
@@ -117,7 +120,8 @@ fn an_id_miss_reports_where_the_name_is_a_string_literal() {
 fn a_definition_miss_says_what_the_name_is_defined_as() {
     let f = fixture("example.go");
     let out = ctsq(&["-q", "*function#Server", &f]);
-    let text = stdout(&out);
+    let text = stderr(&out);
+    assert_eq!(stdout(&out), "");
     assert_eq!(out.status.code(), Some(1));
     assert!(text.starts_with(&format!("no definition matches *function#Server in {} (1 file)\n", f)), "{}", text);
     assert!(text.contains(&format!("Server is defined as a type here: {}:5\n", f)), "{}", text);
@@ -132,8 +136,9 @@ fn a_walk_with_no_files_is_a_miss() {
     std::fs::write(d.join("notes.txt"), "id").unwrap();
     let dir = d.to_str().unwrap();
     let out = ctsq(&["-q", "id#x", dir]);
-    let text = stdout(&out);
-    assert_eq!(out.status.code(), Some(1), "{}{}", text, stderr(&out));
+    let text = stderr(&out);
+    assert_eq!(stdout(&out), "");
+    assert_eq!(out.status.code(), Some(1), "{}", text);
     assert!(text.starts_with(&format!("no identifier matches id#x in {} (0 files)\n", dir)), "{}", text);
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -173,10 +178,11 @@ fn an_escaped_slash_and_a_quote_inside_a_filter_compile_and_run() {
     let f = fixture("example.go");
     let out = ctsq(&["-q", "id#/a\\/b/", &f]);
     assert_eq!(out.status.code(), Some(1), "a miss, not a parse error: {}", stderr(&out));
-    assert!(stderr(&out).is_empty(), "{}", stderr(&out));
+    assert!(stderr(&out).starts_with("no identifier matches id#/a\\/b/ in "), "{}", stderr(&out));
     let out = ctsq(&["-q", "literal#/call\"/", &f]);
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
-    assert!(stderr(&out).is_empty(), "no per-file tree-sitter error: {}", stderr(&out));
+    assert!(stderr(&out).starts_with("no match for literal#/call\"/ in "), "no per-file tree-sitter error: {}", stderr(&out));
+    assert!(!stderr(&out).contains("rror"), "no per-file tree-sitter error: {}", stderr(&out));
 }
 
 #[test]
@@ -205,14 +211,15 @@ fn a_missing_path_suggests_a_close_sibling() {
 }
 
 #[test]
-fn def_resolves_a_type_and_reports_a_miss_on_stdout() {
+fn def_resolves_a_type_and_reports_a_miss_on_stderr() {
     let dir = fixture("");
     let out = ctsq(&["def", "Server", &dir]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(stdout(&out).contains("type Server struct {"), "{}", stdout(&out));
 
     let miss = ctsq(&["def", "NewServe", &dir]);
-    let text = stdout(&miss);
+    assert_eq!(stdout(&miss), "");
+    let text = stderr(&miss);
     assert!(text.starts_with("no definition for 'NewServe' in "), "{}", text);
     assert!(text.contains(" files)") && !text.contains("scanned"), "{}", text);
     assert!(text.contains("similar names: NewServer"), "{}", text);
@@ -254,9 +261,10 @@ fn files_lists_only_what_matches_every_query() {
 }
 
 #[test]
-fn files_reports_a_miss_on_stdout() {
+fn files_reports_a_miss_on_stderr() {
     let out = ctsq(&["files", "-q", "id#NewServer", "-q", "id#nothing_here", &fixture("")]);
-    let text = stdout(&out);
+    assert_eq!(stdout(&out), "");
+    let text = stderr(&out);
     assert!(text.starts_with("no file matches all 2 queries in "), "{}", text);
     assert_eq!(out.status.code(), Some(1));
 }
@@ -393,7 +401,8 @@ fn a_directory_walk_includes_shebang_scripts_in_each_language() {
 #[test]
 fn a_def_miss_over_one_file_says_1_file() {
     let out = ctsq(&["def", "zzzqq", &fixture("example.go")]);
-    assert!(stdout(&out).contains("(1 file)"), "{}", stdout(&out));
+    assert!(stderr(&out).contains("(1 file)"), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
     assert_eq!(out.status.code(), Some(1));
 }
 
@@ -469,7 +478,11 @@ fn a_query_hides_rust_test_scopes() {
 fn a_query_whose_only_matches_are_hidden_prints_the_footer_and_exits_1() {
     let out = ctsq(&["-q", "id#limitSeen", &fixture("hidden")]);
     assert_eq!(out.status.code(), Some(1));
-    assert_eq!(stdout(&out), "0 matches\nhidden: 1 in tests (--tests)\n");
+    assert_eq!(stdout(&out), "");
+    assert_eq!(
+        stderr(&out),
+        format!("no match for id#limitSeen outside tests in {} (3 files)\nhidden: 1 in tests (--tests)\n", fixture("hidden"))
+    );
     let shown = ctsq(&["-q", "id#limitSeen", &fixture("hidden"), "--tests"]);
     assert!(shown.status.success(), "{}", stdout(&shown));
 }
@@ -494,9 +507,13 @@ fn output_that_hides_nothing_has_no_footer() {
 fn exclude_hides_paths_and_names_its_own_reason() {
     let out = ctsq(&["-q", "id#HiddenLimit", &fixture("hidden"), "--exclude", "limit.go"]);
     assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stdout(&out), "");
     assert_eq!(
-        stdout(&out),
-        "0 matches\nhidden: 2 in tests (--tests), 2 in excluded paths (drop --exclude)\n"
+        stderr(&out),
+        format!(
+            "no match for id#HiddenLimit outside tests and excluded paths in {} (3 files)\nhidden: 2 in tests (--tests)\nhidden: 2 in excluded paths (drop --exclude)\n",
+            fixture("hidden")
+        )
     );
 }
 
@@ -518,12 +535,20 @@ fn def_and_files_hide_tests_too() {
     let dir = fixture("hidden");
     let def = ctsq(&["def", "max_is_three", &dir]);
     assert_eq!(def.status.code(), Some(1));
-    assert_eq!(stdout(&def), "0 definitions\nhidden: 1 in tests (--tests)\n");
+    assert_eq!(stdout(&def), "");
+    assert_eq!(
+        stderr(&def),
+        format!("no definition to max_is_three outside tests in {} (3 files)\nhidden: 1 in tests (--tests)\n", dir)
+    );
     assert!(stdout(&ctsq(&["def", "max_is_three", &dir, "--tests"])).contains("lib.rs:14:"));
 
     let files = ctsq(&["files", "-q", "id#HiddenLimit", "-q", "id#limitSeen", &dir]);
     assert_eq!(files.status.code(), Some(1));
-    assert_eq!(stdout(&files), "0 files\nhidden: 1 in tests (--tests)\n");
+    assert_eq!(stdout(&files), "");
+    assert_eq!(
+        stderr(&files),
+        format!("no file matches all 2 queries outside tests in {} (3 files)\nhidden: 1 in tests (--tests)\n", dir)
+    );
 }
 
 #[test]
@@ -575,7 +600,7 @@ fn every_try_line_runs_on_the_same_paths_in_a_mixed_language_dir() {
     std::fs::write(d.join("b.go"), "package main\n\nfunc main() {}\n").unwrap();
     let dir = d.to_str().unwrap();
     let out = ctsq(&["-q", "id#/Still reading/", dir]);
-    let text = stdout(&out);
+    let text = stderr(&out);
     assert_eq!(out.status.code(), Some(1), "{}", text);
     assert!(text.contains("found as JSX text:"), "{}", text);
     let tries: Vec<&str> = text.lines().filter(|l| l.starts_with("try: ctsq ")).collect();
@@ -609,7 +634,8 @@ fn a_hidden_test_caller_is_counted_once_and_matches_the_extra_rows_of_tests() {
 fn explain_exits_1_when_nothing_resolves_or_everything_is_hidden() {
     let miss = ctsq(&["explain", "no_such_symbol_anywhere", &fixture("example.c")]);
     assert_eq!(miss.status.code(), Some(1), "{}", stdout(&miss));
-    assert!(stdout(&miss).contains("no definition resolved"), "{}", stdout(&miss));
+    assert_eq!(stdout(&miss), "");
+    assert!(stderr(&miss).contains("no definition resolved"), "{}", stderr(&miss));
 
     let d = scratch_dir("explainhidden");
     std::fs::write(d.join("a.go"), "package p\n\nfunc Other() {}\n").unwrap();
@@ -617,7 +643,8 @@ fn explain_exits_1_when_nothing_resolves_or_everything_is_hidden() {
     let dir = d.to_str().unwrap();
     let hidden = ctsq(&["explain", "OnlyInTests", dir]);
     assert_eq!(hidden.status.code(), Some(1), "{}", stdout(&hidden));
-    assert!(stdout(&hidden).contains("hidden: "), "the footer still prints: {}", stdout(&hidden));
+    assert_eq!(stdout(&hidden), "");
+    assert!(stderr(&hidden).contains("hidden: "), "the hidden line goes to stderr: {}", stderr(&hidden));
     let shown = ctsq(&["explain", "OnlyInTests", dir, "--tests"]);
     assert!(shown.status.success(), "{}", stdout(&shown));
     let _ = std::fs::remove_dir_all(&d);
@@ -840,11 +867,11 @@ fn find_with_no_arguments_lists_what_applies_and_exits_0() {
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(
         stdout(&out),
-        "built-in queries/jsx-component.toml:8: component  jsx-component  (always)\n\
-         built-in queries/error-js.toml:7: error           js-error       (always)\n\
-         built-in queries/jsx-label.toml:8: label          jsx-label      (always)\n\
-         built-in queries/solid-routes.toml:9: route       solid-routes   (import @solidjs/router in src/App.tsx)\n\
-         built-in queries/jsx-text.toml:7: text            jsx-text       (always)\n\
+        "built-in queries/jsx-component.toml:8:  component  jsx-component  (always)\n\
+         built-in queries/error-js.toml:7:       error      js-error       (always)\n\
+         built-in queries/jsx-label.toml:8:      label      jsx-label      (always)\n\
+         built-in queries/solid-routes.toml:9:   route      solid-routes   (import @solidjs/router in src/App.tsx)\n\
+         built-in queries/jsx-text.toml:7:       text       jsx-text       (always)\n\
          not detected here: error (go-error), error (ruby-error), route (chi), route (net-http), route (next-app), route (rails-routes), route (react-router)\n"
     );
 }
@@ -868,8 +895,9 @@ fn the_glossary_is_used_by_find_def_and_a_miss_and_each_says_so_last() {
     assert_eq!(stdout(&out), format!("src/pipeline.go:5: func Pipeline() error {{\n{}", note));
     let out = ctsq_in(&dir, &["-q", "id#\"pipeline page\"", "src"]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(stdout(&out).starts_with("no identifier matches id#\"pipeline page\" in src (1 file)\nfound as Pipeline:\nsrc/pipeline.go:5: func Pipeline() error {\n"), "{}", stdout(&out));
-    assert!(stdout(&out).ends_with(note), "{}", stdout(&out));
+    assert_eq!(stdout(&out), "");
+    assert!(stderr(&out).starts_with("no identifier matches id#\"pipeline page\" in src (1 file)\nfound as Pipeline:\nsrc/pipeline.go:5: func Pipeline() error {\n"), "{}", stderr(&out));
+    assert!(stderr(&out).ends_with(note), "{}", stderr(&out));
     let out = ctsq_in(&dir, &["def", "supplies", "src"]);
     assert!(stdout(&out).ends_with(".ctsq/glossary.toml:4: \"supplies\" also searched as /resource|stock/\n"), "{}", stdout(&out));
     assert!(stdout(&out).starts_with("src/pipeline.go:13: func stockLevel() error {"), "{}", stdout(&out));
@@ -886,7 +914,8 @@ fn find_uses_a_repo_override_and_names_it() {
 fn find_misses_exit_1_and_an_unknown_query_exits_2() {
     let out = ctsq_in(&fixture("queries/solid"), &["find", "route", "/nowhere"]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(stdout(&out).starts_with("no route matches /nowhere here (tried solid-routes from built-in queries/solid-routes.toml)\n"), "{}", stdout(&out));
+    assert_eq!(stdout(&out), "");
+    assert!(stderr(&out).starts_with("no route matches /nowhere here (tried solid-routes from built-in queries/solid-routes.toml)\n"), "{}", stderr(&out));
     let out = ctsq_in(&fixture("queries/solid"), &["find", "nope"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(stderr(&out).starts_with("no named query 'nope'"), "{}", stderr(&out));
@@ -898,7 +927,8 @@ fn find_hides_tests_and_tests_shows_them() {
     let dir = fixture("queries/solid");
     let out = ctsq_in(&dir, &["find", "route", "test-only"]);
     assert_eq!(out.status.code(), Some(1));
-    assert_eq!(stdout(&out), "0 routes\nhidden: 1 in tests (--tests)\n");
+    assert_eq!(stdout(&out), "");
+    assert_eq!(stderr(&out), "no route to test-only outside tests in . (6 files)\nhidden: 1 in tests (--tests)\n");
     let out = ctsq_in(&dir, &["find", "route", "test-only", "--tests"]);
     assert!(out.status.success(), "{}", stdout(&out));
     assert!(stdout(&out).starts_with("src/routes.test.ts:3  /about/test-only"), "{}", stdout(&out));
@@ -1077,4 +1107,153 @@ fn the_footer_counts_every_name_once_at_the_end() {
     assert_eq!(text.matches("hidden:").count(), 1, "{}", text);
     assert!(text.ends_with("hidden: 2 in tests (--tests)\n"), "{}", text);
     let _ = std::fs::remove_dir_all(&d);
+}
+
+// ── Limits, footer lines and stderr (BUILD.md A18 to A21) ─────────────────────
+
+#[test]
+fn max_matches_caps_a_query_and_the_footer_counts_the_rest() {
+    let f = fixture("example.go");
+    let out = ctsq(&["-q", "id#NewServer", &f, "--max-matches", "1"]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(text.lines().filter(|l| l.contains(":14:") || l.contains(":19:")).count(), 1, "{}", text);
+    assert!(text.ends_with("1 match\nhidden: 1 over --max-matches 1 in 1 file (--max-matches 2)\n"), "{}", text);
+    // The suggested number shows everything, with no footer.
+    let all = stdout(&ctsq(&["-q", "id#NewServer", &f, "--max-matches", "2"]));
+    assert!(!all.contains("hidden:"), "{}", all);
+}
+
+#[test]
+fn max_matches_caps_def_refs_and_tree() {
+    let dir = fixture("");
+    let def = stdout(&ctsq(&["def", "process", &dir, "--max-matches", "1"]));
+    assert!(def.starts_with(&dir) && def.contains("1 definition\nhidden: 1 over --max-matches 1 in 1 file (--max-matches 2)\n"), "{}", def);
+    let f = fixture("example.go");
+    let refs = stdout(&ctsq(&["refs", "NewServer", &f, "--max-matches", "1"]));
+    assert!(refs.ends_with("1 reference\nhidden: 1 over --max-matches 1 in 1 file (--max-matches 2)\n"), "{}", refs);
+    let tree = stdout(&ctsq(&["tree", &f, "--max-matches", "2"]));
+    assert!(tree.contains(" 2 entries\n"), "{}", tree);
+    assert!(tree.ends_with("2 entries\nhidden: 2 over --max-matches 2 in 1 file (--max-matches 4)\n"), "{}", tree);
+}
+
+#[test]
+fn max_matches_caps_callers_explain_and_files() {
+    let d = scratch_dir("maxcalls");
+    std::fs::write(d.join("a.go"), "package p\n\nfunc Add() {}\n\nfunc One() { Add() }\n\nfunc Two() { Add() }\n").unwrap();
+    let dir = d.to_str().unwrap();
+    let up = stdout(&ctsq(&["callers", "Add", dir, "--max-matches", "1"]));
+    assert!(up.ends_with("1 caller\nhidden: 1 over --max-matches 1 in 1 file (--max-matches 2)\n"), "{}", up);
+    let files = stdout(&ctsq(&["files", "-q", "id#Add", "-q", "id#One", dir, "--max-matches", "1"]));
+    assert!(files.starts_with(&format!("{}/a.go  ", dir)) && !files.contains("hidden:"), "{}", files);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn max_matches_caps_find_rows() {
+    let out = ctsq_in(&fixture("queries/solid"), &["find", "route", "--max-matches", "2"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert_eq!(text.lines().filter(|l| l.starts_with("src/")).count(), 2, "{}", text);
+    assert!(text.contains("2 routes (solid-routes"), "{}", text);
+    assert!(text.contains("hidden: 2 over --max-matches 2 in "), "{}", text);
+    assert!(text.ends_with("(--max-matches 4)\n") || text.contains("(--max-matches 5)\n"), "{}", text);
+}
+
+#[test]
+fn max_matches_must_be_a_positive_number() {
+    let out = ctsq(&["-q", "id#x", &fixture("example.go"), "--max-matches", "0"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+}
+
+#[test]
+fn max_depth_replaces_depth_and_path_max_points_at_the_new_name() {
+    let f = fixture("example.go");
+    let new = ctsq(&["callers", "NewServer", &f, "--max-depth", "1"]);
+    let old = ctsq(&["callers", "NewServer", &f, "--depth", "1"]);
+    assert!(new.status.success() && old.status.success(), "{}{}", stderr(&new), stderr(&old));
+    assert_eq!(stdout(&new), stdout(&old));
+    let down = ctsq(&["callees", "main", &f, "--max-depth", "1"]);
+    assert!(down.status.success(), "{}", stderr(&down));
+    let help = stdout(&ctsq(&["callers", "--help"]));
+    assert!(help.contains("--max-depth") && !help.contains("--depth"), "the alias stays hidden: {}", help);
+    let path = ctsq(&["path", "--max", "3", "main", &f]);
+    assert_eq!(path.status.code(), Some(2));
+    assert_eq!(stderr(&path), "--max is now --max-depth\n");
+    assert_eq!(stdout(&path), "");
+    let ok = ctsq(&["path", "function#main -> function#NewServer", &f, "--max-depth", "3"]);
+    assert!(ok.status.success(), "{}{}", stdout(&ok), stderr(&ok));
+}
+
+#[test]
+fn each_hidden_reason_gets_its_own_footer_line() {
+    let out = ctsq(&["-q", "id#HiddenLimit", &fixture("hidden"), "--exclude", "limit.go", "--tests"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("hidden: 2 in excluded paths (drop --exclude)\n"), "{}", text);
+    let both = ctsq(&["-q", "id#HIDDEN_MAX", &fixture("hidden"), "--exclude", "limit.go", "--max-matches", "1"]);
+    let text = stdout(&both);
+    let hidden: Vec<&str> = text.lines().filter(|l| l.starts_with("hidden: ")).collect();
+    assert!(hidden.len() >= 2, "one line per reason: {}", text);
+    assert!(hidden[0].contains("in tests") && hidden.last().unwrap().contains("over --max-matches"), "{}", text);
+}
+
+#[test]
+fn every_miss_is_on_stderr_with_stdout_empty_and_exit_1() {
+    let f = fixture("example.go");
+    let dir = fixture("");
+    let cases: Vec<Vec<&str>> = vec![
+        vec!["-q", "id#nopezz", &f],
+        vec!["-q", "*function#nopezz", &f],
+        vec!["def", "nopezz", &f],
+        vec!["callers", "nopezz", &f],
+        vec!["callees", "nopezz", &f],
+        vec!["explain", "nopezz", &f],
+        vec!["refs", "nopezz", &f],
+        vec!["files", "-q", "id#NewServer", "-q", "id#nopezz", &dir],
+    ];
+    for args in cases {
+        let out = ctsq(&args);
+        assert_eq!(out.status.code(), Some(1), "{:?}: {}{}", args, stdout(&out), stderr(&out));
+        assert_eq!(stdout(&out), "", "{:?}", args);
+        assert!(!stderr(&out).is_empty(), "{:?} says nothing", args);
+    }
+    let find = ctsq_in(&fixture("queries/solid"), &["find", "route", "/nowhere"]);
+    assert_eq!((find.status.code(), stdout(&find)), (Some(1), String::new()));
+    assert!(!stderr(&find).is_empty());
+}
+
+#[test]
+fn everything_hidden_is_a_stderr_report_for_every_command() {
+    let dir = fixture("hidden");
+    let cases: Vec<(Vec<&str>, &str)> = vec![
+        (vec!["refs", "limitSeen", &dir], "no reference to limitSeen outside tests in "),
+        (vec!["-q", "id#limitSeen", &dir], "no match for id#limitSeen outside tests in "),
+        (vec!["def", "max_is_three", &dir], "no definition to max_is_three outside tests in "),
+    ];
+    for (args, want) in cases {
+        let out = ctsq(&args);
+        assert_eq!(out.status.code(), Some(1), "{:?}", args);
+        assert_eq!(stdout(&out), "", "{:?}", args);
+        let err = stderr(&out);
+        assert!(err.starts_with(want) && err.contains(" files)\nhidden: 1 in tests (--tests)\n"), "{:?}: {}", args, err);
+    }
+}
+
+#[test]
+fn the_find_listing_lines_up_its_columns() {
+    let out = ctsq_in(&fixture("queries/solid"), &["find"]);
+    let text = stdout(&out);
+    let rows: Vec<&str> = text.lines().filter(|l| l.starts_with("built-in")).collect();
+    assert!(rows.len() >= 3, "{}", text);
+    // The query name column starts at the same place on every row, and so does the reason.
+    let name_at = |r: &&str| {
+        let after = r.find(".toml:").unwrap() + ".toml:".len();
+        let colon = after + r[after..].find(':').unwrap() + 1;
+        colon + r[colon..].find(|c: char| c != ' ').unwrap()
+    };
+    let names: Vec<usize> = rows.iter().map(name_at).collect();
+    assert!(names.windows(2).all(|w| w[0] == w[1]), "names line up: {}", text);
+    let why = rows.iter().map(|r| r.find('(').unwrap()).collect::<Vec<_>>();
+    assert!(why.windows(2).all(|w| w[0] == w[1]), "reasons line up: {}", text);
 }
