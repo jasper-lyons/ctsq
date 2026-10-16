@@ -19,6 +19,20 @@ pub struct MatchRow {
     /// Byte range of the primary node: the node `line` points at.
     pub start_byte: usize,
     pub end_byte: usize,
+    /// Each user capture of the match (names not starting with `_`), in
+    /// pattern order. `find` reads its key and target from here.
+    pub captures: Vec<Capture>,
+}
+
+/// One user capture of a match: its name, its node's text and position.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Capture {
+    pub name: String,
+    pub text: String,
+    /// 1-based line of the node's first byte.
+    pub line: usize,
+    pub start_byte: usize,
+    pub end_byte: usize,
 }
 
 /// Backwards-compatible wrapper: the node-text rendering only.
@@ -73,10 +87,20 @@ pub fn run_rows_on(
     let source_text = String::from_utf8_lossy(source);
     let src_lines: Vec<&str> = source_text.lines().collect();
 
-    let make_row = |node_text: String, primary: tree_sitter::Node, user_caps: usize| -> MatchRow {
+    let make_row = |node_text: String, primary: tree_sitter::Node, caps: &[(String, tree_sitter::Node)]| -> MatchRow {
         let start = primary.start_position().row + 1;
         let multiline = primary.end_position().row != primary.start_position().row;
-        let src_line = if user_caps >= 2 || (body && multiline) {
+        let captures = caps
+            .iter()
+            .map(|(name, n)| Capture {
+                name: name.clone(),
+                text: n.utf8_text(source_bytes).unwrap_or("").to_string(),
+                line: n.start_position().row + 1,
+                start_byte: n.start_byte(),
+                end_byte: n.end_byte(),
+            })
+            .collect();
+        let src_line = if caps.len() >= 2 || (body && multiline) {
             None
         } else {
             Some(
@@ -92,6 +116,7 @@ pub fn run_rows_on(
             node_text,
             start_byte: primary.start_byte(),
             end_byte: primary.end_byte(),
+            captures,
         }
     };
 
@@ -130,14 +155,14 @@ pub fn run_rows_on(
 
             while let Some(m) = matches.next() {
                 let mut parts: Vec<String> = Vec::new();
-                let mut user_nodes: Vec<tree_sitter::Node> = Vec::new();
+                let mut user_nodes: Vec<(String, tree_sitter::Node)> = Vec::new();
                 for capture in m.captures {
                     let name = &capture_names[capture.index as usize];
                     if name.starts_with('_') {
                         continue;
                     }
                     parts.push(fmt_cap(name, capture.node, body));
-                    user_nodes.push(capture.node);
+                    user_nodes.push((name.to_string(), capture.node));
                 }
                 if parts.is_empty() {
                     let root = m
@@ -158,7 +183,7 @@ pub fn run_rows_on(
                         } else {
                             format!("<match>:{}: {:?}", loc(cap.node), display)
                         };
-                        results.push(make_row(node_text, cap.node, 0));
+                        results.push(make_row(node_text, cap.node, &[]));
                     } else {
                         results.push(MatchRow {
                             line: 0,
@@ -166,11 +191,12 @@ pub fn run_rows_on(
                             node_text: "<match>".into(),
                             start_byte: 0,
                             end_byte: 0,
+                            captures: vec![],
                         });
                     }
                 } else {
-                    let primary = user_nodes[0];
-                    results.push(make_row(parts.join(", "), primary, user_nodes.len()));
+                    let primary = user_nodes[0].1;
+                    results.push(make_row(parts.join(", "), primary, &user_nodes));
                 }
             }
         }
@@ -264,10 +290,10 @@ pub fn run_rows_on(
                         .collect();
 
                     let mut parts: Vec<String> = Vec::new();
-                    let mut user_nodes: Vec<tree_sitter::Node> = Vec::new();
+                    let mut user_nodes: Vec<(String, tree_sitter::Node)> = Vec::new();
                     for (name, node) in outer_named.iter().chain(inner_named.iter()) {
                         parts.push(fmt_cap(name, *node, body));
-                        user_nodes.push(*node);
+                        user_nodes.push((name.clone(), *node));
                     }
 
                     if parts.is_empty() {
@@ -286,7 +312,7 @@ pub fn run_rows_on(
                             } else {
                                 format!("<match>:{}: {:?}", loc(cap.node), display)
                             };
-                            results.push(make_row(node_text, cap.node, 0));
+                            results.push(make_row(node_text, cap.node, &[]));
                         }
                     } else {
                         // A descendant row sits on the inner match, not on the head.
@@ -295,11 +321,11 @@ pub fn run_rows_on(
                                 .first()
                                 .map(|(_, n)| *n)
                                 .or_else(|| m.captures.first().map(|c| c.node))
-                                .unwrap_or(user_nodes[0])
+                                .unwrap_or(user_nodes[0].1)
                         } else {
-                            user_nodes[0]
+                            user_nodes[0].1
                         };
-                        results.push(make_row(parts.join(", "), primary, user_nodes.len()));
+                        results.push(make_row(parts.join(", "), primary, &user_nodes));
                     }
                 }
             }
@@ -466,6 +492,49 @@ mod tests {
         let src = "package main\n\nfunc a() {}\n";
         let rows = rows_for("function#a function#a", "go", src, false);
         assert!(rows.is_empty(), "{:?}", rows);
+    }
+
+    const ROUTES_TS: &str = "const routes = [\n  { path: \"/a\", component: A },\n  { component: B },\n  { path: \"/c\", title: \"x\", component: C },\n];\n";
+
+    fn caps(r: &MatchRow) -> Vec<(&str, &str)> {
+        r.captures.iter().map(|c| (c.name.as_str(), c.text.as_str())).collect()
+    }
+
+    #[test]
+    fn sibling_pairs_match_inside_one_object_and_carry_both_captures() {
+        let q = "(pair.key(property_identifier#path).value(string @key)) ~ (pair.key(property_identifier#component).value(@target))";
+        let rows = rows_for(q, "typescript", ROUTES_TS, false);
+        let got: Vec<_> = rows.iter().map(caps).collect();
+        assert_eq!(
+            got,
+            vec![vec![("key", "\"/a\""), ("target", "A")], vec![("key", "\"/c\""), ("target", "C")]],
+            "B has no path, so no match crosses objects: {:?}",
+            rows
+        );
+        assert_eq!(rows[1].captures[0].line, 4);
+        assert_eq!(&ROUTES_TS[rows[1].captures[1].start_byte..rows[1].captures[1].end_byte], "C");
+    }
+
+    #[test]
+    fn adjacent_means_the_next_named_sibling() {
+        let q = "(pair.key(property_identifier#path) @p) + (pair.key(property_identifier#component) @c)";
+        let rows = rows_for(q, "typescript", ROUTES_TS, false);
+        assert_eq!(rows.len(), 1, "/c has a title pair between: {:?}", rows);
+        assert_eq!(rows[0].line, 2);
+    }
+
+    #[test]
+    fn an_uncaptured_sibling_query_sits_on_the_later_sibling() {
+        let rows = rows_for("pair.key(property_identifier#path) ~ pair.key(property_identifier#title)", "typescript", ROUTES_TS, false);
+        assert_eq!(rows.len(), 1, "{:?}", rows);
+        assert_eq!(&ROUTES_TS[rows[0].start_byte..rows[0].end_byte], "title: \"x\"");
+    }
+
+    #[test]
+    fn one_capture_keeps_the_source_line_and_lists_its_capture() {
+        let rows = rows_for("(id#itemCols @n)", "go", "package main\n\nconst itemCols = 1\n", false);
+        assert_eq!(rows[0].src_line.as_deref(), Some("const itemCols = 1"));
+        assert_eq!(caps(&rows[0]), vec![("n", "itemCols")]);
     }
 
     #[test]

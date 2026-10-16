@@ -388,8 +388,29 @@ impl Parser {
             self.skip_whitespace();
             let inner = if self.peek() == &Token::RParen {
                 None
+            } else if self.peek() == &Token::At {
+                // `.value(@target)`: any node, captured.
+                let any = Query {
+                    head: Selector {
+                        node: SelectorNode::Bare(Atom { sigil: None, node_type: None, name_match: None, attrs: vec![] }),
+                        fields: vec![],
+                        not: vec![],
+                    },
+                    tail: vec![],
+                };
+                let name = self.parse_capture()?;
+                Some(Box::new(captured(any, name)))
             } else {
-                Some(Box::new(self.parse_query()?))
+                let q = self.parse_query()?;
+                self.skip_whitespace();
+                // `.value(literal @key)`: a capture on the field's inner query
+                // without a group around it.
+                if self.peek() == &Token::At {
+                    let name = self.parse_capture()?;
+                    Some(Box::new(captured(q, name)))
+                } else {
+                    Some(Box::new(q))
+                }
             };
             self.skip_whitespace();
             if self.peek() != &Token::RParen {
@@ -400,6 +421,15 @@ impl Parser {
         }
 
         Ok(Selector { node, fields, not })
+    }
+
+    /// `@name`, with the cursor on the `@`.
+    fn parse_capture(&mut self) -> Result<String, QueryError> {
+        self.advance();
+        match self.advance() {
+            Token::Ident(name) => Ok(name),
+            _ => Err(self.err_prev("expected capture name after @")),
+        }
     }
 
     fn parse_atom(&mut self) -> Result<Atom, QueryError> {
@@ -485,6 +515,19 @@ impl Parser {
             return Err(self.err_prev("expected ] to close attribute"));
         }
         Ok(AttrMatch { key, op, value })
+    }
+}
+
+/// `q` as a one-selector query whose group carries the capture `name`, the
+/// same AST `(q @name)` parses to.
+fn captured(q: Query, name: String) -> Query {
+    Query {
+        head: Selector {
+            node: SelectorNode::Group { query: Box::new(q), capture: Some(name) },
+            fields: vec![],
+            not: vec![],
+        },
+        tail: vec![],
     }
 }
 
@@ -924,6 +967,48 @@ mod tests {
             e.hint.as_deref(),
             Some("a '/' inside a regex name filter must be escaped: (id#/a\\/b\\/c/ @x)")
         );
+    }
+
+    fn group_capture(q: &Query) -> (Option<&str>, &Query) {
+        match &q.head.node {
+            SelectorNode::Group { query, capture } => (capture.as_deref(), query),
+            other => panic!("expected a group, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_bare_capture_is_a_field_argument_meaning_any_node() {
+        let q = parse("pair.value(@target)").unwrap();
+        let inner = q.head.fields[0].inner.as_ref().unwrap();
+        let (cap, any) = group_capture(inner);
+        assert_eq!(cap, Some("target"));
+        assert_eq!(atom_of(any).node_type, None, "a wildcard: {:?}", any);
+        assert_eq!(atom_of(any).name_match, None);
+    }
+
+    #[test]
+    fn a_capture_after_a_field_query_needs_no_parentheses() {
+        let bare = parse("pair.value(literal @key)").unwrap();
+        let grouped = parse("pair.value((literal @key))").unwrap();
+        assert_eq!(bare, grouped, "the same AST as the grouped form");
+        let (cap, lit) = group_capture(bare.head.fields[0].inner.as_ref().unwrap());
+        assert_eq!(cap, Some("key"));
+        assert_eq!(atom_of(lit).node_type.as_deref(), Some("literal"));
+        assert!(parse("pair.value(literal @)").is_err());
+        assert!(parse("pair.value(@)").is_err());
+    }
+
+    #[test]
+    fn captures_sit_on_both_sides_of_sibling_combinators() {
+        for (src, c) in [
+            ("(pair.key(id#path).value(literal @key)) ~ (pair.value(@target))", Combinator::Sibling),
+            ("(id#a @x) + (id#b @y)", Combinator::Adjacent),
+            ("(id#a @x)~(id#b @y)", Combinator::Sibling),
+        ] {
+            let q = parse(src).unwrap_or_else(|e| panic!("{}: {}", src, e));
+            assert_eq!(q.tail.len(), 1, "{}", src);
+            assert_eq!(q.tail[0].0, c, "{}", src);
+        }
     }
 
     #[test]

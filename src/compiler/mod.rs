@@ -350,9 +350,104 @@ fn emit_alternation(frags: Vec<Fragment>) -> String {
 // ---------------------------------------------------------------------------
 // Compilation
 // ---------------------------------------------------------------------------
+/// Where the selector a sibling combinator follows sits in the fragment, which
+/// decides where the sibling goes so both share one parent.
+#[derive(Clone, Copy, PartialEq)]
+enum Parent {
+    /// The fragment is the previous selector itself: wrap both in `(_ A B)`.
+    None,
+    /// The previous selector is a direct child of the fragment's own node
+    /// (after `>` or an earlier sibling): append to the node body.
+    Body,
+    /// The previous selector sits inside the `(_ ...)` bridge a descendant
+    /// combinator left at the end of the body: append inside the bridge.
+    Bridge,
+}
+
+/// `A ~ B` (any later sibling) and `A + B` (the next named sibling, through
+/// tree-sitter's `.` anchor, which skips anonymous nodes such as commas). The
+/// sibling becomes the subject: with no user capture it gets the `_root`
+/// capture, so a match row sits on it, and the shared parent gets a `_sib` one.
+fn add_sibling(frags: Vec<Fragment>, sel: &Selector, adjacent: bool, parent: Parent, lang: &dyn Lang) -> Vec<Fragment> {
+    let sibs: Vec<Fragment> = compile_selector(sel, lang)
+        .into_iter()
+        .map(|mut f| {
+            if f.outer_capture.is_none() {
+                f.outer_capture = Some(format!("_root{}", fresh_id()));
+            }
+            f.resolve();
+            f
+        })
+        .collect();
+    if sibs.is_empty() {
+        return frags;
+    }
+    let anchor = if adjacent { ". " } else { "" };
+    frags
+        .into_iter()
+        .flat_map(|head| {
+            sibs.iter().map(move |sib| {
+                let mut head = head.clone();
+                match parent {
+                    Parent::None => {
+                        head.resolve();
+                        let mut out = blank_fragment();
+                        out.node_body = format!("_ {} {}{}", head.inline(), anchor, sib.inline());
+                        out.predicates = head.predicates.clone();
+                        out.predicates.extend(sib.predicates.clone());
+                        out.outer_capture = Some(format!("_sib{}", fresh_id()));
+                        out
+                    }
+                    Parent::Body => {
+                        head.node_body.push_str(&format!(" {}{}", anchor, sib.inline()));
+                        head.predicates.extend(sib.predicates.clone());
+                        head
+                    }
+                    Parent::Bridge => {
+                        // The body ends with the `)` that closes the bridge.
+                        head.node_body.pop();
+                        head.node_body.push_str(&format!(" {}{})", anchor, sib.inline()));
+                        head.predicates.extend(sib.predicates.clone());
+                        head
+                    }
+                }
+            })
+        })
+        .collect()
+}
+
+fn blank_fragment() -> Fragment {
+    Fragment {
+        node_body: "_".into(),
+        predicates: vec![],
+        outer_capture: None,
+        pending_name_match: None,
+        pending_parent_wrap: None,
+        params_field: None,
+        params_container: None,
+        params_needs_bridge: false,
+        body_field: None,
+        body_container: None,
+        extra_root: false,
+    }
+}
+
 fn compile_query(query: &Query, lang: &dyn Lang) -> Vec<Fragment> {
     let mut frags = compile_selector(&query.head, lang);
+    let mut parent = Parent::None;
     for (combinator, sel) in &query.tail {
+        match combinator {
+            Combinator::Adjacent | Combinator::Sibling => {
+                frags = add_sibling(frags, sel, *combinator == Combinator::Adjacent, parent, lang);
+                if parent == Parent::None {
+                    parent = Parent::Body;
+                }
+                continue;
+            }
+            Combinator::Child => parent = Parent::Body,
+            Combinator::Descendant => parent = Parent::Bridge,
+            _ => {}
+        }
         match combinator {
             Combinator::Child => {
                 // Direct child: nest the tail pattern inside the head.
@@ -398,10 +493,6 @@ fn compile_query(query: &Query, lang: &dyn Lang) -> Vec<Fragment> {
                         })
                     })
                     .collect();
-            }
-            Combinator::Adjacent | Combinator::Sibling => {
-                // Sibling combinators have no direct TS query equivalent — emit independently.
-                frags.extend(compile_selector(sel, lang));
             }
             // Semantic combinators never reach here: `validate` rejects them. A caller
             // that skips validation gets each side emitted independently.
@@ -1206,6 +1297,53 @@ mod tests {
             let q = parse(src).unwrap();
             assert!(check_compiles(&q, lang.as_ref(), "typescript", src).is_ok(), "{}", src);
         }
+    }
+
+    #[test]
+    fn siblings_share_one_parent_instead_of_compiling_as_alternatives() {
+        let out = compile_str("(pair @a) ~ (pair @b)", "javascript");
+        assert!(!out.starts_with('['), "one pattern, not two alternatives: {}", out);
+        assert!(shape(&out).starts_with("(_ (pair) @a (pair) @b) @_sib"), "{}", out);
+        let adj = compile_str("(pair @a) + (pair @b)", "javascript");
+        assert!(shape(&adj).starts_with("(_ (pair) @a . (pair) @b) @_sib"), "the anchor: {}", adj);
+    }
+
+    #[test]
+    fn an_uncaptured_sibling_is_the_subject_of_the_match() {
+        let out = compile_str("pair ~ pair", "javascript");
+        assert_eq!(shape(&out), "(_ (pair) (pair) @_root) @_sib", "{}", out);
+    }
+
+    #[test]
+    fn a_sibling_after_a_child_goes_into_the_same_parent() {
+        let out = compile_str("jsx_attribute > property_identifier#path + (string @key)", "tsx");
+        assert!(shape(&out).contains("(jsx_attribute (property_identifier) @_nm . (string) @key)"), "{}", out);
+        assert!(out.contains("(#eq? @_nm") && out.contains("\"path\""), "the name predicate survives: {}", out);
+        // A chain of siblings stays in one parent.
+        let out = compile_str("(id#a @x) ~ (id#b @y) ~ (id#c @z)", "go");
+        assert!(out.contains("@x") && out.contains("@y") && out.contains("@z"), "{}", out);
+        assert_eq!(shape(&out).matches("@_sib").count(), shape(&out).matches("(_ ").count(), "{}", out);
+    }
+
+    #[test]
+    fn a_route_shaped_sibling_query_compiles_in_tree_sitter() {
+        let lang = for_name("tsx").unwrap();
+        for src in [
+            "(pair.key(property_identifier#path).value(string @key)) ~ (pair.key(property_identifier#component).value(@target))",
+            "(pair.key(property_identifier#path).value(literal @key)) + (pair.value(identifier @target))",
+            "(jsx_attribute > (property_identifier#path) + (string @key)) ~ (jsx_attribute > (property_identifier#element) + (jsx_expression > jsx_self_closing_element.name(@target)))",
+        ] {
+            let q = parse(src).unwrap_or_else(|e| panic!("{}: {}", src, e));
+            check_compiles(&q, lang.as_ref(), "tsx", src).unwrap_or_else(|e| panic!("{}: {}", src, e));
+        }
+    }
+
+    #[test]
+    fn a_bare_capture_field_argument_compiles_to_a_captured_wildcard() {
+        let out = compile_str("pair.value(@target)", "javascript");
+        assert!(out.contains("(_) @target"), "{}", out);
+        let out = compile_str("(pair.value(literal @key))", "javascript");
+        assert!(out.contains("value: (string) @key"), "{}", out);
     }
 
     #[test]
