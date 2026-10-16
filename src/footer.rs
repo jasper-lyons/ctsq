@@ -88,9 +88,29 @@ pub fn footer(shown: usize, noun: &str, hidden: &Hidden) -> String {
     format!("{} {}\nhidden: {}\n", shown, plural(noun, shown), reasons.join(", "))
 }
 
+/// The last lines of a command's output. With `count` (`--scope` asks for it)
+/// the count line always prints, merged into the footer when something was
+/// hidden, so it never prints twice.
+pub fn tail(shown: usize, noun: &str, hidden: &Hidden, count: bool) -> String {
+    if hidden.any() || !count {
+        footer(shown, noun, hidden)
+    } else {
+        format!("{} {}\n", shown, plural(noun, shown))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_count_line_is_asked_for_and_never_doubled() {
+        assert_eq!(tail(2, "definition", &Hidden::default(), true), "2 definitions\n");
+        assert_eq!(tail(2, "definition", &Hidden::default(), false), "");
+        let mut h = Hidden::default();
+        h.count(Hide::Test, 1);
+        assert_eq!(tail(2, "match", &h, true), "2 matches\nhidden: 1 in tests (--tests)\n");
+    }
 
     #[test]
     fn nothing_hidden_prints_nothing() {

@@ -1,24 +1,26 @@
 use crate::files;
-use crate::footer::{footer, Hidden};
+use crate::footer::{tail, Hidden};
 use crate::resolve::graph::{self, CallGraph, NodeKey};
 use crate::resolve::Confidence;
+use crate::scope;
 use std::collections::HashSet;
 
 // ── Public entry points ───────────────────────────────────────────────────────
 
-pub fn callees(function: &str, path: &str, lang_name: Option<&str>, max_depth: usize, no_ignore: bool, hide: &files::HideOpts) {
-    run(Direction::Down, function, path, lang_name, max_depth, no_ignore, hide);
+pub fn callees(function: &str, path: &str, lang_name: Option<&str>, max_depth: usize, no_ignore: bool, hide: &files::HideOpts, scope: Option<scope::Opts>) {
+    run(Direction::Down, function, path, lang_name, max_depth, no_ignore, hide, scope);
 }
 
-pub fn callers(function: &str, path: &str, lang_name: Option<&str>, max_depth: usize, no_ignore: bool, hide: &files::HideOpts) {
-    run(Direction::Up, function, path, lang_name, max_depth, no_ignore, hide);
+pub fn callers(function: &str, path: &str, lang_name: Option<&str>, max_depth: usize, no_ignore: bool, hide: &files::HideOpts, scope: Option<scope::Opts>) {
+    run(Direction::Up, function, path, lang_name, max_depth, no_ignore, hide, scope);
 }
 
-fn run(dir: Direction, function: &str, path: &str, lang_name: Option<&str>, max_depth: usize, no_ignore: bool, hide: &files::HideOpts) {
+#[allow(clippy::too_many_arguments)]
+fn run(dir: Direction, function: &str, path: &str, lang_name: Option<&str>, max_depth: usize, no_ignore: bool, hide: &files::HideOpts, scope: Option<scope::Opts>) {
     let jobs = files::resolve_jobs(path, lang_name, no_ignore);
     let mut hider = files::Hider::new(hide);
     hider.add_jobs(path, &jobs);
-    let (text, code) = report(dir, function, &jobs, max_depth, &mut hider);
+    let (text, code) = report_scoped(dir, function, &jobs, max_depth, &mut hider, scope);
     print!("{}", text);
     if code != 0 {
         std::process::exit(code);
@@ -40,6 +42,7 @@ pub enum Direction {
 /// resolves. A definition of `function` that sits in a test is left out as a
 /// root, and a row whose call is written in a test is left out with everything
 /// above it. Each one counts once in the footer.
+#[cfg(test)]
 pub fn report(
     dir: Direction,
     function: &str,
@@ -47,8 +50,22 @@ pub fn report(
     max_depth: usize,
     hider: &mut files::Hider,
 ) -> (String, i32) {
+    report_scoped(dir, function, jobs, max_depth, hider, None)
+}
+
+/// `report`, with `--scope` rows under each row when `scope` is set: the named
+/// scope holding that row's call site, then the count line.
+pub fn report_scoped(
+    dir: Direction,
+    function: &str,
+    jobs: &[(String, &'static str)],
+    max_depth: usize,
+    hider: &mut files::Hider,
+    scope: Option<scope::Opts>,
+) -> (String, i32) {
     let g = graph::build(jobs);
-    let mut w = Walk { g: &g, max_depth, out: String::new(), shown: 0, hider, hidden: Hidden::default() };
+    let printer = scope.map(|o| scope::Printer::new(o, jobs));
+    let mut w = Walk { g: &g, max_depth, out: String::new(), shown: 0, hider, hidden: Hidden::default(), scope: printer };
     let all_roots = g.index.by_name.get(function).cloned().unwrap_or_default();
     let had_roots = !all_roots.is_empty();
     let roots = w.hider.keep(
@@ -86,7 +103,7 @@ pub fn report(
     let noun = if dir == Direction::Up { "caller" } else { "callee" };
     let code = if w.shown == 0 && w.hidden.any() { 1 } else { 0 };
     let mut out = w.out;
-    out.push_str(&footer(w.shown, noun, &w.hidden));
+    out.push_str(&tail(w.shown, noun, &w.hidden, scope.is_some()));
     (out, code)
 }
 
@@ -161,9 +178,20 @@ struct Walk<'a> {
     shown: usize,
     hider: &'a mut files::Hider,
     hidden: Hidden,
+    scope: Option<scope::Printer>,
 }
 
 impl Walk<'_> {
+    /// The `--scope` rows for the call of edge `e`, under the row just printed.
+    fn scope_rows(&mut self, e: usize, indent: &str) {
+        let g = self.g;
+        let rc = &g.calls[e];
+        let file = &g.index.defs[rc.caller].id.file;
+        if let Some(p) = self.scope.as_mut() {
+            self.out.push_str(&p.call_rows(file, rc.line, indent));
+        }
+    }
+
     /// The edges whose call is not written in a hidden place.
     fn visible(&mut self, edges: &[usize]) -> Vec<usize> {
         let g = self.g;
@@ -188,6 +216,7 @@ impl Walk<'_> {
             let rc = &g.calls[e];
             let is_last = i == n - 1;
             let connector = if is_last { "└── " } else { "├── " };
+            let child_prefix = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
             match rc.target {
                 Some((t, conf)) => {
                     let d = &g.index.defs[t];
@@ -196,15 +225,19 @@ impl Walk<'_> {
                     let tk = NodeKey::Def(d.id.clone());
                     if visited.contains(&tk) {
                         self.out.push_str(&format!("{}{}{}()  {}{} (cycle)\n", prefix, connector, rc.callee_display, loc, mark));
+                        self.scope_rows(e, &child_prefix);
                     } else {
                         self.out.push_str(&format!("{}{}{}()  {}{}\n", prefix, connector, rc.callee_display, loc, mark));
+                        self.scope_rows(e, &child_prefix);
                         visited.insert(tk.clone());
-                        let child_prefix = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
                         self.down(&tk, depth + 1, &child_prefix, visited);
                         visited.remove(&tk);
                     }
                 }
-                None => self.out.push_str(&format!("{}{}{}()\n", prefix, connector, rc.callee_display)),
+                None => {
+                    self.out.push_str(&format!("{}{}{}()\n", prefix, connector, rc.callee_display));
+                    self.scope_rows(e, &child_prefix);
+                }
             }
         }
     }
@@ -227,12 +260,14 @@ impl Walk<'_> {
             };
             let loc = format!("[{}:{}]", short_path(&d.id.file), d.id.line);
             let tk = NodeKey::Def(d.id.clone());
+            let child_prefix = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
             if visited.contains(&tk) {
                 self.out.push_str(&format!("{}{}{}()  {}{} (cycle)\n", prefix, connector, d.name, loc, mark));
+                self.scope_rows(e, &child_prefix);
             } else {
                 self.out.push_str(&format!("{}{}{}()  {}{}\n", prefix, connector, d.name, loc, mark));
+                self.scope_rows(e, &child_prefix);
                 visited.insert(tk.clone());
-                let child_prefix = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
                 self.up(&tk, depth + 1, &child_prefix, visited);
                 visited.remove(&tk);
             }
@@ -288,6 +323,24 @@ mod tests {
         assert!(text.starts_with("Add()\n└── Twice()  [calc.go:5]\n"), "{}", text);
         assert!(!text.contains("TestAdd"), "{}", text);
         assert!(text.ends_with("1 caller\nhidden: 1 in tests (--tests)\n"), "{}", text);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn scope_rows_sit_under_their_call_row_and_the_count_merges_with_the_footer() {
+        let (d, jobs, mut h) = go_pair("scoped");
+        let root = d.to_str().unwrap();
+        let (text, code) = report_scoped(Direction::Up, "Add", &jobs, 3, &mut h, Some(scope::Opts::default()));
+        assert_eq!(code, 0);
+        let want = format!(
+            "Add()\n└── Twice()  [calc.go:5]\n      in {root}/calc.go:5-5  func Twice(a int) int {{ return Add(a, a) }}\n1 caller\nhidden: 1 in tests (--tests)\n"
+        );
+        assert_eq!(text, want);
+        let mut all = files::Hider::new(&files::HideOpts { tests: true, exclude: vec![] });
+        all.add_jobs(root, &jobs);
+        let (text, _) = report_scoped(Direction::Up, "Add", &jobs, 3, &mut all, Some(scope::Opts { body: true }));
+        assert!(text.contains(&format!("      in {root}/calc.go:5-5  func Twice(a int) int {{ return Add(a, a) }}\n        func Twice(a int) int {{ return Add(a, a) }}\n")), "{}", text);
+        assert!(text.contains("TestAdd()") && text.ends_with("2 callers\n"), "{}", text);
         let _ = std::fs::remove_dir_all(&d);
     }
 

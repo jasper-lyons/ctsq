@@ -7,6 +7,7 @@ mod footer;
 mod miss;
 mod query;
 mod runner;
+mod scope;
 mod tree;
 mod calltree;
 mod importgraph;
@@ -109,6 +110,9 @@ EXAMPLES (a question as a comment, the call, then the next call)
   # Who calls it? Which files mention both names?
   ctsq callers count_items src/
   ctsq files -q 'id#DefIndex' -q 'id#CallGraph' src/
+  # Which function or class holds each hit? --scope adds a row under it, --body the scope's body.
+  ctsq -q 'id#hide_rows' --scope src/
+  ctsq def saveAssetNow fixtures/scope --scope
 
 STDIN
   Pipe file paths (language detected per file from extension):
@@ -200,6 +204,11 @@ struct Cli {
     #[arg(short = 'C', long = "context", value_name = "N")]
     context: Option<usize>,
 
+    /// Under each match print the nearest named scope holding it: its path:START-END and signature.
+    /// With --body the scope's body follows the row
+    #[arg(long)]
+    scope: bool,
+
     /// Ignore .gitignore and .ignore files (search all files)
     #[arg(long, global = true)]
     no_ignore: bool,
@@ -211,6 +220,30 @@ struct Cli {
     /// Hide paths matching GLOB, judged relative to the search root (repeatable)
     #[arg(long, global = true, value_name = "GLOB")]
     exclude: Vec<String>,
+}
+
+/// `--scope` and its `--body`, shared by the commands that return hits. They
+/// are declared per command, since the top-level `--body` is not global and
+/// `tree` and `path` each keep a `--body` of their own.
+#[derive(clap::Args, Clone, Copy)]
+struct ScopeArgs {
+    /// Under each hit print the nearest named scope holding it: path:START-END and its signature
+    #[arg(long)]
+    scope: bool,
+    /// With --scope, print each scope's body under its row
+    #[arg(long)]
+    body: bool,
+}
+
+impl ScopeArgs {
+    /// None without --scope. A --body with no --scope is a usage error.
+    fn opts(self) -> Option<scope::Opts> {
+        if self.body && !self.scope {
+            eprintln!("--body here needs --scope, it prints the scope's body");
+            std::process::exit(2);
+        }
+        self.scope.then_some(scope::Opts { body: self.body })
+    }
 }
 
 #[derive(Subcommand)]
@@ -274,6 +307,8 @@ There is no --body: `tree` is the outline. For one entry's body use
         /// Maximum depth to traverse
         #[arg(long, default_value = "3")]
         depth: usize,
+        #[command(flatten)]
+        scope: ScopeArgs,
     },
     /// Show what a function calls (walk down the call chain)
     Callees {
@@ -284,6 +319,8 @@ There is no --body: `tree` is the outline. For one entry's body use
         /// Maximum depth to traverse
         #[arg(long, default_value = "3")]
         depth: usize,
+        #[command(flatten)]
+        scope: ScopeArgs,
     },
     /// Build a full call graph for all functions in a path
     Callgraph {
@@ -307,13 +344,21 @@ in query order as the trailing column.
         /// File or directory to search
         #[arg(default_value = ".")]
         path: String,
+        #[command(flatten)]
+        scope: ScopeArgs,
     },
     /// Resolve a name to its definition location(s)
+    #[command(after_help = "With --scope each definition gets a row under it naming the scope that
+holds it, so a name defined inside several components tells them apart:
+
+  ctsq def saveAssetNow src/ --scope")]
     Def {
         /// Name, qualified path (a::b::f, Foo::method) or method expr (x.method)
         name_or_expr: String,
         /// File or directory to search
         path: String,
+        #[command(flatten)]
+        scope: ScopeArgs,
     },
     /// Find all usage sites of a name (complement of def)
     Refs {
@@ -321,6 +366,8 @@ in query order as the trailing column.
         name: String,
         /// File or directory to search
         path: String,
+        #[command(flatten)]
+        scope: ScopeArgs,
     },
     /// Show what files/packages a file imports (forward dependency tree)
     Imports {
@@ -520,28 +567,28 @@ fn main() {
             }
             return;
         }
-        Some(Commands::Callers { function, path, depth }) => {
-            calltree::callers(&function, &path, cli.lang.as_deref(), depth, cli.no_ignore, &hide);
+        Some(Commands::Callers { function, path, depth, scope }) => {
+            calltree::callers(&function, &path, cli.lang.as_deref(), depth, cli.no_ignore, &hide, scope.opts());
             return;
         }
-        Some(Commands::Callees { function, path, depth }) => {
-            calltree::callees(&function, &path, cli.lang.as_deref(), depth, cli.no_ignore, &hide);
+        Some(Commands::Callees { function, path, depth, scope }) => {
+            calltree::callees(&function, &path, cli.lang.as_deref(), depth, cli.no_ignore, &hide, scope.opts());
             return;
         }
         Some(Commands::Callgraph { path, format }) => {
             calltree::callgraph(&path, cli.lang.as_deref(), cli.no_ignore, &format);
             return;
         }
-        Some(Commands::Files { query, path }) => {
-            cooccur::run(&query, &path, cli.lang.as_deref(), cli.no_ignore, &hide);
+        Some(Commands::Files { query, path, scope }) => {
+            cooccur::run(&query, &path, cli.lang.as_deref(), cli.no_ignore, &hide, scope.opts());
             return;
         }
-        Some(Commands::Def { name_or_expr, path }) => {
-            resolve::run_def(&name_or_expr, &path, cli.lang.as_deref(), cli.no_ignore, &hide);
+        Some(Commands::Def { name_or_expr, path, scope }) => {
+            resolve::run_def(&name_or_expr, &path, cli.lang.as_deref(), cli.no_ignore, &hide, scope.opts());
             return;
         }
-        Some(Commands::Refs { name, path }) => {
-            run_refs(&name, &path, cli.lang.as_deref(), cli.no_ignore, &hide);
+        Some(Commands::Refs { name, path, scope }) => {
+            run_refs(&name, &path, cli.lang.as_deref(), cli.no_ignore, &hide, scope.opts());
             return;
         }
         Some(Commands::Imports { file, path, depth }) => {
@@ -604,6 +651,12 @@ fn main() {
         eprintln!("-C/--context does not apply to --node, which already prints the whole node");
         std::process::exit(2);
     }
+    if cli.scope && cli.context.is_some() {
+        eprintln!("-C/--context does not apply to --scope, which already adds the scope row under each match");
+        std::process::exit(2);
+    }
+    let scope_opts = cli.scope.then_some(scope::Opts { body: cli.body });
+    let mut scopes = scope::Scopes::new();
 
     // --show-query with explicit --lang: print and maybe exit
     if cli.show_query {
@@ -817,6 +870,11 @@ fn main() {
                         if seen.insert(out.clone()) {
                             total_matches += 1;
                             println!("{}", out);
+                            if let Some(o) = scope_opts {
+                                if let Some(s) = scopes.hit(display, lang_name, &source, r.start_byte) {
+                                    print!("{}", scope::render(&s, &source, o.body, ""));
+                                }
+                            }
                         }
                     }
                 }
@@ -840,7 +898,7 @@ fn main() {
         print!("{}", miss::report_for(&ast, query_str, &where_, &shown));
         std::process::exit(1);
     }
-    print!("{}", footer::footer(total_matches, "match", &hidden));
+    print!("{}", footer::tail(total_matches, "match", &hidden, scope_opts.is_some()));
     if total_matches == 0 {
         std::process::exit(1);
     }
@@ -974,7 +1032,15 @@ fn with_path(display: &str, node_text: &str) -> String {
     }
 }
 
-fn run_refs(name: &str, path: &str, lang_override: Option<&str>, no_ignore: bool, hide: &files::HideOpts) {
+fn run_refs(
+    name: &str,
+    path: &str,
+    lang_override: Option<&str>,
+    no_ignore: bool,
+    hide: &files::HideOpts,
+    scope_opts: Option<scope::Opts>,
+) {
+    let mut scopes = scope::Scopes::new();
     let query_str = format!("id#{}", name);
     let ast = match query::parse(&query_str) {
         Ok(q) => q,
@@ -1007,12 +1073,17 @@ fn run_refs(name: &str, path: &str, lang_override: Option<&str>, no_ignore: bool
                 for r in &hide_rows(&mut hider, file, &source, rows, false, &mut hidden) {
                     shown += 1;
                     println!("{}", with_path(file, &r.node_text));
+                    if let Some(o) = scope_opts {
+                        if let Some(s) = scopes.hit(file, lang_name, &source, r.start_byte) {
+                            print!("{}", scope::render(&s, &source, o.body, ""));
+                        }
+                    }
                 }
             }
             Err(e) => eprintln!("Runner error in {}: {}", file, e),
         }
     }
-    print!("{}", footer::footer(shown, "reference", &hidden));
+    print!("{}", footer::tail(shown, "reference", &hidden, scope_opts.is_some()));
     if shown == 0 && hidden.any() {
         std::process::exit(1);
     }

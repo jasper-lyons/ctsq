@@ -250,7 +250,14 @@ pub fn resolver_for(lang_name: &str) -> Box<dyn Resolver> {
 /// call-graph definition index first, then the `tree` outline. The index only
 /// holds callable definitions, so without the outline step a struct, class,
 /// type alias or top-level variable resolved by `explain` reported nothing here.
-pub fn run_def(expr: &str, path: &str, lang_name: Option<&str>, no_ignore: bool, hide: &crate::files::HideOpts) {
+pub fn run_def(
+    expr: &str,
+    path: &str,
+    lang_name: Option<&str>,
+    no_ignore: bool,
+    hide: &crate::files::HideOpts,
+    scope: Option<crate::scope::Opts>,
+) {
     let jobs = crate::files::resolve_jobs(path, lang_name, no_ignore);
     let mut all_names: Vec<String> = Vec::new();
     let rows = def_rows(expr, &jobs, &mut all_names);
@@ -275,6 +282,7 @@ pub fn run_def(expr: &str, path: &str, lang_name: Option<&str>, no_ignore: bool,
     }
 
     let shown = rows.len();
+    let mut printer = scope.map(|o| crate::scope::Printer::new(o, &jobs));
     for (file, line, conf) in rows {
         let line_text = std::fs::read_to_string(&file)
             .ok()
@@ -282,9 +290,12 @@ pub fn run_def(expr: &str, path: &str, lang_name: Option<&str>, no_ignore: bool,
             .unwrap_or_default();
         let mark = if conf == Confidence::Guess { "  ?" } else { "" };
         println!("{}:{}: {}{}", file, line, line_text, mark);
+        if let Some(p) = printer.as_mut() {
+            print!("{}", p.def_rows(&file, line, ""));
+        }
     }
     // Every definition hidden: the footer says where they are, and exit 1.
-    print!("{}", crate::footer::footer(shown, "definition", &hidden));
+    print!("{}", crate::footer::tail(shown, "definition", &hidden, scope.is_some()));
     if shown == 0 {
         std::process::exit(1);
     }
@@ -333,8 +344,35 @@ pub fn def_rows(
     names_seen.extend(index.by_name.keys().cloned());
     found.sort();
     found.dedup();
+    if found.is_empty() {
+        found = nested_def_sites(bare, jobs);
+    }
     let conf = if found.len() == 1 { Confidence::Exact } else { Confidence::Guess };
     found.into_iter().map(|(f, l)| (f, l, conf)).collect()
+}
+
+/// The last step of `def_rows`: a name defined below the top level, such as a
+/// const inside a component or a closure bound to a local. Neither the
+/// call-graph index nor the outline holds those, so this asks the query engine
+/// for any function, class, type or variable declaration of that name.
+fn nested_def_sites(name: &str, jobs: &[(String, &'static str)]) -> Vec<(String, usize)> {
+    let queries: Vec<crate::query::ast::Query> = ["function", "variable", "class", "type"]
+        .iter()
+        .filter_map(|k| crate::query::parse(&format!("*{}#\"{}\"", k, name)).ok())
+        .collect();
+    let mut found: Vec<(String, usize)> = Vec::new();
+    for (file, lang_name) in jobs {
+        let Some(lang) = crate::compiler::lang::for_name(lang_name) else { continue };
+        let Ok(source) = std::fs::read(file) else { continue };
+        for ast in &queries {
+            let compiled = crate::compiler::compile(ast, lang.as_ref());
+            let rows = crate::runner::run_rows(&compiled, lang.as_ref(), &source, false).unwrap_or_default();
+            found.extend(rows.into_iter().map(|r| (file.clone(), r.line)));
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
 }
 
 /// Up to three names from `pool` that look like `name`, case-insensitively:

@@ -214,6 +214,33 @@ fixtures/hidden/limit_test.go:3: "HiddenLimit"
 fixtures/hidden/limit_test.go:5: "HiddenLimit"
 ```
 
+### 13. What holds this hit
+
+Question: `saveAssetNow` is defined inside two components. Which two?
+
+```
+ctsq def saveAssetNow fixtures/scope --scope
+fixtures/scope/Asset.tsx:4: const saveAssetNow = async () => {  ?
+  in fixtures/scope/Asset.tsx:3-8  export const AssetEditor = (props: Props) => {
+fixtures/scope/Asset.tsx:11: const saveAssetNow = () => props.asset  ?
+  in fixtures/scope/Asset.tsx:10-14  export function BrandAssetPanel(props: Props) {
+2 definitions
+```
+
+`--scope` puts a row under each hit naming the nearest named scope that holds it, as `path:START-END` and the scope's first line, so no window read follows. A named scope is a function, method, class, type, Rust `impl` or `trait`, Ruby `module`, or an arrow function bound to a const. A closure is skipped and the walk goes on to its named parent. A hit at the top level has no row. It works on `def`, `refs`, `callers`, `callees`, `files` and `-q`, and the count line always prints. Add `--body` to print the scope's body under its row, indented four spaces. The same on a `-q` search:
+
+```
+ctsq -q 'id#hide_rows' --scope src/
+src/main.rs:841: hide_rows(&mut hider, file, &source, rows, true, &mut hidden)
+  in src/main.rs:521-905  fn main() {
+src/main.rs:910: fn hide_rows(
+src/main.rs:1073: for r in &hide_rows(&mut hider, file, &source, rows, false, &mut hidden) {
+  in src/main.rs:1035-1090  fn run_refs(
+3 matches
+```
+
+Next: pull the scope with `ctsq -q '*function#run_refs' --body src/main.rs`.
+
 ## Reference
 
 ## Subcommands

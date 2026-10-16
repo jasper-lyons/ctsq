@@ -6,7 +6,8 @@
 
 use crate::compiler::{self, lang};
 use crate::files;
-use crate::footer::{footer, Hidden};
+use crate::footer::{footer, tail, Hidden};
+use crate::scope;
 use crate::query;
 use crate::runner;
 use std::collections::HashMap;
@@ -78,7 +79,46 @@ pub fn matching_files_hiding(
     Ok(out)
 }
 
-pub fn run(queries: &[String], path: &str, lang_name: Option<&str>, no_ignore: bool, hide: &files::HideOpts) {
+/// The distinct named scopes that hold a match of any of `queries` in `file`,
+/// in source order. A match inside a hidden test scope holds none.
+pub fn hit_scopes(
+    queries: &[String],
+    file: &str,
+    lang_name: &'static str,
+    hider: &mut files::Hider,
+    printer: &mut scope::Printer,
+) -> Vec<scope::Scope> {
+    let Some(lang_box) = lang::for_name(lang_name) else { return vec![] };
+    let Ok(source) = std::fs::read(file) else { return vec![] };
+    let hidden_lines = hider.scope_lines(file, Some(&source));
+    let mut out: Vec<scope::Scope> = Vec::new();
+    for q in queries {
+        let Ok(ast) = query::parse(q) else { continue };
+        let compiled = compiler::compile(&ast, lang_box.as_ref());
+        let rows = runner::run_rows(&compiled, lang_box.as_ref(), &source, false).unwrap_or_default();
+        for r in rows {
+            if hidden_lines.iter().any(|(a, b)| *a <= r.line && r.line <= *b) {
+                continue;
+            }
+            if let Some(s) = printer.hit(file, r.start_byte) {
+                if !out.iter().any(|o| o.start_byte == s.start_byte && o.end_byte == s.end_byte) {
+                    out.push(s);
+                }
+            }
+        }
+    }
+    out.sort_by_key(|s| s.start_byte);
+    out
+}
+
+pub fn run(
+    queries: &[String],
+    path: &str,
+    lang_name: Option<&str>,
+    no_ignore: bool,
+    hide: &files::HideOpts,
+    scope: Option<scope::Opts>,
+) {
     let jobs = files::resolve_jobs(path, lang_name, no_ignore);
     let mut hider = files::Hider::new(hide);
     hider.add_jobs(path, &jobs);
@@ -106,11 +146,18 @@ pub fn run(queries: &[String], path: &str, lang_name: Option<&str>, no_ignore: b
     }
 
     let shown = hits.len();
+    let mut printer = scope.map(|o| scope::Printer::new(o, &jobs));
     for (file, counts) in hits {
         let counts: Vec<String> = counts.iter().map(|c| c.to_string()).collect();
         println!("{}  {}", file, counts.join(" "));
+        if let Some(p) = printer.as_mut() {
+            let lang = jobs.iter().find(|(f, _)| *f == file).map(|(_, l)| *l);
+            for s in lang.map(|l| hit_scopes(queries, &file, l, &mut hider, p)).unwrap_or_default() {
+                print!("{}", p.rows(&file, &s, ""));
+            }
+        }
     }
-    print!("{}", footer(shown, "file", &hidden));
+    print!("{}", tail(shown, "file", &hidden, scope.is_some()));
 }
 
 #[cfg(test)]

@@ -127,7 +127,7 @@ fn item(kind: &'static str, name: String, node: Node, source: &[u8], children: V
     }
 }
 
-fn signature(node: Node, source: &[u8]) -> String {
+pub fn signature(node: Node, source: &[u8]) -> String {
     let first = first_line(node_text(node, source)).trim();
     if first.chars().count() > SIG_MAX {
         let cut: String = first.chars().take(SIG_MAX).collect();

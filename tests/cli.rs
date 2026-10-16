@@ -646,3 +646,131 @@ fn real_fields_still_work_and_a_field_of_another_language_in_the_walk_is_valid()
     assert!(stdout(&out).contains("b.c:1:") && stdout(&out).contains("example.go:18:"), "{}", stdout(&out));
     let _ = std::fs::remove_dir_all(&d);
 }
+
+// ── --scope ──────────────────────────────────────────────────────────────────
+
+fn scope_fixture() -> String {
+    fixture("scope")
+}
+
+#[test]
+fn def_scope_prints_both_components_a_local_name_is_defined_in() {
+    let dir = scope_fixture();
+    let out = ctsq(&["def", "saveAssetNow", &dir, "--scope"]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    let want = format!(
+        "{d}/Asset.tsx:4: const saveAssetNow = async () => {{  ?\n  in {d}/Asset.tsx:3-8  export const AssetEditor = (props: Props) => {{\n\
+{d}/Asset.tsx:11: const saveAssetNow = () => props.asset  ?\n  in {d}/Asset.tsx:10-14  export function BrandAssetPanel(props: Props) {{\n2 definitions\n",
+        d = dir
+    );
+    assert_eq!(stdout(&out), want);
+}
+
+#[test]
+fn def_scope_body_indents_the_scope_body_four_spaces_under_its_row() {
+    let dir = scope_fixture();
+    let text = stdout(&ctsq(&["def", "saveAssetNow", &dir, "--scope", "--body"]));
+    assert!(text.contains("3-8  export const AssetEditor = (props: Props) => {\n    export const AssetEditor = (props: Props) => {\n      const saveAssetNow = async () => {\n"), "{}", text);
+    assert!(text.contains("\n    }\n"), "{}", text);
+    assert!(text.ends_with("2 definitions\n"), "{}", text);
+}
+
+#[test]
+fn a_body_with_no_scope_is_a_usage_error_on_the_commands_that_gained_scope() {
+    let dir = scope_fixture();
+    for args in [
+        vec!["def", "saveAssetNow", dir.as_str(), "--body"],
+        vec!["refs", "saveAssetNow", dir.as_str(), "--body"],
+        vec!["callers", "saveAssetNow", dir.as_str(), "--body"],
+        vec!["callees", "saveAssetNow", dir.as_str(), "--body"],
+        vec!["files", "-q", "id#Props", dir.as_str(), "--body"],
+    ] {
+        let out = ctsq(&args);
+        assert_eq!(out.status.code(), Some(2), "{:?}: {}{}", args, stdout(&out), stderr(&out));
+        assert!(stderr(&out).contains("needs --scope"), "{:?}: {}", args, stderr(&out));
+    }
+    // the --body each other command already had is untouched
+    let tree = ctsq(&["tree", &dir, "--body"]);
+    assert_eq!(tree.status.code(), Some(2));
+    assert!(stderr(&tree).contains("tree has no --body"), "{}", stderr(&tree));
+    let q = ctsq(&["-q", "*function#BrandAssetPanel", "--body", &dir]);
+    assert!(q.status.success(), "{}", stderr(&q));
+    assert!(stdout(&q).contains("Asset.tsx:10-14:"), "{}", stdout(&q));
+}
+
+#[test]
+fn query_scope_prints_a_row_under_each_hit_and_none_at_the_top_level() {
+    let dir = scope_fixture();
+    let out = ctsq(&["-q", "id#/^(saveAssetNow|standalone)$/", &dir, "--scope"]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{}{}", text, stderr(&out));
+    let rows: Vec<&str> = text.lines().filter(|l| l.starts_with("  in ")).collect();
+    // four saveAssetNow hits, each under its component, and `standalone` has no scope
+    assert_eq!(rows.len(), 4, "{}", text);
+    assert!(text.contains("standalone = 1\n5 matches\n"), "{}", text);
+}
+
+#[test]
+fn query_scope_with_context_is_rejected() {
+    let out = ctsq(&["-q", "id#Props", &scope_fixture(), "--scope", "-C", "1"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("--scope"), "{}", stderr(&out));
+}
+
+#[test]
+fn refs_scope_counts_references_and_shows_the_holder() {
+    let out = ctsq(&["refs", "saveAssetNow", &scope_fixture(), "--scope"]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{}", text);
+    assert_eq!(text.lines().filter(|l| l.starts_with("  in ")).count(), 4, "{}", text);
+    assert!(text.ends_with("4 references\n"), "{}", text);
+}
+
+#[test]
+fn scope_rows_follow_test_hiding_and_the_count_line_prints_once() {
+    let d = scratch_dir("scopehide");
+    std::fs::write(d.join("a.go"), "package p\n\nfunc Helper() int { return 1 }\n\nfunc Use() int {\n\treturn Helper()\n}\n").unwrap();
+    std::fs::write(d.join("a_test.go"), "package p\n\nfunc TestX() { Helper() }\n").unwrap();
+    let dir = d.to_str().unwrap();
+    let text = stdout(&ctsq(&["refs", "Helper", dir, "--scope"]));
+    assert!(!text.contains("a_test.go") && !text.contains("TestX"), "{}", text);
+    assert!(text.contains("a.go:5-7  func Use() int {\n"), "{}", text);
+    assert!(text.ends_with("2 references\nhidden: 1 in tests (--tests)\n"), "{}", text);
+    assert_eq!(text.matches("references").count(), 1, "{}", text);
+    let all = stdout(&ctsq(&["refs", "Helper", dir, "--scope", "--tests"]));
+    assert!(all.contains("a_test.go:3-3  func TestX() { Helper() }\n"), "{}", all);
+    assert!(all.ends_with("3 references\n"), "{}", all);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn callers_and_callees_scope_go_under_each_call_row() {
+    let d = scratch_dir("scopecalls");
+    std::fs::write(d.join("c.go"), "package p\n\nfunc Add(a, b int) int { return a + b }\n\nfunc Twice(a int) int {\n\treturn Add(a, a)\n}\n").unwrap();
+    let dir = d.to_str().unwrap();
+    let up = stdout(&ctsq(&["callers", "Add", dir, "--scope"]));
+    assert_eq!(
+        up,
+        format!("Add()\n└── Twice()  [c.go:5]\n      in {dir}/c.go:5-7  func Twice(a int) int {{\n1 caller\n"),
+    );
+    let down = stdout(&ctsq(&["callees", "Twice", dir, "--scope", "--depth", "1"]));
+    assert_eq!(
+        down,
+        format!("Twice()\n└── Add()  [c.go:3]\n      in {dir}/c.go:5-7  func Twice(a int) int {{\n1 callee\n"),
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn files_scope_lists_each_distinct_scope_holding_a_match() {
+    let d = scratch_dir("scopefiles");
+    std::fs::write(d.join("a.go"), "package p\n\ntype T struct{}\n\nfunc One() {\n\tvar x T\n\t_ = x\n}\n\nfunc Two() {\n\tvar y T\n\tvar z T\n}\n").unwrap();
+    let dir = d.to_str().unwrap();
+    let text = stdout(&ctsq(&["files", "-q", "id#/^[xyz]$/", "-q", "id#One", dir, "--scope"]));
+    let f = format!("{}/a.go", dir);
+    assert_eq!(
+        text,
+        format!("{f}  4 1\n  in {f}:5-8  func One() {{\n  in {f}:10-13  func Two() {{\n1 file\n"),
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}

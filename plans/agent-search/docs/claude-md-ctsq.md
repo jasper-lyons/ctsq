@@ -8,6 +8,7 @@
   - what is in a file: `ctsq tree file.rs` for the outline and size, then `ctsq -q '*function#name' --body file.rs` for one body
   - who calls it: `ctsq callers Name src/`, then `ctsq explain` on a caller. Also `callees` and `callgraph`
   - where is a method called: `ctsq -q 'call#Name' src/` matches the last segment, so `pkg.Name(...)` and `x.Name(...)` both hit. `comment#/text/` finds comments. Scripts with no extension are read by their shebang, no `--lang` needed
+  - what function or class holds a hit: add `--scope` to `def`, `refs`, `callers`, `callees`, `files` or `-q`. A row under each hit gives the holder's `path:START-END` and signature, so no window Read follows. `--scope --body` adds the holder's body
   - files where several names occur: `ctsq files -q 'id#A' -q 'id#B' src/`
   - where is it defined: `ctsq def Name src/`. Functions that use a constant: `ctsq -q '(*function @f).body(id#CONST)' file.cpp`
   - tests are hidden by default and counted on the last line, `hidden: N in tests (--tests)`. Before deleting or renaming a name, rerun with `--tests` to see every use. `--exclude GLOB` hides more paths
