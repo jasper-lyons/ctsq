@@ -100,3 +100,31 @@ Minor findings from the mid-build adversarial review, not fixed in this build:
 - `string` and `literal` do not cover JS/TS template strings, so the id# miss fallback misses them too.
 - Test-scope detection still costs time: `tree src/` takes 0.27s against 0.10s before this build (0.41s before the fix). Next step: cache compiled scope queries across files.
 - `scopeof --siblings` on a top-level Rust item also lists the functions inside `mod tests`, because `mod_item` is not a scope and the walk descends into it.
+
+## Decisions from Jasper (2026-10-16)
+
+### A17. Several names: git-style arguments
+
+`def`, `refs`, `callers`, `callees` and `explain` take names, then paths. An argument that exists on disk is a path. `--` makes everything after it a path. An argument before `--` that is both a valid name and an existing path is an error that says to use `--`. With no path, the search root is `.`. A trailing argument that looks like a path (contains `/`) but does not exist prints `no such file: X (did you mean Y)` on stderr. Each name is answered in order, then `not found: A, B (similar: ...)` for the misses on stderr. Exit 0 if any name resolved (decision 07).
+
+### A18. Limits use the max prefix
+
+- `--max-matches N` on every command that returns hits: stop after N, the footer counts the rest.
+- `ctsq path --max` is renamed `--max-depth`. `callers`, `callees` and `callgraph` `--depth` is renamed `--max-depth`, with `--depth` kept as a hidden alias. `path --max` errors with a pointer to `--max-depth`.
+
+### A19. Footer: one line per reason
+
+```
+2 references
+hidden: 2 in tests (--tests)
+hidden: 3 in excluded paths (drop --exclude)
+hidden: 31 over --max-matches 2 in 4 files (--max-matches 40)
+```
+
+### A20. Errors go to stderr
+
+Miss reports (including the found-as blocks and `try:` lines), the everything-hidden report and `not found:` lines go to stderr with exit 1. Results and the footer of a call that printed results stay on stdout. When everything was hidden, stderr reads `no <noun> to X outside tests in P (N files)` or the command's miss wording, then the `hidden:` lines.
+
+### A21. `find` listing columns line up
+
+The `ctsq find` listing pads the source column so the query, framework and reason columns align.

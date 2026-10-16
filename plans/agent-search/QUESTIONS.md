@@ -35,3 +35,12 @@ I built the sample's shape: one `hidden:` line with the reasons separated by com
 ## Note
 
 These questions could not be posted with `brief ask agent-search`. This repo has no `.queue` folder holding an `agent-search.md` brief, and creating one would have meant running `brief init` here. They are in the build report instead.
+
+## Answers (2026-10-16)
+
+1. Limits take the max prefix: `--max-matches`, `--max-depth`. Names and paths: git-style (orchestrator's recommendation, not objected to).
+2. One footer line per reason.
+3. Errors go to stderr. The `find` output shape is approved.
+4. Run a benchmarking and performance round.
+
+Recorded as A17 to A21 in BUILD.md.
