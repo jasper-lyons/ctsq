@@ -25,3 +25,9 @@ Options:
 - **A (my recommendation).** Add `--max N` (match limit) to every command that returns hits, but not as a global flag. `path --max` keeps its hop-limit meaning. The same flag name means two different things on two commands.
 - **B.** Rename the hop limit to `ctsq path --hops N` and make `--max` global as the plan says. Breaks existing `path --max` calls and docs.
 - **C.** Name the match limit differently, for example `--limit N`, everywhere. Differs from the plan and the footer wording (`over --max 2`).
+
+## 3. Footer: one line, or one line per reason (decision 03)
+
+The plan's prose under Output format says "one line per reason", but its sample prints every reason on one line: `hidden: 6 in tests (--tests), 31 over --max 2 in 4 files (--max 40)`.
+
+I built the sample's shape: one `hidden:` line with the reasons separated by commas, printed after a count line such as `2 matches`. The wording lives in one shared function, so switching to one line per reason is a one-function change. Say if you want the other shape.
