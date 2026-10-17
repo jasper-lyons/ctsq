@@ -1596,7 +1596,7 @@ fn run_path(
         // The flow engine asks the graph one call or one name at a time, and
         // a lazy graph answers each from the files that can change it.
         let graph = if resolve::scoped::whole() {
-            resolve::scoped::FlowGraph::whole(&resolve::graph::build_from_store(&store))
+            semantic::flows::whole_graph(&resolve::graph::build_from_store(&store))
         } else {
             resolve::scoped::FlowGraph::lazy(&jobs, words.clone())
         };

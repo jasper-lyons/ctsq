@@ -21,8 +21,9 @@ use tree_sitter::Node;
 use super::Hop;
 use crate::config::{LangConfig, Slot};
 use crate::resolve::go::{binding_type_qualified, go_imports};
+use crate::resolve::graph::CallGraph;
+use crate::resolve::{DefIndex, DefKind, TreeStore};
 use crate::resolve::scoped::{FlowGraph, Site};
-use crate::resolve::{DefIndex, TreeStore};
 
 const FUNCTIONS: &[&str] = &["function_declaration", "method_declaration", "func_literal"];
 const LITERALS: &[&str] = &[
@@ -431,6 +432,11 @@ fn leaf(tag: &str) -> Origin {
     Origin { tags: vec![tag.to_string()], ..Default::default() }
 }
 
+/// The flow graph over a whole-folder call graph (`CTSQ_WHOLE_GRAPH=1`).
+pub fn whole(g: &CallGraph) -> FlowGraph {
+    FlowGraph::whole(g)
+}
+
 /// End predicate over (file, call node).
 pub type UpEnd<'e> = dyn Fn(&str, Node) -> bool + 'e;
 
@@ -477,7 +483,7 @@ impl<'a> Up<'a> {
 
     /// The def index of a function node, matched by file and line.
     pub fn def_of(&self, file: &str, func: Node) -> Option<usize> {
-        self.graph.def_at(file, line_of(func))
+        self.graph.def_at(file, line_of(func), |d| !matches!(d.kind, DefKind::InterfaceMethod { .. }))
     }
 
     /// Sites calling `def`, in file then document order.
@@ -1003,7 +1009,7 @@ mod tests {
     fn a_param_walks_to_each_callers_argument() {
         let src = "package t\nfunc r(n string) {}\nfunc a() { r(\"x\") }\nfunc b() { v := \"y\"; r(v) }\n";
         let s = store(&[("t/a.go", src)]);
-        let g = crate::resolve::scoped::FlowGraph::whole(&crate::resolve::graph::build_from_store(&s));
+        let g = whole(&crate::resolve::graph::build_from_store(&s));
         let up = Up::new(&s, &g, None, 12);
         let root = s.get("t/a.go").unwrap().tree.as_ref().unwrap().root_node();
         let h = up.start("t/a.go", ident(root, src, "n", 0)).unwrap();
@@ -1018,7 +1024,7 @@ mod tests {
     fn a_call_result_goes_back_into_the_callee_return() {
         let src = "package t\nfunc mk() string {\n\treturn \"lit\"\n}\nfunc F() {\n\tq := mk()\n\t_ = q\n}\n";
         let s = store(&[("t/a.go", src)]);
-        let g = crate::resolve::scoped::FlowGraph::whole(&crate::resolve::graph::build_from_store(&s));
+        let g = whole(&crate::resolve::graph::build_from_store(&s));
         let up = Up::new(&s, &g, None, 12);
         let root = s.get("t/a.go").unwrap().tree.as_ref().unwrap().root_node();
         let h = up.start("t/a.go", ident(root, src, "q", 0)).unwrap();
@@ -1031,7 +1037,7 @@ mod tests {
     fn a_field_read_goes_back_to_its_store_and_an_outside_call_is_unmodelled() {
         let src = "package t\nimport \"x/y\"\ntype B struct{ P string }\nfunc F() {\n\tb := B{}\n\tb.P = y.Get()\n\tq := b.P\n\t_ = q\n}\n";
         let s = store(&[("t/a.go", src)]);
-        let g = crate::resolve::scoped::FlowGraph::whole(&crate::resolve::graph::build_from_store(&s));
+        let g = whole(&crate::resolve::graph::build_from_store(&s));
         let up = Up::new(&s, &g, None, 12);
         let root = s.get("t/a.go").unwrap().tree.as_ref().unwrap().root_node();
         let h = up.start("t/a.go", ident(root, src, "q", 0)).unwrap();
@@ -1044,7 +1050,7 @@ mod tests {
     fn recursion_and_max_depth_stop() {
         let src = "package t\nfunc r(n int) { r(n - 1) }\nfunc a() { r(3) }\n";
         let s = store(&[("t/a.go", src)]);
-        let g = crate::resolve::scoped::FlowGraph::whole(&crate::resolve::graph::build_from_store(&s));
+        let g = whole(&crate::resolve::graph::build_from_store(&s));
         let root = s.get("t/a.go").unwrap().tree.as_ref().unwrap().root_node();
         let up = Up::new(&s, &g, None, 12);
         let h = up.start("t/a.go", ident(root, src, "n", 0)).unwrap();

@@ -22,6 +22,7 @@ use crate::flow::{
 };
 use crate::query::ast::{Combinator, Query};
 use crate::resolve::go::{binding_type_qualified, go_imports, go_signatures, GoSignature};
+use crate::resolve::graph::CallGraph;
 use crate::resolve::scoped::FlowGraph;
 use crate::resolve::{DefIndex, DefKind, TreeStore};
 
@@ -49,6 +50,11 @@ pub struct FlowReport {
     pub text: String,
     /// Sink hops, or `outside` leaves when the query has no end.
     pub found: usize,
+}
+
+/// The flow graph over a whole-folder call graph (`CTSQ_WHOLE_GRAPH=1`).
+pub fn whole_graph(g: &CallGraph) -> FlowGraph {
+    upward::whole(g)
 }
 
 /// A query string that ends in `=>`, `==>`, `<=` or `<==` has no end
@@ -1252,7 +1258,7 @@ mod tests {
         for (f, src) in files {
             store.insert(f, "go", src.as_bytes().to_vec());
         }
-        let g = FlowGraph::whole(&crate::resolve::graph::build_from_store(&store));
+        let g = whole_graph(&crate::resolve::graph::build_from_store(&store));
         let (head, open) = match open_end(q) {
             Some((h, c)) => (h, Some(c)),
             None => (q.to_string(), None),

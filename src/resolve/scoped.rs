@@ -755,11 +755,9 @@ impl FlowGraph {
     }
 
     /// The first definition, in index order, declared in `file` at `line`
-    /// that is not an interface method.
-    pub fn def_at(&self, file: &str, line: usize) -> Option<usize> {
-        let fits = |d: &super::Def| {
-            d.id.file == file && d.id.line == line && !matches!(d.kind, super::DefKind::InterfaceMethod { .. })
-        };
+    /// that `keep` accepts.
+    pub fn def_at(&self, file: &str, line: usize, keep: impl Fn(&super::Def) -> bool) -> Option<usize> {
+        let fits = |d: &super::Def| d.id.file == file && d.id.line == line && keep(d);
         match &self.kind {
             FlowKind::Whole(w) => w.defs.iter().position(|d| fits(d)),
             FlowKind::Lazy(l) => {

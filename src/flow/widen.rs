@@ -70,7 +70,7 @@ pub fn outside_impls_for(iface: &str, store: &TreeStore, graph: &FlowGraph, modu
         }
         for sig in sigs_of(f) {
             if sig.params.iter().any(|p| base(&p.ty) == iface) {
-                if let Some(d) = graph.def_at(f, sig.line) {
+                if let Some(d) = graph.def_at(f, sig.line, |d| !matches!(d.kind, DefKind::InterfaceMethod { .. })) {
                     let d = graph.def(d);
                     if matches!(d.kind, DefKind::Function) && !takers.contains(&d.name) {
                         takers.push(d.name.clone());
