@@ -58,17 +58,14 @@ pub fn report_many(
     hider: &mut files::Hider,
 ) -> crate::resolve::NamesOut {
     let mut hidden = Hidden::default();
-    // Held to the end: the graph, the definitions, the references and the
-    // outline all read these parses, so each file is parsed once per run.
-    let _held = hold_named(names, jobs);
-    let g = graph_for(names, jobs, opts);
+    let (g, facts) = gather(names, jobs, opts, hider);
     let mut out = String::new();
     let mut miss_text = String::new();
     let mut missing: Vec<String> = Vec::new();
     let mut any = false;
     for symbol in names {
         let before = hidden.tests + hidden.excluded;
-        let (text, found) = body(symbol, jobs, &g, opts, hider, &mut hidden);
+        let (text, found) = body(symbol, jobs, &g, &facts[bare_name(symbol)], opts, hider, &mut hidden);
         if found {
             any = true;
         } else if hidden.tests + hidden.excluded == before {
@@ -101,9 +98,28 @@ pub fn report_many(
     crate::resolve::NamesOut { out, err, code: if any { 0 } else { 1 } }
 }
 
-/// The graph the walks of every name read, built from the files they need:
-/// callers and callees `opts.depth` levels from each name's definitions.
-fn graph_for(names: &[String], jobs: &[(String, &'static str)], opts: &Options) -> CallGraph {
+/// What the files holding a name's bare form say about it.
+#[derive(Default)]
+struct Facts {
+    /// (file, lang, kind, line) of each outline entry named the bare name, in
+    /// job order then outline order.
+    outline: Vec<(String, &'static str, &'static str, usize)>,
+    /// Every `id#bare` match as (file, line, source line), sorted.
+    refs: Vec<(String, usize, String)>,
+}
+
+/// The graph the walks of every name read, built from the files they need
+/// (callers and callees `opts.depth` levels from each name's definitions),
+/// and the facts of each bare name. One pass reads every file holding a bare
+/// name, for its outline and references, and hands the same parse to the
+/// graph builder, so no file is parsed twice for them.
+fn gather(
+    names: &[String],
+    jobs: &[(String, &'static str)],
+    opts: &Options,
+    hider: &mut files::Hider,
+) -> (CallGraph, HashMap<String, Facts>) {
+    use crate::resolve::scoped;
     let mut seeds: Vec<String> = Vec::new();
     for s in names {
         for n in [bare_name(s), query_name(s)] {
@@ -112,7 +128,62 @@ fn graph_for(names: &[String], jobs: &[(String, &'static str)], opts: &Options) 
             }
         }
     }
-    crate::resolve::scoped::build(jobs, &crate::resolve::scoped::Seeds { names: seeds, up: opts.depth, down: opts.depth })
+    let seeds = scoped::Seeds { names: seeds, up: opts.depth, down: opts.depth };
+    let mut bares: Vec<&str> = Vec::new();
+    for s in names {
+        if !bares.contains(&bare_name(s)) {
+            bares.push(bare_name(s));
+        }
+    }
+    let mut facts: HashMap<String, Facts> = bares.iter().map(|b| (b.to_string(), Facts::default())).collect();
+    let mut prep = (!scoped::whole()).then(|| scoped::Prepared::new(jobs));
+    let mut queries: HashMap<(&str, &'static str), (Box<dyn lang::Lang>, Option<compiler::CompiledQuery>)> = HashMap::new();
+    let mut lines = LineCache::default();
+    for (j, (file, lang_name)) in jobs.iter().enumerate() {
+        let Some(src) = crate::parsed::source(file) else { continue };
+        // An outline entry or an `id#` match of a name holds its bytes.
+        let held: Vec<&str> = bares.iter().copied().filter(|b| crate::needle::holds(&src, b)).collect();
+        if held.is_empty() {
+            continue;
+        }
+        let Some(p) = crate::parsed::get(file, lang_name) else { continue };
+        if let Some(pr) = prep.as_mut() {
+            pr.offer(j, &p);
+        }
+        // The rows of this file are hidden or not by its test scopes, read
+        // now from the parse in hand.
+        hider.scope_lines_in(file, Some(&p.source), p.tree.as_ref());
+        let locs = tree::collect_def_locs(file, lang_name);
+        for b in held {
+            let f = facts.get_mut(b).expect("a fact per bare name");
+            for (kind, name, line) in &locs {
+                if name == b {
+                    f.outline.push((file.clone(), lang_name, kind, *line));
+                }
+            }
+            let (lang_box, compiled) = queries.entry((b, lang_name)).or_insert_with(|| {
+                let l = lang::for_name(lang_name).expect("lang_name always valid here");
+                let c = query::parse(&format!("(id#\"{}\" @r)", b)).ok().map(|ast| compiler::compile(&ast, l.as_ref()));
+                (l, c)
+            });
+            let Some(compiled) = compiled.as_ref() else { continue };
+            let Ok(matches) = runner::run_rows_cached(compiled, lang_box.as_ref(), file, lang_name, false) else { continue };
+            for m in matches {
+                if let Some(line) = crate::resolve::fallback::parse_line("r", &m.node_text) {
+                    f.refs.push((file.clone(), line, lines.text(file, line)));
+                }
+            }
+        }
+    }
+    for f in facts.values_mut() {
+        f.refs.sort();
+        f.refs.dedup();
+    }
+    let g = match prep {
+        Some(pr) => pr.build(&seeds),
+        None => crate::resolve::graph::build(jobs),
+    };
+    (g, facts)
 }
 
 /// The name `resolve_def_query` looks `expr` up by.
@@ -127,21 +198,6 @@ fn query_name(expr: &str) -> &str {
     } else {
         expr
     }
-}
-
-/// Whether `file` can hold a definition, an outline entry or an `id#` match
-/// of `bare`: each of those holds its bytes.
-fn may_hold(file: &str, bare: &str) -> bool {
-    crate::parsed::source(file).is_some_and(|s| crate::needle::holds(&s, bare))
-}
-
-/// The parses of the files holding any name's bare form, held so the
-/// definitions, the references and the outline share one parse each.
-fn hold_named(names: &[String], jobs: &[(String, &'static str)]) -> Vec<std::rc::Rc<crate::parsed::ParsedFile>> {
-    jobs.iter()
-        .filter(|(f, _)| names.iter().any(|n| may_hold(f, bare_name(n))))
-        .filter_map(|(f, l)| crate::parsed::get(f, l))
-        .collect()
 }
 
 // ── Report ───────────────────────────────────────────────────────────────────
@@ -165,8 +221,8 @@ pub fn report_hiding(
     hider: &mut files::Hider,
 ) -> (String, bool) {
     let mut hidden = Hidden::default();
-    let g = graph_for(&[symbol.to_string()], jobs, opts);
-    let (mut out, found) = body(symbol, jobs, &g, opts, hider, &mut hidden);
+    let (g, facts) = gather(&[symbol.to_string()], jobs, opts, hider);
+    let (mut out, found) = body(symbol, jobs, &g, &facts[bare_name(symbol)], opts, hider, &mut hidden);
     let shown = out.matches("\nDEFINITION ").count();
     out.push_str(&footer(shown, "definition", &hidden));
     (out, found)
@@ -176,6 +232,7 @@ fn body(
     symbol: &str,
     jobs: &[(String, &'static str)],
     g: &CallGraph,
+    facts: &Facts,
     opts: &Options,
     hider: &mut files::Hider,
     hidden: &mut Hidden,
@@ -186,11 +243,11 @@ fn body(
     // caller and a reference, or a definition and a reference, counts once.
     let mut hidden_seen: HashSet<(String, usize)> = HashSet::new();
 
-    let sites = keep_once(hider, definition_sites(symbol, g, jobs), |s| (s.file.clone(), s.line), hidden, &mut hidden_seen);
+    let sites = keep_once(hider, definition_sites(symbol, g, jobs, facts), |s| (s.file.clone(), s.line), hidden, &mut hidden_seen);
 
     if sites.is_empty() {
         out.push_str(&format!("SYMBOL {} (no definition resolved)\n", symbol));
-        let n = push_reference_list(&mut out, symbol, jobs, opts, hider, hidden, &mut hidden_seen);
+        let n = push_reference_list(&mut out, facts, opts, hider, hidden, &mut hidden_seen);
         return (out, n > 0);
     }
 
@@ -265,8 +322,7 @@ fn body(
         push_walk(&mut out, "CALLEES", Direction::Down, &g, &keys, opts, &mut ctx);
     }
 
-    let remaining: Vec<_> = references(symbol, jobs)
-        .into_iter()
+    let remaining: Vec<_> = facts.refs.iter().cloned()
         .filter(|(file, line, _)| !listed.contains(&(file.clone(), *line)))
         .collect();
     let remaining = keep_once(hider, remaining, |(f, l, _)| (f.clone(), *l), hidden, &mut hidden_seen);
@@ -328,10 +384,9 @@ struct Site {
 /// definitions, so a class of the same name is merged in from the `tree`
 /// outline, and when the index finds nothing at all the outline supplies
 /// every kind of definition it knows.
-fn definition_sites(symbol: &str, g: &CallGraph, jobs: &[(String, &'static str)]) -> Vec<Site> {
+fn definition_sites(symbol: &str, g: &CallGraph, jobs: &[(String, &'static str)], facts: &Facts) -> Vec<Site> {
     let lang_of: HashMap<&str, &'static str> =
         jobs.iter().map(|(f, l)| (f.as_str(), *l)).collect();
-    let bare = bare_name(symbol);
 
     let mut sites: Vec<Site> = resolve_def_query(symbol, &g.index)
         .into_iter()
@@ -351,29 +406,22 @@ fn definition_sites(symbol: &str, g: &CallGraph, jobs: &[(String, &'static str)]
     let index_resolved = !sites.is_empty();
     // A class or struct is invisible to the call-graph index, so take it from
     // the outline. When the index resolved nothing, take any kind.
-    for (file, lang_name) in jobs {
-        if !may_hold(file, bare) {
+    for (file, lang_name, kind, line) in &facts.outline {
+        let (file, line) = (file, *line);
+        if index_resolved && *kind != "class" {
             continue;
         }
-        for (kind, name, line) in tree::collect_def_locs(file, lang_name) {
-            if name != bare {
-                continue;
-            }
-            if index_resolved && kind != "class" {
-                continue;
-            }
-            if sites.iter().any(|s| s.file == *file && s.line == line) {
-                continue;
-            }
-            sites.push(Site {
-                file: file.clone(),
-                line,
-                lang: lang_name,
-                kind: kind.to_string(),
-                guess: false,
-                key: None,
-            });
+        if sites.iter().any(|s| s.file == *file && s.line == line) {
+            continue;
         }
+        sites.push(Site {
+            file: file.clone(),
+            line,
+            lang: lang_name,
+            kind: kind.to_string(),
+            guess: false,
+            key: None,
+        });
     }
 
     sites.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
@@ -570,47 +618,15 @@ fn walk(
 
 // ── References ───────────────────────────────────────────────────────────────
 
-/// Every `id#Symbol` match in the search set, as (file, line, source line).
-fn references(symbol: &str, jobs: &[(String, &'static str)]) -> Vec<(String, usize, String)> {
-    let query_str = format!("(id#\"{}\" @r)", bare_name(symbol));
-    let Ok(ast) = query::parse(&query_str) else { return vec![] };
-
-    let mut cache: HashMap<&'static str, (Box<dyn lang::Lang>, compiler::CompiledQuery)> =
-        HashMap::new();
-    let mut lines = LineCache::default();
-    let mut out = Vec::new();
-
-    for (file, lang_name) in jobs {
-        if !may_hold(file, bare_name(symbol)) {
-            continue;
-        }
-        let (lang_box, compiled) = cache.entry(lang_name).or_insert_with(|| {
-            let l = lang::for_name(lang_name).expect("lang_name always valid here");
-            let c = compiler::compile(&ast, l.as_ref());
-            (l, c)
-        });
-        let Ok(matches) = runner::run_rows_cached(compiled, lang_box.as_ref(), file, lang_name, false) else { continue };
-        for m in matches {
-            if let Some(line) = crate::resolve::fallback::parse_line("r", &m.node_text) {
-                out.push((file.clone(), line, lines.text(file, line)));
-            }
-        }
-    }
-    out.sort();
-    out.dedup();
-    out
-}
-
 fn push_reference_list(
     out: &mut String,
-    symbol: &str,
-    jobs: &[(String, &'static str)],
+    facts: &Facts,
     opts: &Options,
     hider: &mut files::Hider,
     hidden: &mut Hidden,
     seen: &mut HashSet<(String, usize)>,
 ) -> usize {
-    let refs = keep_once(hider, references(symbol, jobs), |(f, l, _)| (f.clone(), *l), hidden, seen);
+    let refs = keep_once(hider, facts.refs.clone(), |(f, l, _)| (f.clone(), *l), hidden, seen);
     let refs: Vec<_> = refs.into_iter().filter(|(f, _, _)| crate::footer::take(f)).collect();
     out.push_str(&format!("\nREFERENCES ({})\n", refs.len()));
     for (file, line, text) in refs.iter().take(opts.max_lines) {

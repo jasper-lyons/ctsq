@@ -41,9 +41,17 @@ pub fn build(jobs: &[(String, &'static str)]) -> CallGraph {
             }
         }
     }
-    let files: Vec<&Loaded> = loaded.iter().collect();
-    let index = index_of(&files);
-    let resolved = files.iter().map(|l| l.resolve(&index, None)).collect();
+    // The definitions move into the index, and each model goes once its
+    // calls are resolved. Only the flow engine reads the per-site table, and
+    // it builds from a `TreeStore`, so the sites are not kept.
+    let mut index = DefIndex::default();
+    for l in loaded.iter_mut() {
+        for d in l.defs.drain(..) {
+            index.push(d);
+        }
+        index.impls.append(&mut l.impls);
+    }
+    let resolved = loaded.into_iter().map(|l| (l.resolve(&index, None).0, Vec::new())).collect();
     finish(index, resolved)
 }
 

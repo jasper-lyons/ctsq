@@ -456,6 +456,7 @@ pub fn def_report(
     // The index is built once for all the names, from files parsed and dropped
     // in turn. It holds definitions, not trees.
     let mut scan = DefScan::new(jobs);
+    scan.cover_exprs(names);
     for expr in names {
         let mut all_names: Vec<String> = Vec::new();
         let mut rows = def_rows(expr, jobs, &mut scan, &mut all_names);
@@ -636,14 +637,27 @@ impl DefScan {
 
     /// Read every file holding `name`, then rebuild the index in job order.
     fn cover(&mut self, name: &str) {
-        if !self.covered.insert(name.to_string()) {
+        self.cover_names(&[name]);
+    }
+
+    /// Read every file holding one of `names` as a whole word (see
+    /// `scoped::holds_any`), each file's text read once.
+    pub fn cover_names(&mut self, names: &[&str]) {
+        let new: Vec<&str> = names.iter().copied().filter(|n| self.covered.insert(n.to_string())).collect();
+        if new.is_empty() {
             return;
         }
         let pick: Vec<usize> = (0..self.jobs.len())
             .filter(|&j| !self.read[j])
-            .filter(|&j| crate::parsed::source(&self.jobs[j].0).is_some_and(|s| crate::needle::holds(&s, name)))
+            .filter(|&j| crate::parsed::source(&self.jobs[j].0).is_some_and(|s| scoped::holds_any(&s, &new)))
             .collect();
         self.read_jobs(&pick);
+    }
+
+    /// Cover what `def_rows` reads for each of `exprs`, in one pass.
+    pub fn cover_exprs(&mut self, exprs: &[String]) {
+        let names: Vec<&str> = exprs.iter().flat_map(|e| [def_query_name(e), crate::explain::bare_name(e)]).collect();
+        self.cover_names(&names);
     }
 
     /// Read every file, for a miss report.

@@ -39,6 +39,28 @@ pub fn build(jobs: &[(String, &'static str)], seeds: &Seeds) -> CallGraph {
     Scope::new(jobs).run(seeds)
 }
 
+/// A scoped build that can take parses its caller already holds, so a file
+/// the caller reads for its own reasons is not parsed a second time.
+pub struct Prepared<'a>(Scope<'a>);
+
+impl<'a> Prepared<'a> {
+    pub fn new(jobs: &'a [(String, &'static str)]) -> Prepared<'a> {
+        Prepared(Scope::new(jobs))
+    }
+
+    /// Read job `j` from a parse of it, if it is not read yet. A file read
+    /// that no walk needs only adds definitions the index may hold anyway.
+    pub fn offer(&mut self, j: usize, p: &crate::parsed::ParsedFile) {
+        if matches!(self.0.files[j], State::Unread) {
+            self.0.files[j] = State::Loaded(Loaded::read(&self.0.jobs[j].0, p));
+        }
+    }
+
+    pub fn build(self, seeds: &Seeds) -> CallGraph {
+        self.0.run(seeds)
+    }
+}
+
 /// Whether `CTSQ_WHOLE_GRAPH` asks for the whole-folder graph.
 pub fn whole() -> bool {
     std::env::var_os("CTSQ_WHOLE_GRAPH").is_some_and(|v| !v.is_empty() && v != "0")
@@ -75,6 +97,8 @@ impl<'a> Scope<'a> {
         Scope { jobs, words: Words::new(jobs), files, covered: HashSet::new(), job_of }
     }
 
+    /// Read job `j`: its definitions and its calls, so it is parsed once
+    /// whether it later turns out to be resolved or only indexed.
     fn load(&mut self, j: usize) {
         if !matches!(self.files[j], State::Unread) {
             return;
@@ -200,7 +224,8 @@ impl<'a> Scope<'a> {
                 for &j in resolved {
                     if let State::Loaded(l) = &self.files[j] {
                         let want = Want { names, lines: lines.get(&j) };
-                        out.push(l.resolve(&index, Some(&want)));
+                        // No walk reads the per-site table.
+                        out.push((l.resolve(&index, Some(&want)).0, Vec::new()));
                     }
                 }
                 let mut new: Vec<String> =
@@ -283,29 +308,39 @@ impl Words {
 
 /// Whether `hay` holds `name` with no identifier byte touching an end of it
 /// that is itself an identifier byte.
-fn holds_bounded(hay: &[u8], name: &str) -> bool {
-    let n = name.as_bytes();
-    if n.is_empty() {
-        return true;
-    }
-    let (check_before, check_after) = (word_byte(n[0]), word_byte(n[n.len() - 1]));
-    let mut from = 0;
-    while from + n.len() <= hay.len() {
-        let Some(k) = find(&hay[from..], n) else { return false };
-        let i = from + k;
-        let end = i + n.len();
-        let before = !check_before || i == 0 || !word_byte(hay[i - 1]);
-        let after = !check_after || end == hay.len() || !word_byte(hay[end]);
-        if before && after {
-            return true;
-        }
-        from = i + 1;
-    }
-    false
+pub(crate) fn holds_bounded(hay: &[u8], name: &str) -> bool {
+    holds_any(hay, &[name])
 }
 
-fn find(hay: &[u8], n: &[u8]) -> Option<usize> {
-    hay.windows(n.len()).position(|w| w == n)
+/// `holds_bounded` for any of `names`, validating the text once.
+pub(crate) fn holds_any(hay: &[u8], names: &[&str]) -> bool {
+    let text = std::str::from_utf8(hay).ok();
+    names.iter().any(|name| {
+        let n = name.as_bytes();
+        let Some(first) = name.chars().next() else { return true };
+        let (check_before, check_after) = (word_byte(n[0]), word_byte(n[n.len() - 1]));
+        let mut from = 0;
+        while from + n.len() <= hay.len() {
+            let found = match text {
+                // The standard library's substring search, far faster than
+                // comparing a window at every offset.
+                Some(s) => s[from..].find(*name),
+                None => hay[from..].windows(n.len()).position(|w| w == n),
+            };
+            let Some(k) = found else { return false };
+            let i = from + k;
+            let end = i + n.len();
+            let before = !check_before || i == 0 || !word_byte(hay[i - 1]);
+            let after = !check_after || end == hay.len() || !word_byte(hay[end]);
+            if before && after {
+                return true;
+            }
+            // Past the first character, so the next search starts on a
+            // character boundary.
+            from = i + first.len_utf8();
+        }
+        false
+    })
 }
 
 #[cfg(test)]
