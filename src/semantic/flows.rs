@@ -437,6 +437,10 @@ fn field_users(
         if pf.lang != "go" {
             continue;
         }
+        // A file without the name's bytes has no field called `name`.
+        if !crate::needle::holds(&pf.source, name) {
+            continue;
+        }
         let Some(tree) = &pf.tree else { continue };
         let cx = FlowCtx { file, src: &pf.source, root: tree.root_node(), mech: m, module };
         let other_owner = |t: Option<String>| match (t, owner) {
@@ -454,7 +458,9 @@ fn field_users(
             } else {
                 None
             };
-            let other = field.is_some() && owner.is_some() && {
+            // The owner check types the operand, so it runs only on a field called `name`.
+            let named_hit = field.is_some_and(|f| f.utf8_text(&pf.source).unwrap_or("") == name);
+            let other = named_hit && owner.is_some() && {
                 if config::Mechanics::is(&m.nodes.field, n.kind()) {
                     let line = n.start_position().row + 1;
                     other_owner(m.fields.operand.iter().find_map(|f| n.child_by_field_name(f)).and_then(|o| flow::operand_type(&cx, o, line)))
@@ -465,7 +471,7 @@ fn field_users(
                     other_owner(ty.map(|t| flow::base_type(t.utf8_text(&pf.source).unwrap_or(""))).filter(|t| !t.is_empty()))
                 }
             };
-            if !other && field.is_some_and(|f| f.utf8_text(&pf.source).unwrap_or("") == name) {
+            if named_hit && !other {
                 if let Some(func) = enclosing_function(tree.root_node(), m, n.start_byte()) {
                     if seen.insert(func.start_byte()) {
                         hits.push((func.start_byte(), n.start_byte()));
@@ -607,7 +613,7 @@ fn prune(h: &Hop, end: &str, eventually: bool, depth: usize, need_return: bool) 
     if !needed && children.is_empty() {
         return None;
     }
-    let mut out = Hop { children, ..h.clone() };
+    let mut out = with_children(h, children);
     if h.has(end) && !is_end {
         out.tags.retain(|t| t != end);
     }
@@ -632,7 +638,23 @@ fn only(h: &Hop, wanted: &[String], root: bool) -> Option<Hop> {
     if !keep && children.is_empty() {
         return None;
     }
-    Some(Hop { children, ..h.clone() })
+    Some(with_children(h, children))
+}
+
+/// `h` with `children` in place of its own. `Hop { children, ..h.clone() }`
+/// copied the whole subtree under `h` only to drop it, once per hop.
+fn with_children(h: &Hop, children: Vec<Hop>) -> Hop {
+    Hop {
+        file: h.file.clone(),
+        line: h.line,
+        func: h.func.clone(),
+        text: h.text.clone(),
+        tags: h.tags.clone(),
+        unmodelled: h.unmodelled.clone(),
+        returns: h.returns,
+        into: h.into,
+        children,
+    }
 }
 
 /// Print `h` and its children. A downward root drops its `source` tag (it

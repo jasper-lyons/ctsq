@@ -102,6 +102,7 @@ pub fn segment_defs(seg: &Query, store: &TreeStore, index: &DefIndex) -> Result<
 /// returned.
 pub fn segment_rows(seg: &Query, store: &TreeStore) -> Result<Vec<(String, Vec<crate::runner::MatchRow>)>, String> {
     let attrs = attrs::last_selector_attrs(seg)?;
+    let needles = crate::needle::Needles::from_query(seg);
     let mut first_err: Option<String> = None;
     let mut accepted = false;
     let mut out = Vec::new();
@@ -117,9 +118,14 @@ pub fn segment_rows(seg: &Query, store: &TreeStore) -> Result<Vec<(String, Vec<c
             continue;
         }
         accepted = true;
-        let compiled = compiler::compile(seg, lang.as_ref());
-        let rows = crate::runner::run_rows(&compiled, lang.as_ref(), &pf.source, false)?;
-        let rows = attrs::filter_rows(rows, &attrs, pf.lang, &lang.ts_language(), &pf.source);
+        // A file lacking a name the segment filters on cannot hold a row.
+        if !needles.holds(&pf.source) {
+            continue;
+        }
+        let Some(tree) = &pf.tree else { continue };
+        let compiled = compiled_segment(seg, lang.as_ref(), pf.lang);
+        let rows = crate::runner::run_rows_on(&compiled, lang.as_ref(), &pf.source, tree, false)?;
+        let rows = attrs::filter_rows_on(rows, &attrs, pf.lang, tree.root_node(), &pf.source);
         if !rows.is_empty() {
             out.push((file.to_string(), rows));
         }
@@ -130,6 +136,27 @@ pub fn segment_rows(seg: &Query, store: &TreeStore) -> Result<Vec<(String, Vec<c
         }
     }
     Ok(out)
+}
+
+thread_local! {
+    /// Compiled segments by the segment's printed AST and the language name.
+    static SEGMENTS: std::cell::RefCell<std::collections::HashMap<(String, &'static str), compiler::CompiledQuery>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// `compiler::compile(seg, lang)`, once per segment and language for the run.
+/// Each compile numbers its internal captures afresh, so compiling per file
+/// gave every file a different pattern text and the runner's query cache
+/// rebuilt the tree-sitter query each time. The internal capture names are
+/// never printed, so reusing one compile changes no row.
+fn compiled_segment(seg: &Query, lang: &dyn compiler::lang::Lang, lang_name: &'static str) -> compiler::CompiledQuery {
+    let key = (format!("{:?}", seg), lang_name);
+    if let Some(c) = SEGMENTS.with(|m| m.borrow().get(&key).cloned()) {
+        return c;
+    }
+    let c = compiler::compile(seg, lang);
+    SEGMENTS.with(|m| m.borrow_mut().insert(key, c.clone()));
+    c
 }
 
 /// (def index, declaration start byte, header end byte) for every def in

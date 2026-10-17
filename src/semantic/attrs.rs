@@ -95,7 +95,21 @@ pub fn filter_rows(
         return vec![];
     }
     let Some(tree) = parser.parse(source, None) else { return vec![] };
-    let root = tree.root_node();
+    filter_rows_on(rows, attrs, lang_name, tree.root_node(), source)
+}
+
+/// `filter_rows` over a tree the caller already parsed from `source` with
+/// the language's grammar. `root` is that tree's root node.
+pub fn filter_rows_on(
+    rows: Vec<MatchRow>,
+    attrs: &[AttrMatch],
+    lang_name: &str,
+    root: Node,
+    source: &[u8],
+) -> Vec<MatchRow> {
+    if attrs.is_empty() {
+        return rows;
+    }
     let imports = file_imports(root, source, lang_name);
     rows.into_iter()
         .filter(|r| {

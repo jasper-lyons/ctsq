@@ -899,6 +899,42 @@ pub fn go_imports(root: Node, src: &[u8]) -> HashMap<String, String> {
     s.imports.into_iter().map(|(k, v)| (k, v.join("/"))).collect()
 }
 
+/// Key of a `SCOPES` entry: the source's address and length, and the root
+/// node's byte span and kind.
+type ScopeKey = (usize, usize, usize, usize, u16);
+
+thread_local! {
+    /// `FileScope`s that `binding_type` built, each with a copy of the source
+    /// it was built from. The data-flow engine asks for one variable's type
+    /// per operand it meets, so without this the same file's scope was
+    /// rebuilt from its whole tree once per question.
+    static SCOPES: std::cell::RefCell<HashMap<ScopeKey, (Vec<u8>, std::rc::Rc<FileScope>)>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// `FileScope::build(root, src)`, reused while the same bytes come back. A
+/// scope depends only on the subtree under `root`, which a parse of the same
+/// bytes reproduces, so a hit is confirmed by comparing the bytes, never by
+/// the address alone.
+fn scope_for(root: Node, src: &[u8]) -> std::rc::Rc<FileScope> {
+    let key = (src.as_ptr() as usize, src.len(), root.start_byte(), root.end_byte(), root.kind_id());
+    let hit = SCOPES.with(|c| {
+        c.borrow().get(&key).filter(|(bytes, _)| bytes.as_slice() == src).map(|(_, s)| s.clone())
+    });
+    if let Some(s) = hit {
+        return s;
+    }
+    let s = std::rc::Rc::new(FileScope::build(root, src));
+    SCOPES.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= 4096 {
+            c.clear();
+        }
+        c.insert(key, (src.to_vec(), s.clone()));
+    });
+    s
+}
+
 /// Base type name of `var` as seen at 1-based `line` inside the function
 /// declared nearest above that line: its last binding (`var x T`, `x := &T{}`,
 /// `x := f()` through `f`'s indexed return type or the `NewT` convention),
@@ -912,7 +948,7 @@ pub fn binding_type(
     line: usize,
     index: &DefIndex,
 ) -> Option<String> {
-    let scope = FileScope::build(root, src);
+    let scope = scope_for(root, src);
     let fun = scope.fns.iter().filter(|f| f.line <= line).max_by_key(|f| f.line)?;
     let constructed = HashSet::new();
     let ctx = Ctx { file, scope: &scope, fun, index, constructed: &constructed };
