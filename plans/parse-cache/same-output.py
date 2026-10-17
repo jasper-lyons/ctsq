@@ -5,7 +5,8 @@ Usage: python3 -I same-output.py REF_BIN NEW_BIN
 The call set is every call in plans/agent-search/measure/bench.py (with and
 without --tests) over this repo, Mavexa and emc-gigs, plus every worked
 example in plans/agent-search/docs/SKILL.md and every EXAMPLES line in
-`ctsq --help`, run in this repo. For each call stdout, stderr and the exit
+`ctsq --help`, run in this repo, and the `ctsq path` calls in PATH_CALLS.
+For each call stdout, stderr and the exit
 code must match. Prints one block per difference and a summary line, and
 exits 1 when anything differs.
 """
@@ -43,6 +44,24 @@ def help_calls(binary):
     return [shlex.split(l.strip())[1:] for l in sec.split("\n") if l.startswith("  ctsq ")]
 
 
+MAVEXA = "/Users/jasperlyons/workspace/projects/mavexa/mavexa"
+
+# `ctsq path` calls: call routes and data-flow routes, on Mavexa backend and
+# on the fixtures the path suites use (run in this repo).
+PATH_CALLS = [
+    (MAVEXA, ["path", "function#login --> function#writeError", "backend"]),
+    (MAVEXA, ["path", "function#register --> function#decodeBody", "backend"]),
+    (MAVEXA, ["path", "function#writeError <-- function#login", "backend"]),
+    (MAVEXA, ["path", "function#writeError param#msg ==>", "backend"]),
+    (MAVEXA, ["path", "field#loginRequest.Email ==>", "backend"]),
+    (REPO, ["path", "function#parseConfig --> function#validate", "fixtures/path"]),
+    (REPO, ["path", "field#Booking.CustomerPhone ==>", "fixtures/flow/booking"]),
+    (REPO, ["path", "function#handle variable#body ==> function#log.Printf", "fixtures/flow/flow-calls"]),
+    (REPO, ["path", "variable#q <== function#os.Getenv", "fixtures/flow/flow-up"]),
+    (REPO, ["path", "function#main --> function#Save", "fixtures/flow/widening"]),
+]
+
+
 def run(binary, args, cwd):
     env = dict(os.environ)
     env.pop("CTSQ_PARSE_STATS", None)
@@ -62,6 +81,7 @@ def main():
             jobs.append((r["path"], args + ["--tests"]))
     for args in example_calls() + help_calls(ref) + [["--help"]]:
         jobs.append((REPO, args))
+    jobs.extend(PATH_CALLS)
     diffs = 0
     for cwd, args in jobs:
         a, b = run(ref, args, cwd), run(new, args, cwd)
