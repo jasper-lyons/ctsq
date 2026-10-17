@@ -2,6 +2,7 @@
 
 usage: profile.py BIN CALLS_FILE OUT_DIR [name-filter]
 calls file: one per line, ROOT<TAB>ARGS (ARGS shell-split, run with cwd=ROOT); '#' lines skipped.
+A relative ROOT (such as `.`) is taken from the root of the repo holding this script.
 BIN should be a release build with debug symbols (see profile.sh).
 """
 import ctypes, os, sys, subprocess, time, signal, shlex, re, statistics, math
@@ -10,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bucket as B
 
 libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 STATS = re.compile(r'parsed (\d+) files, (\d+) cache hits, (\d+) text reads')
 NFILES = re.compile(r'\((\d+) files?\)')
 
@@ -61,6 +63,7 @@ def main():
         if not ln.strip() or ln.startswith("#"):
             continue
         root, args = ln.split("\t", 1)
+        root = os.path.normpath(os.path.join(REPO, root))
         if filt and filt not in args:
             continue
         argv = shlex.split(args)

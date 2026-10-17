@@ -1,4 +1,4 @@
-# ROOT<TAB>ARGS. M=Mavexa, E=emc-gigs, C=this repo (path of the worktree running the harness).
+# ROOT<TAB>ARGS. M=Mavexa, E=emc-gigs, C=this repo, written `.`: a relative ROOT is taken from the root of the repo holding profile.py, so it survives worktree removal.
 /Users/jasperlyons/workspace/projects/mavexa/mavexa	-q 'id#writeError' backend
 /Users/jasperlyons/workspace/projects/mavexa/mavexa	-q 'id#/^write/' backend
 /Users/jasperlyons/workspace/projects/mavexa/mavexa	-q '*function#register' --body backend
@@ -44,10 +44,10 @@
 /Users/jasperlyons/workspace/projects/eastbournemusic/emc-gigs	callers authenticate app
 /Users/jasperlyons/workspace/projects/eastbournemusic/emc-gigs	find route /gigs
 /Users/jasperlyons/workspace/projects/eastbournemusic/emc-gigs	tree app
-/Users/jasperlyons/workspace/projects/jasperlyons/ctsq/.claude/worktrees/agent-af8b64c91b61820cf	-q 'id#run' src
-/Users/jasperlyons/workspace/projects/jasperlyons/ctsq/.claude/worktrees/agent-af8b64c91b61820cf	tree src
-/Users/jasperlyons/workspace/projects/jasperlyons/ctsq/.claude/worktrees/agent-af8b64c91b61820cf	def run_rows src
-/Users/jasperlyons/workspace/projects/jasperlyons/ctsq/.claude/worktrees/agent-af8b64c91b61820cf	explain run_rows src
-/Users/jasperlyons/workspace/projects/jasperlyons/ctsq/.claude/worktrees/agent-af8b64c91b61820cf	callers run_rows src
-/Users/jasperlyons/workspace/projects/jasperlyons/ctsq/.claude/worktrees/agent-af8b64c91b61820cf	callgraph src --format edges
-/Users/jasperlyons/workspace/projects/jasperlyons/ctsq/.claude/worktrees/agent-af8b64c91b61820cf	importgraph src --format edges
+.	-q 'id#run' src
+.	tree src
+.	def run_rows src
+.	explain run_rows src
+.	callers run_rows src
+.	callgraph src --format edges
+.	importgraph src --format edges
