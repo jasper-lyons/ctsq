@@ -346,14 +346,16 @@ pub fn def_report(
     let mut printer = scope.map(|o| crate::scope::Printer::new(o, jobs));
     let mut shown = 0usize;
     let mut missing: Vec<String> = Vec::new();
+    // Held to the end, so every stage reads one parse per file.
+    let store = TreeStore::build(jobs);
     for expr in names {
         let mut all_names: Vec<String> = Vec::new();
-        let mut rows = def_rows(expr, jobs, &mut all_names);
+        let mut rows = def_rows(expr, jobs, &store, &mut all_names);
         // A name that is a glossary term is also searched as each name it maps to.
         let mut notes: Vec<String> = Vec::new();
         if let Some(g) = glossary {
             for entry in g.lookup(expr, true) {
-                for r in mapped_rows(&entry.names, jobs) {
+                for r in mapped_rows(&entry.names, jobs, &store) {
                     if !rows.iter().any(|(f, l, _)| *f == r.0 && *l == r.1) {
                         rows.push(r);
                     }
@@ -385,9 +387,12 @@ pub fn def_report(
         let rows: Vec<_> = rows.into_iter().filter(|(f, _, _)| crate::footer::take(f)).collect();
         shown += rows.len();
         for (file, line, conf) in rows {
-            let line_text = std::fs::read_to_string(&file)
-                .ok()
-                .and_then(|s| s.lines().nth(line.saturating_sub(1)).map(|l| l.trim().to_string()))
+            let line_text = crate::parsed::source(&file)
+                .and_then(|b| {
+                    std::str::from_utf8(&b)
+                        .ok()
+                        .and_then(|s| s.lines().nth(line.saturating_sub(1)).map(|l| l.trim().to_string()))
+                })
                 .unwrap_or_default();
             let mark = if conf == Confidence::Guess { "  ?" } else { "" };
             out.push_str(&format!("{}:{}: {}{}\n", file, line, line_text, mark));
@@ -422,15 +427,18 @@ pub fn def_report(
 /// call-graph definition index first, then the `tree` outline for everything
 /// the index cannot hold. `names_seen` collects every outline name met on the
 /// way, which is the pool the miss report suggests from.
+///
+/// `store` holds every job's parse and the caller keeps it alive, so the index,
+/// the outline, the nested search and the hider's test check read one parse.
 pub fn def_rows(
     expr: &str,
     jobs: &[(String, &'static str)],
+    store: &TreeStore,
     names_seen: &mut Vec<String>,
 ) -> Vec<(String, usize, Confidence)> {
     let mut index = DefIndex::default();
-    for (file, lang) in jobs {
-        let Ok(source) = std::fs::read(file) else { continue };
-        for def in resolver_for(lang).collect_defs(file, &source) {
+    for (file, p) in store.iter() {
+        for def in resolver_for(p.lang).collect_defs_tree(file, &p.source, p.tree.as_ref()) {
             index.push(def);
         }
     }
@@ -507,7 +515,7 @@ impl DefLookup {
     pub fn new(jobs: &[(String, &'static str)]) -> DefLookup {
         let sources = jobs
             .iter()
-            .map(|(f, _)| String::from_utf8_lossy(&std::fs::read(f).unwrap_or_default()).into_owned())
+            .map(|(f, _)| String::from_utf8_lossy(&crate::parsed::source(f).map(|b| b.to_vec()).unwrap_or_default()).into_owned())
             .collect();
         DefLookup {
             jobs: jobs.to_vec(),
@@ -566,12 +574,13 @@ impl DefLookup {
 pub fn mapped_rows(
     names: &[crate::config::glossary::Name],
     jobs: &[(String, &'static str)],
+    store: &TreeStore,
 ) -> Vec<(String, usize, Confidence)> {
     use crate::config::glossary::Name;
     let mut out: Vec<(String, usize, Confidence)> = Vec::new();
     for n in names {
         match n {
-            Name::Exact(name) => out.extend(def_rows(name, jobs, &mut Vec::new())),
+            Name::Exact(name) => out.extend(def_rows(name, jobs, store, &mut Vec::new())),
             Name::Re(re) => {
                 for (file, lang) in jobs {
                     for (_, name, line) in crate::tree::collect_def_locs(file, lang) {
@@ -597,7 +606,7 @@ fn nested_def_sites(name: &str, jobs: &[(String, &'static str)]) -> Vec<(String,
     // Compiled queries per language, built once.
     let mut compiled_by_lang: HashMap<&'static str, Vec<crate::compiler::CompiledQuery>> = HashMap::new();
     for (file, lang_name) in jobs {
-        let Ok(source) = std::fs::read(file) else { continue };
+        let Some(source) = crate::parsed::source(file) else { continue };
         // A definition of the name has the name's bytes in its file.
         if !holds(&source, name) {
             continue;
@@ -606,13 +615,10 @@ fn nested_def_sites(name: &str, jobs: &[(String, &'static str)]) -> Vec<(String,
         let compiled = compiled_by_lang
             .entry(lang_name)
             .or_insert_with(|| queries.iter().map(|ast| crate::compiler::compile(ast, lang.as_ref())).collect());
-        let mut parser = tree_sitter::Parser::new();
-        if parser.set_language(&lang.ts_language()).is_err() {
-            continue;
-        }
-        let Some(tree) = parser.parse(&source, None) else { continue };
+        let Some(p) = crate::parsed::get(file, lang_name) else { continue };
+        let Some(tree) = p.tree.as_ref() else { continue };
         for c in compiled.iter() {
-            let rows = crate::runner::run_rows_on(c, lang.as_ref(), &source, &tree, false).unwrap_or_default();
+            let rows = crate::runner::run_rows_on(c, lang.as_ref(), &p.source, tree, false).unwrap_or_default();
             found.extend(rows.into_iter().map(|r| (file.clone(), r.line)));
         }
     }
@@ -775,12 +781,16 @@ mod tests {
         crate::files::resolve_jobs(&path, None, false)
     }
 
+    fn rows_for(expr: &str, jobs: &[(String, &'static str)], names: &mut Vec<String>) -> Vec<(String, usize, Confidence)> {
+        def_rows(expr, jobs, &TreeStore::build(jobs), names)
+    }
+
     #[test]
     fn def_finds_a_type_the_call_graph_index_cannot_hold() {
         // Server is a struct, so only the outline step resolves it. This is
         // the case that printed "no definition found" and exited 1.
         let mut names = Vec::new();
-        let rows = def_rows("Server", &jobs_for("example.go"), &mut names);
+        let rows = rows_for("Server", &jobs_for("example.go"), &mut names);
         assert_eq!(rows.len(), 1, "{:?}", rows);
         assert!(rows[0].0.ends_with("example.go"), "{:?}", rows);
         assert_eq!(rows[0].1, 5, "{:?}", rows);
@@ -790,7 +800,7 @@ mod tests {
     fn def_agrees_with_explain_on_a_class() {
         let jobs = jobs_for("example.cpp");
         let mut names = Vec::new();
-        let rows = def_rows("Buffer", &jobs, &mut names);
+        let rows = rows_for("Buffer", &jobs, &mut names);
         assert!(!rows.is_empty(), "def must resolve what explain resolves");
         let r = crate::explain::report("Buffer", &jobs, &crate::explain::Options::default());
         assert!(
@@ -804,7 +814,7 @@ mod tests {
     #[test]
     fn def_still_prefers_the_call_graph_index_for_functions() {
         let mut names = Vec::new();
-        let rows = def_rows("NewServer", &jobs_for("example.go"), &mut names);
+        let rows = rows_for("NewServer", &jobs_for("example.go"), &mut names);
         assert_eq!(rows.len(), 1, "{:?}", rows);
         assert_eq!(rows[0].2, Confidence::Exact, "{:?}", rows);
     }
@@ -812,7 +822,7 @@ mod tests {
     #[test]
     fn a_miss_collects_the_names_it_could_have_meant() {
         let mut names = Vec::new();
-        let rows = def_rows("NewServe", &jobs_for("example.go"), &mut names);
+        let rows = rows_for("NewServe", &jobs_for("example.go"), &mut names);
         assert!(rows.is_empty(), "{:?}", rows);
         assert!(names.contains(&"NewServer".to_string()), "{:?}", names);
     }
