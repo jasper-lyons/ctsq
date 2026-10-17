@@ -138,18 +138,6 @@ impl Fragment {
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
-/// For `A ~ B` and `A + B` (one sibling step, nothing else), the queries for A
-/// and for B on their own. A match of the pair holds a match of each, so a file
-/// where either has none cannot match, and the pair pattern, which tree-sitter
-/// runs in time quadratic in the siblings under one parent, need not run there.
-pub fn sibling_gate(query: &Query, lang: &dyn Lang) -> Option<(CompiledQuery, CompiledQuery)> {
-    let [(Combinator::Sibling | Combinator::Adjacent, sel)] = query.tail.as_slice() else { return None };
-    let alone = |s: &Selector| compile(&Query { head: s.clone(), tail: vec![] }, lang);
-    let (a, b) = (alone(&query.head), alone(sel));
-    let simple = |c: &CompiledQuery| matches!(c, CompiledQuery::Simple(_)) && !c.is_empty();
-    (simple(&a) && simple(&b)).then_some((a, b))
-}
-
 pub fn compile(query: &Query, lang: &dyn Lang) -> CompiledQuery {
     if let Some((outer, scope_field, inner)) = try_compile_scoped(query, lang) {
         return CompiledQuery::Scoped { outer, scope_field, inner };
@@ -907,6 +895,18 @@ pub fn check_compiles(query: &Query, lang: &dyn Lang, lang_name: &str, src: &str
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+/// For `A ~ B` and `A + B` (one sibling step, nothing else), the queries for A
+/// and for B on their own. A match of the pair holds a match of each, so a file
+/// where either has none cannot match, and the pair pattern, which tree-sitter
+/// runs in time quadratic in the siblings under one parent, need not run there.
+pub fn sibling_gate(query: &Query, lang: &dyn Lang) -> Option<(CompiledQuery, CompiledQuery)> {
+    let [(Combinator::Sibling | Combinator::Adjacent, sel)] = query.tail.as_slice() else { return None };
+    let alone = |s: &Selector| compile(&Query { head: s.clone(), tail: vec![] }, lang);
+    let (a, b) = (alone(&query.head), alone(sel));
+    let simple = |c: &CompiledQuery| matches!(c, CompiledQuery::Simple(_)) && !c.is_empty();
+    (simple(&a) && simple(&b)).then_some((a, b))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

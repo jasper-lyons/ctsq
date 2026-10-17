@@ -980,26 +980,22 @@ fn main() {
         }
     }
 
-    let mut compiled_cache: HashMap<&'static str, (Box<dyn lang::Lang>, compiler::CompiledQuery)> =
+    let mut compiled_cache: HashMap<&'static str, (Box<dyn lang::Lang>, compiler::CompiledQuery, Option<(compiler::CompiledQuery, compiler::CompiledQuery)>)> =
         HashMap::new();
 
     // A file without the query's names cannot match, so it is never parsed.
     // --show-query prints per file, so it keeps every file.
     let needles = if cli.show_query { needle::Needles::none() } else { needle::Needles::from_query(&ast) };
 
-    // A sibling pair `A ~ B` can match only where A and B each match alone.
-    let mut gates: HashMap<&'static str, Option<(compiler::CompiledQuery, compiler::CompiledQuery)>> = HashMap::new();
-
     for (file, lang_name) in &jobs {
         if lacks_needles(&needles, file) {
             continue;
         }
-        let (lang_box, compiled) = compiled_cache.entry(lang_name).or_insert_with(|| {
+        let (lang_box, compiled, gate) = compiled_cache.entry(lang_name).or_insert_with(|| {
             let l = lang::for_name(lang_name).expect("lang_name always valid here");
             let c = compiler::compile(&ast, l.as_ref());
-            (l, c)
+            let g = compiler::sibling_gate(&ast, l.as_ref()); (l, c, g)
         });
-        let gate = gates.entry(lang_name).or_insert_with(|| compiler::sibling_gate(&ast, lang_box.as_ref()));
 
         if cli.show_query && !multiple {
             println!("=== Compiled S-expression ({}) ===", lang_name);
@@ -1035,7 +1031,7 @@ fn main() {
 
         let display = if file == "-" { "<stdin>" } else { file.as_str() };
 
-        let result = fetched.rows(compiled, lang_box.as_ref(), cli.body, gate.as_ref()).map(|rows| {
+        let result = (if gated_out(&fetched, gate.as_ref(), lang_box.as_ref()) { Ok(vec![]) } else { fetched.rows(compiled, lang_box.as_ref(), cli.body) }).map(|rows| {
             let rows = semantic::attrs::filter_rows(rows, &attrs, lang_name, &lang_box.ts_language(), source);
             hide_rows(&mut hider, file, source, fetched.tree(), rows, true, &mut hidden)
         });
@@ -1155,18 +1151,7 @@ impl Fetched {
     }
 
     /// `runner::run_rows`, over the cached tree when there is one.
-    fn rows(
-        &self,
-        compiled: &compiler::CompiledQuery,
-        l: &dyn lang::Lang,
-        body: bool,
-        gate: Option<&(compiler::CompiledQuery, compiler::CompiledQuery)>,
-    ) -> Result<Vec<runner::MatchRow>, String> {
-        if let (Some(t), Some((a, b))) = (self.tree(), gate) {
-            if !runner::has_match(a, l, self.source(), t) || !runner::has_match(b, l, self.source(), t) {
-                return Ok(vec![]);
-            }
-        }
+    fn rows(&self, compiled: &compiler::CompiledQuery, l: &dyn lang::Lang, body: bool) -> Result<Vec<runner::MatchRow>, String> {
         match self.tree() {
             Some(t) => runner::run_rows_on(compiled, l, self.source(), t, body),
             None => runner::run_rows(compiled, l, self.source(), body),
@@ -1492,7 +1477,7 @@ fn run_refs(
                 Err(e) => { eprintln!("Failed to read {}: {}", file, e); continue; }
             };
             let source = fetched.source();
-            match fetched.rows(compiled, lang_box.as_ref(), false, None) {
+            match fetched.rows(compiled, lang_box.as_ref(), false) {
                 Ok(rows) => {
                     for r in &hide_rows(&mut hider, file, source, fetched.tree(), rows, false, &mut name_hidden) {
                         if !footer::take(file) {
@@ -1706,3 +1691,12 @@ mod arg_tests {
         assert!(!identifier_like(""));
     }
 }
+
+/// Whether a sibling pair `A ~ B` cannot match in `fetched`, because A or B has no match alone.
+fn gated_out(fetched: &Fetched, gate: Option<&(compiler::CompiledQuery, compiler::CompiledQuery)>, l: &dyn lang::Lang) -> bool {
+    match (fetched.tree(), gate) {
+        (Some(t), Some((a, b))) => !runner::has_match(a, l, fetched.source(), t) || !runner::has_match(b, l, fetched.source(), t),
+        _ => false,
+    }
+}
+
