@@ -39,3 +39,13 @@ Whole-folder by nature. One parse per file, read into definitions and a call mod
 ## Fallback to the whole folder
 
 The scoped build is used for every language, since all three resolvers (Go, Rust, fallback) read the index only through the recorded reads. A hub name or `--max-depth 6` can grow P to the whole folder, which costs what the whole-folder build costs plus the passes.
+
+## path
+
+`path` builds only what its walk reads. The store is lazy: a file is parsed when a selector's needles hold in its text, or when a walk or a name lookup reaches it.
+
+- **Call routes (`-->`, `->`, `<--`, `<-`).** The walk follows edges from a start only into definitions whose distance to the next end set is known within `--max`, and that distance comes from callers of the end set. So the graph is the scoped build rooted at the end sets' definition names (every set but the first in call order) at depth `--max` upward, with every segment's and `:not()`'s definition names covered so their definitions are indexed. When a start has no route within `--max`, the printed cut count needs the walk without that bound, so the same scope is grown to every caller at any depth and the routes are evaluated again. Walking forward from the starts instead was tried and was worse: resolving every call of a walked function asks most names of the folder.
+- **Data flow (`==>`, `=>`, `<==`, `<=`).** The engine reads a `FlowGraph`, which answers one question at a time: the targets of the call at a byte range (its file resolved for the function holding the call), the callers of a definition named N (every file holding N, resolved for the calls that can reach N), the definitions named N, the definition at a line, whether N is an interface. Each resolution grows the index until it asks no uncovered name, as above. Definitions are keys handed out in the order first met, and every answer that lists them orders them as the whole index does. The module (structs, globals, readers, result types) and the outside implementations of an interface are read per name in the same way.
+- **Which files answer a read.** A Go file is loaded for a read of N only when a whole-word N sits where a definition, interface, construction or result type of N would: first on its line, on a line opening with `type` or `)`, on a `func` line outside the parameter list, before `{` (not after `]`) or `[`, or after `new(`. Reads through `named` (definitions) take only the function name of a `func` line or a name first on its line, and `ask_interface` only type declarations. A constructed-type read that is already yes asks nothing, since more files only add constructed types.
+
+`CTSQ_WHOLE_GRAPH=1` builds the whole store and graph, as before.

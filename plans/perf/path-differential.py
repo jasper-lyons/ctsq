@@ -42,6 +42,27 @@ MAVEXA_ROUTES = [
     ["function#writeError param#msg <=="],
     ["function#login variable#req <=="],
     ["field#signupRequest.Email ==>", "--max", "3"],
+    # path-setup: the call graph is built over the callers of the end sets
+    # within --max, again at any depth when a start has no route.
+    ["function#login --> function#writeError", "--max", "2"],
+    ["function#login --> function#writeError", "--max", "1"],
+    ["function#writeError --> function#login"],
+    ["function#main --> function#writeError"],
+    ["function#register --> function#decodeBody --> function#writeError"],
+    ["function#writeError <-- function#register", "--max", "2"],
+    ["function#login -> function#writeError", "--max", "1"],
+    ["function#register --> function#writeError:not(function#writeErrorCode)", "--max", "3"],
+    ["function#/^handle/ --> function#writeJSON", "--max", "2"],
+    # path-setup: the flow engine's graph, module and outside implementations
+    # load per call, per name and per interface.
+    ["function#register param#r ==>"],
+    ["function#register param#r ==>", "--expand"],
+    ["function#login param#w <=="],
+    ["function#login param#r <=="],
+    ["function#writeJSON param#v <=="],
+    ["function#writeJSON param#v <==", "--max", "1"],
+    ["field#loginRequest.Password ==>"],
+    ["function#decodeBody param#r ==>", "--max", "2"],
 ]
 
 
