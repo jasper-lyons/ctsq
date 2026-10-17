@@ -1492,6 +1492,77 @@ mod tests {
         }
     }
 
+    /// Write `files` under a fresh temp folder named for `tag`, as Go jobs.
+    fn go_jobs(tag: &str, files: &[(&str, &str)]) -> (std::path::PathBuf, Vec<(String, &'static str)>) {
+        let d = std::env::temp_dir().join(format!("ctsq-scoped-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let mut jobs = Vec::new();
+        for (f, src) in files {
+            let p = d.join(f);
+            std::fs::write(&p, src).unwrap();
+            jobs.push((p.to_string_lossy().to_string(), "go"));
+        }
+        (d, jobs)
+    }
+
+    /// Assert the scoped graph and the lazy flow graph answer as the whole
+    /// graph does: the edges a walk from each of `names` reads, the targets
+    /// of every call site, and the callers of every definition.
+    fn agrees_with_whole(jobs: &[(String, &'static str)], names: &[&str]) {
+        // Built from a store, so the per-site table is kept.
+        let whole = graph::build_from_store(&super::super::TreeStore::build(jobs));
+        assert!(!whole.sites.is_empty());
+        for name in names {
+            for depth in [1, 3] {
+                let seeds = Seeds { names: vec![name.to_string()], up: depth, down: depth };
+                let g = Scope::new(jobs).run(&seeds);
+                assert_eq!(reachable(&g, &[name], depth, depth), reachable(&whole, &[name], depth, depth), "{} {}", name, depth);
+            }
+        }
+        let id = |d: &super::super::Def| format!("{}:{}:{}", d.id.file, d.id.line, d.name);
+        let lazy = FlowGraph::lazy(jobs, Rc::new(Words::new(jobs)));
+        for s in &whole.sites {
+            let file = &whole.index.defs[s.caller].id.file;
+            let want: Vec<String> = whole
+                .sites
+                .iter()
+                .filter(|o| &whole.index.defs[o.caller].id.file == file && o.start_byte == s.start_byte && o.end_byte == s.end_byte)
+                .filter_map(|o| o.target.map(|(t, _)| id(&whole.index.defs[t])))
+                .collect();
+            let got: Vec<String> =
+                lazy.site_targets(file, s.start_byte, s.end_byte).unwrap_or_default().into_iter().map(|k| id(&lazy.def(k))).collect();
+            assert_eq!(got, want, "targets of the call at {}:{}", file, s.start_byte);
+        }
+        for (t, d) in whole.index.defs.iter().enumerate() {
+            let mut want: Vec<(String, usize)> = whole
+                .sites
+                .iter()
+                .filter(|s| s.target.map(|(x, _)| x) == Some(t))
+                .map(|s| (whole.index.defs[s.caller].id.file.clone(), s.start_byte))
+                .collect();
+            want.sort();
+            want.dedup();
+            let Some(&k) = lazy.by_name(&d.name).iter().find(|&&k| id(&lazy.def(k)) == id(d)) else {
+                panic!("lazy graph misses {}", id(d))
+            };
+            let got: Vec<(String, usize)> = lazy.callers_of(k).iter().map(|s| (s.file.clone(), s.start_byte)).collect();
+            assert_eq!(got, want, "callers of {}", id(d));
+        }
+    }
+
+    const RUNNER: &str = "package a\n\ntype Runner interface {\n\tRun(v string) string\n}\n\ntype Lazy struct{}\n\n\
+        func (l *Lazy) Run(v string) string { return Sink(v) }\n\nfunc Sink(v string) string { return v }\n\n\
+        func Disp(r Runner, s string) string { return r.Run(s) }\n";
+
+    #[test]
+    fn a_type_constructed_only_through_a_new_function_keeps_its_dispatch() {
+        // mk.go never holds the word Lazy, only NewLazy.
+        let (d, jobs) = go_jobs("newt", &[("x.go", RUNNER), ("mk.go", "package a\n\nfunc NewLazy() any { return nil }\n")]);
+        agrees_with_whole(&jobs, &["Sink", "Run", "Disp"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn go_interface_dispatch_and_function_values_keep_their_edges() {
         let d = std::env::temp_dir().join(format!("ctsq-scoped-go-{}", std::process::id()));

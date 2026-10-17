@@ -822,6 +822,9 @@ fn constructed(ty: &str, ctx: &Ctx) -> bool {
         return true;
     }
     ctx.index.ask(ty);
+    // `constructed_types` also counts a function `NewT` as constructing T,
+    // and a file holding only `NewT` never holds the word T.
+    ctx.index.ask(&format!("New{}", ty));
     false
 }
 
