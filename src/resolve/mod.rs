@@ -225,6 +225,11 @@ pub trait Resolver {
     fn collect_impls(&self, _file: &str, _source: &[u8]) -> Vec<(String, String)> {
         vec![]
     }
+    /// Phase 1b with an already parsed tree. Resolvers that do not use it
+    /// parse again.
+    fn collect_impls_tree(&self, file: &str, source: &[u8], _tree: Option<&tree_sitter::Tree>) -> Vec<(String, String)> {
+        self.collect_impls(file, source)
+    }
     /// Phase 2: call sites in one file, resolved against the full project index.
     fn resolve_calls(&self, file: &str, source: &[u8], index: &DefIndex) -> Vec<ResolvedCall>;
 }

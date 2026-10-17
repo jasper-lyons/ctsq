@@ -58,13 +58,16 @@ pub fn report_many(
     hider: &mut files::Hider,
 ) -> crate::resolve::NamesOut {
     let mut hidden = Hidden::default();
+    // Held to the end: the graph, the definitions, the references and the
+    // outline all read these parses, so each file is parsed once per run.
+    let store = crate::resolve::TreeStore::build(jobs);
     let mut out = String::new();
     let mut miss_text = String::new();
     let mut missing: Vec<String> = Vec::new();
     let mut any = false;
     for symbol in names {
         let before = hidden.tests + hidden.excluded;
-        let (text, found) = body(symbol, jobs, opts, hider, &mut hidden);
+        let (text, found) = body(symbol, jobs, &store, opts, hider, &mut hidden);
         if found {
             any = true;
         } else if hidden.tests + hidden.excluded == before {
@@ -118,7 +121,8 @@ pub fn report_hiding(
     hider: &mut files::Hider,
 ) -> (String, bool) {
     let mut hidden = Hidden::default();
-    let (mut out, found) = body(symbol, jobs, opts, hider, &mut hidden);
+    let store = crate::resolve::TreeStore::build(jobs);
+    let (mut out, found) = body(symbol, jobs, &store, opts, hider, &mut hidden);
     let shown = out.matches("\nDEFINITION ").count();
     out.push_str(&footer(shown, "definition", &hidden));
     (out, found)
@@ -127,6 +131,7 @@ pub fn report_hiding(
 fn body(
     symbol: &str,
     jobs: &[(String, &'static str)],
+    store: &crate::resolve::TreeStore,
     opts: &Options,
     hider: &mut files::Hider,
     hidden: &mut Hidden,
@@ -137,7 +142,7 @@ fn body(
     // caller and a reference, or a definition and a reference, counts once.
     let mut hidden_seen: HashSet<(String, usize)> = HashSet::new();
 
-    let g = graph::build(jobs);
+    let g = graph::build_from_store(store);
     let sites = keep_once(hider, definition_sites(symbol, &g, jobs), |s| (s.file.clone(), s.line), hidden, &mut hidden_seen);
 
     if sites.is_empty() {
@@ -354,15 +359,13 @@ pub fn bare_name(symbol: &str) -> &str {
 /// The node wanted is the outermost one that starts on that line, which is the
 /// whole `fn`, `class` or declaration rather than its name. Descend from the
 /// root until a child starts on the line, preferring the widest such child.
-fn definition_text(file: &str, lang_name: &str, line: usize) -> Option<String> {
-    let source = std::fs::read(file).ok()?;
-    let lang_box = lang::for_name(lang_name)?;
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&lang_box.ts_language()).ok()?;
-    let parsed = parser.parse(&source, None)?;
+fn definition_text(file: &str, lang_name: &'static str, line: usize) -> Option<String> {
+    let p = crate::parsed::get(file, lang_name)?;
+    let source = &p.source;
+    let root = p.tree.as_ref()?.root_node();
 
     let row = line.checked_sub(1)?;
-    let mut node = parsed.root_node();
+    let mut node = root;
     loop {
         let mut widest: Option<tree_sitter::Node> = None;
         let mut containing: Option<tree_sitter::Node> = None;
@@ -379,7 +382,7 @@ fn definition_text(file: &str, lang_name: &str, line: usize) -> Option<String> {
             }
         }
         if let Some(w) = widest {
-            return w.utf8_text(&source).ok().map(|s| s.to_string());
+            return w.utf8_text(source).ok().map(|s| s.to_string());
         }
         node = containing?;
     }
@@ -537,10 +540,9 @@ fn references(symbol: &str, jobs: &[(String, &'static str)]) -> Vec<(String, usi
             let c = compiler::compile(&ast, l.as_ref());
             (l, c)
         });
-        let Ok(source) = std::fs::read(file) else { continue };
-        let Ok(matches) = runner::run(compiled, lang_box.as_ref(), &source, false) else { continue };
+        let Ok(matches) = runner::run_rows_cached(compiled, lang_box.as_ref(), file, lang_name, false) else { continue };
         for m in matches {
-            if let Some(line) = crate::resolve::fallback::parse_line("r", &m) {
+            if let Some(line) = crate::resolve::fallback::parse_line("r", &m.node_text) {
                 out.push((file.clone(), line, lines.text(file, line)));
             }
         }
@@ -581,7 +583,8 @@ struct LineCache {
 impl LineCache {
     fn text(&mut self, file: &str, line: usize) -> String {
         let entry = self.files.entry(file.to_string()).or_insert_with(|| {
-            std::fs::read_to_string(file)
+            crate::parsed::source(file)
+                .and_then(|b| String::from_utf8(b.to_vec()).ok())
                 .map(|s| s.lines().map(|l| l.to_string()).collect())
                 .unwrap_or_default()
         });

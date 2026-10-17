@@ -24,20 +24,15 @@ pub struct CallGraph {
     pub sites: Vec<CallSite>,
 }
 
-/// Build from files on disk. Each resolver parses its own files.
+/// Build from files on disk, each read and parsed once through the cache. The
+/// trees live only as long as this call; a caller that wants later stages to
+/// share them builds a `TreeStore` and keeps it (see `build_from_store`).
 pub fn build(jobs: &[(String, &'static str)]) -> CallGraph {
-    let sources: Vec<Option<Vec<u8>>> = jobs.iter().map(|(f, _)| std::fs::read(f).ok()).collect();
-    let files: Vec<(&str, &'static str, &[u8], Option<&tree_sitter::Tree>)> = jobs
-        .iter()
-        .zip(&sources)
-        .filter_map(|((f, l), s)| s.as_ref().map(|s| (f.as_str(), *l, s.as_slice(), None)))
-        .collect();
-    assemble(&files)
+    build_from_store(&TreeStore::build(jobs))
 }
 
-#[allow(dead_code)] // wired by the path command
-/// Build from a `TreeStore`, so resolvers that take a tree (Go) do not parse
-/// again. Same graph as `build` on the same files.
+/// Build from a `TreeStore`, so no resolver parses again. Same graph as `build`
+/// on the same files.
 pub fn build_from_store(store: &TreeStore) -> CallGraph {
     let files: Vec<(&str, &'static str, &[u8], Option<&tree_sitter::Tree>)> = store
         .iter()
@@ -54,7 +49,7 @@ fn assemble(files: &[(&str, &'static str, &[u8], Option<&tree_sitter::Tree>)]) -
         for def in resolver.collect_defs_tree(file, source, tree) {
             index.push(def);
         }
-        index.impls.extend(resolver.collect_impls(file, source));
+        index.impls.extend(resolver.collect_impls_tree(file, source, tree));
     }
 
     // Pass 2: resolve call sites against the full index.

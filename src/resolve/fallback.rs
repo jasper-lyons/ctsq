@@ -33,17 +33,41 @@ impl Resolver for NameResolver {
     }
 
     fn resolve_calls(&self, file: &str, source: &[u8], index: &DefIndex) -> Vec<ResolvedCall> {
+        self.resolve_calls_tree(file, source, None, index).0
+    }
+
+    fn resolve_calls_tree(
+        &self,
+        file: &str,
+        source: &[u8],
+        given: Option<&tree_sitter::Tree>,
+        index: &DefIndex,
+    ) -> (Vec<ResolvedCall>, Vec<super::CallSite>) {
+        (self.calls_in(file, source, given, index), vec![])
+    }
+}
+
+impl NameResolver {
+    fn calls_in(&self, file: &str, source: &[u8], given: Option<&tree_sitter::Tree>, index: &DefIndex) -> Vec<ResolvedCall> {
         let Some(lang_box) = lang::for_name(self.lang_name) else { return vec![] };
         let mine: Vec<(usize, &Def)> = index.defs.iter().enumerate().filter(|(_, d)| d.id.file == file).collect();
         if mine.is_empty() {
             return vec![];
         }
         // One parse serves every function in the file.
-        let mut parser = tree_sitter::Parser::new();
-        if parser.set_language(&lang_box.ts_language()).is_err() {
-            return vec![];
-        }
-        let Some(tree) = parser.parse(source, None) else { return vec![] };
+        let fresh;
+        let tree = match given {
+            Some(t) => t,
+            None => {
+                let mut parser = tree_sitter::Parser::new();
+                if parser.set_language(&lang_box.ts_language()).is_err() {
+                    return vec![];
+                }
+                let Some(t) = parser.parse(source, None) else { return vec![] };
+                fresh = t;
+                &fresh
+            }
+        };
         // One query run serves every function too, when the query with any
         // name is the per-name query with a match-anything name predicate:
         // its rows filtered by name are that name's rows.
@@ -58,12 +82,12 @@ impl Resolver for NameResolver {
             let matches: Vec<String> = match any.as_ref().filter(|a| a.covers(&compiled, &def.name)) {
                 Some(a) => {
                     let rows = named.get_or_insert_with(|| {
-                        crate::runner::run_rows_named(&a.query, lang_box.as_ref(), source, &tree).unwrap_or_default()
+                        crate::runner::run_rows_named(&a.query, lang_box.as_ref(), source, tree).unwrap_or_default()
                     });
                     rows.iter().filter(|(_, n)| *n == def.name).map(|(r, _)| r.node_text.clone()).collect()
                 }
                 None => {
-                    let Ok(rows) = crate::runner::run_rows_on(&compiled, lang_box.as_ref(), source, &tree, false)
+                    let Ok(rows) = crate::runner::run_rows_on(&compiled, lang_box.as_ref(), source, tree, false)
                     else { continue };
                     rows.into_iter().map(|r| r.node_text).collect()
                 }
