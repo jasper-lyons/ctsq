@@ -211,6 +211,26 @@ pub fn list_report(queries: &[NamedQuery], scan: &mut Scan) -> Report {
     Report { out, code: 0 }
 }
 
+/// A text a file must hold, see `KeyFilter::file_needle`.
+enum KeyNeedle {
+    /// Lowercase ASCII letters and digits, found whatever the case.
+    Fold(String),
+}
+
+impl KeyNeedle {
+    fn holds(&self, source: &[u8]) -> bool {
+        let KeyNeedle::Fold(n) = self;
+        let n = n.as_bytes();
+        let first = n[0];
+        let found = source.len() >= n.len()
+            && source
+                .windows(n.len())
+                .any(|w| w[0].to_ascii_lowercase() == first && w.eq_ignore_ascii_case(n));
+        // The Kelvin sign and the dotted capital I lowercase to ASCII letters.
+        found || crate::needle::holds(source, "\u{212A}") || crate::needle::holds(source, "\u{130}")
+    }
+}
+
 /// How a key filter matches: a case-insensitive substring, or a regex when
 /// written `/.../`.
 enum KeyFilter {
@@ -227,6 +247,27 @@ impl KeyFilter {
                 .map(KeyFilter::Re)
                 .map_err(|e| format!("the key regex {} does not compile: {}", k, e.to_string().lines().last().unwrap_or("").trim())),
             Some(k) => Ok(KeyFilter::Sub(k.to_lowercase())),
+        }
+    }
+
+    /// What a file must hold for any row of it to pass this filter, as groups
+    /// of which one text must occur: None when nothing is provable. A key row
+    /// is the source text of a node (quotes trimmed, whitespace runs joined), so
+    /// a run of letters and digits of the key occurs in the file unbroken. A
+    /// substring key is case-insensitive, so its longest such run is searched
+    /// ignoring ASCII case. A regex key counts only when it is a literal or an
+    /// alternation of literals without spaces. An error key is not used: it
+    /// also matches through the format string's placeholders, so the user's
+    /// text need not occur in the file.
+    fn file_needle(&self, errors: bool) -> Option<KeyNeedle> {
+        match self {
+            KeyFilter::Any => None,
+            KeyFilter::Sub(_) if errors => None,
+            KeyFilter::Sub(s) => {
+                let run = s.split(|c: char| !c.is_ascii_alphanumeric()).max_by_key(|r| r.len())?;
+                (!run.is_empty()).then(|| KeyNeedle::Fold(run.to_string()))
+            }
+            KeyFilter::Re(_) => None,
         }
     }
 
@@ -418,11 +459,23 @@ fn run_query(
     let mut specs: Option<crate::resolve::imports::JsSpecResolver> = None;
     let mut hits = Vec::new();
     let mut seen = HashSet::new();
+    // A file lacking the key's text has no row that passes the key filter, and
+    // nothing else keeps a row: not the glossary, not a rewritten key.
+    let key_needle = if ask.extra.is_empty() && q.key_rewrite.is_none() {
+        ask.filter.file_needle(q.name == "error")
+    } else {
+        None
+    };
     for (file, lang_name) in &jobs {
         if !compiled.iter().any(|(l, ..)| l == lang_name) {
             continue;
         }
         let Ok(source) = std::fs::read(file) else { continue };
+        if let Some(k) = &key_needle {
+            if !k.holds(&source) {
+                continue;
+            }
+        }
         let mine: Vec<_> = compiled
             .iter()
             .filter(|(l, _, _, must)| l == lang_name && must.holds(&source))
@@ -1312,5 +1365,18 @@ mod tests {
             let r = run(name, None, &hide());
             assert!(!r.out.contains(';') && !r.out.contains('\u{2014}'), "{}", r.out);
         }
+    }
+
+    #[test]
+    fn a_substring_key_needs_its_longest_run_in_the_file_whatever_the_case() {
+        let f = KeyFilter::new(Some("Sign-in now")).unwrap();
+        let n = f.file_needle(false).unwrap();
+        assert!(n.holds(b"<p>please SIGN-IN</p>") && n.holds(b"a sIgN b"));
+        assert!(!n.holds(b"nothing here"));
+        assert!(n.holds("\u{212A}".as_bytes()), "the Kelvin sign lowercases to k");
+        assert!(f.file_needle(true).is_none(), "an error key also matches through placeholders");
+        assert!(KeyFilter::new(Some("/Wel/")).unwrap().file_needle(false).is_none());
+        assert!(KeyFilter::new(None).unwrap().file_needle(false).is_none());
+        assert!(KeyFilter::new(Some("- ")).unwrap().file_needle(false).is_none());
     }
 }

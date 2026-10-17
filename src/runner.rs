@@ -106,6 +106,16 @@ pub fn run_rows_cached(
     run_rows_on(compiled, lang, &p.source, tree, body)
 }
 
+/// Whether a simple query has any match in `tree`. Any other query reports true,
+/// so the answer only ever rules a file out.
+pub fn has_match(compiled: &CompiledQuery, lang: &dyn Lang, source: &[u8], tree: &tree_sitter::Tree) -> bool {
+    let CompiledQuery::Simple(text) = compiled else { return true };
+    let Ok(query) = cached_query(&lang.ts_language(), text) else { return true };
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), source);
+    matches.next().is_some()
+}
+
 /// `run_rows` over a tree the caller already parsed from `source` with `lang`'s
 /// grammar, so several queries can share one parse.
 pub fn run_rows_on(

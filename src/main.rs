@@ -987,6 +987,9 @@ fn main() {
     // --show-query prints per file, so it keeps every file.
     let needles = if cli.show_query { needle::Needles::none() } else { needle::Needles::from_query(&ast) };
 
+    // A sibling pair `A ~ B` can match only where A and B each match alone.
+    let mut gates: HashMap<&'static str, Option<(compiler::CompiledQuery, compiler::CompiledQuery)>> = HashMap::new();
+
     for (file, lang_name) in &jobs {
         if lacks_needles(&needles, file) {
             continue;
@@ -996,6 +999,7 @@ fn main() {
             let c = compiler::compile(&ast, l.as_ref());
             (l, c)
         });
+        let gate = gates.entry(lang_name).or_insert_with(|| compiler::sibling_gate(&ast, lang_box.as_ref()));
 
         if cli.show_query && !multiple {
             println!("=== Compiled S-expression ({}) ===", lang_name);
@@ -1031,7 +1035,7 @@ fn main() {
 
         let display = if file == "-" { "<stdin>" } else { file.as_str() };
 
-        let result = fetched.rows(compiled, lang_box.as_ref(), cli.body).map(|rows| {
+        let result = fetched.rows(compiled, lang_box.as_ref(), cli.body, gate.as_ref()).map(|rows| {
             let rows = semantic::attrs::filter_rows(rows, &attrs, lang_name, &lang_box.ts_language(), source);
             hide_rows(&mut hider, file, source, fetched.tree(), rows, true, &mut hidden)
         });
@@ -1151,7 +1155,18 @@ impl Fetched {
     }
 
     /// `runner::run_rows`, over the cached tree when there is one.
-    fn rows(&self, compiled: &compiler::CompiledQuery, l: &dyn lang::Lang, body: bool) -> Result<Vec<runner::MatchRow>, String> {
+    fn rows(
+        &self,
+        compiled: &compiler::CompiledQuery,
+        l: &dyn lang::Lang,
+        body: bool,
+        gate: Option<&(compiler::CompiledQuery, compiler::CompiledQuery)>,
+    ) -> Result<Vec<runner::MatchRow>, String> {
+        if let (Some(t), Some((a, b))) = (self.tree(), gate) {
+            if !runner::has_match(a, l, self.source(), t) || !runner::has_match(b, l, self.source(), t) {
+                return Ok(vec![]);
+            }
+        }
         match self.tree() {
             Some(t) => runner::run_rows_on(compiled, l, self.source(), t, body),
             None => runner::run_rows(compiled, l, self.source(), body),
@@ -1477,7 +1492,7 @@ fn run_refs(
                 Err(e) => { eprintln!("Failed to read {}: {}", file, e); continue; }
             };
             let source = fetched.source();
-            match fetched.rows(compiled, lang_box.as_ref(), false) {
+            match fetched.rows(compiled, lang_box.as_ref(), false, None) {
                 Ok(rows) => {
                     for r in &hide_rows(&mut hider, file, source, fetched.tree(), rows, false, &mut name_hidden) {
                         if !footer::take(file) {

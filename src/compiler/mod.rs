@@ -138,6 +138,18 @@ impl Fragment {
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
+/// For `A ~ B` and `A + B` (one sibling step, nothing else), the queries for A
+/// and for B on their own. A match of the pair holds a match of each, so a file
+/// where either has none cannot match, and the pair pattern, which tree-sitter
+/// runs in time quadratic in the siblings under one parent, need not run there.
+pub fn sibling_gate(query: &Query, lang: &dyn Lang) -> Option<(CompiledQuery, CompiledQuery)> {
+    let [(Combinator::Sibling | Combinator::Adjacent, sel)] = query.tail.as_slice() else { return None };
+    let alone = |s: &Selector| compile(&Query { head: s.clone(), tail: vec![] }, lang);
+    let (a, b) = (alone(&query.head), alone(sel));
+    let simple = |c: &CompiledQuery| matches!(c, CompiledQuery::Simple(_)) && !c.is_empty();
+    (simple(&a) && simple(&b)).then_some((a, b))
+}
+
 pub fn compile(query: &Query, lang: &dyn Lang) -> CompiledQuery {
     if let Some((outer, scope_field, inner)) = try_compile_scoped(query, lang) {
         return CompiledQuery::Scoped { outer, scope_field, inner };
@@ -1351,5 +1363,18 @@ mod tests {
         let with = compile_str("&function#Printf[from=fmt]", "go");
         let without = compile_str("&function#Printf", "go");
         assert_eq!(shape(&with), shape(&without));
+    }
+
+    #[test]
+    fn a_sibling_pair_gates_on_each_side_alone() {
+        let lang = lang::for_name("go").unwrap();
+        let q = crate::query::parse("(*function#a @x) ~ (*function#b @y)").unwrap();
+        let (a, b) = sibling_gate(&q, lang.as_ref()).unwrap();
+        assert!(matches!(&a, CompiledQuery::Simple(s) if s.contains("\"a\"") && !s.contains("\"b\"")));
+        assert!(matches!(&b, CompiledQuery::Simple(s) if s.contains("\"b\"")));
+        let plain = crate::query::parse("*function#a").unwrap();
+        assert!(sibling_gate(&plain, lang.as_ref()).is_none());
+        let long = crate::query::parse("*function#a ~ *function#b ~ *function#c").unwrap();
+        assert!(sibling_gate(&long, lang.as_ref()).is_none());
     }
 }
