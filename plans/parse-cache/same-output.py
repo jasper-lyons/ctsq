@@ -1,6 +1,6 @@
 """Run a fixed call set with a reference binary and the new one, diff the results.
 
-Usage: python3 -I same-output.py REF_BIN NEW_BIN
+Usage: python3 -I same-output.py REF_BIN NEW_BIN [JOBS]
 
 The call set is every call in plans/agent-search/measure/bench.py (with and
 without --tests) over this repo, Mavexa and emc-gigs, plus every worked
@@ -14,6 +14,7 @@ exits 1 when anything differs.
 import os
 import re
 import shlex
+import concurrent.futures
 import subprocess
 import sys
 
@@ -21,6 +22,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True  # no __pycache__ beside bench.py
 sys.path.insert(0, os.path.join(HERE, "..", "agent-search", "measure"))
 import bench  # noqa: E402
+
+sys.path.insert(0, os.path.join(HERE, "..", "perf"))
+import refcache  # noqa: E402
 
 REPO = bench.CTSQ
 
@@ -69,6 +73,12 @@ def run(binary, args, cwd):
     return p.returncode, p.stdout, p.stderr
 
 
+def run_ref(binary, args, cwd):
+    env = dict(os.environ)
+    env.pop("CTSQ_PARSE_STATS", None)
+    return refcache.run_ref(binary, cwd, args, timeout=300, env=env)
+
+
 def main():
     ref, new = os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2])
     jobs = []
@@ -83,8 +93,15 @@ def main():
         jobs.append((REPO, args))
     jobs.extend(PATH_CALLS)
     diffs = 0
-    for cwd, args in jobs:
-        a, b = run(ref, args, cwd), run(new, args, cwd)
+    nproc = int(sys.argv[3]) if len(sys.argv) > 3 else 1
+
+    def check(job):
+        cwd, args = job
+        return cwd, args, run_ref(ref, args, cwd), run(new, args, cwd)
+
+    with concurrent.futures.ThreadPoolExecutor(nproc) as pool:
+        results = list(pool.map(check, jobs))
+    for cwd, args, a, b in results:
         if a != b:
             diffs += 1
             print(f"DIFF in {cwd}: ctsq {shlex.join(args)}")

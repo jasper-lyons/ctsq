@@ -14,6 +14,9 @@ import re
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import refcache  # noqa: E402
+
 REF, NEW, REPO = sys.argv[1], sys.argv[2], sys.argv[3]
 JOBS = int(sys.argv[4]) if len(sys.argv) > 4 else 8
 
@@ -73,7 +76,7 @@ def run(binary, root, args):
 
 def check(item):
     root, args = item
-    a = run(REF, root, args)
+    a = refcache.run_ref(REF, root, args, timeout=900)
     b = run(NEW, root, args)
     return root, args, a == b, a, b
 

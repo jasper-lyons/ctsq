@@ -8,7 +8,11 @@ total. Usage: differential.py REF NEW [JOBS]
 """
 import concurrent.futures
 import subprocess
+import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import refcache  # noqa: E402
 
 REF, NEW = sys.argv[1], sys.argv[2]
 JOBS = int(sys.argv[3]) if len(sys.argv) > 3 else 8
@@ -63,7 +67,7 @@ def run(binary, root, args):
 
 def check(call):
     root, args = call
-    a = run(REF, root, args)
+    a = refcache.run_ref(REF, root, args, timeout=600)
     b = run(NEW, root, args)
     return call, a == b, a, b
 
