@@ -4,7 +4,7 @@
 //! bare name; only a project-wide unique name resolves, everything else
 //! stays external.
 
-use super::{Confidence, Def, DefId, DefIndex, DefKind, Resolver, ResolvedCall};
+use super::{Confidence, Def, DefId, DefIndex, DefKind, FileModel, Resolver, ResolvedCall};
 use crate::compiler::{self, lang};
 
 pub struct NameResolver {
@@ -32,38 +32,55 @@ impl Resolver for NameResolver {
             .collect()
     }
 
-    fn resolve_calls(&self, file: &str, source: &[u8], index: &DefIndex) -> Vec<ResolvedCall> {
-        self.resolve_calls_tree(file, source, None, index).0
+    fn model(&self, file: &str, source: &[u8], given: Option<&tree_sitter::Tree>, own: &[Def]) -> FileModel {
+        FileModel::Names(self.calls_in(file, source, given, own))
     }
 
-    fn resolve_calls_tree(
+    fn resolve_model(
         &self,
         file: &str,
-        source: &[u8],
-        given: Option<&tree_sitter::Tree>,
+        model: &FileModel,
         index: &DefIndex,
+        want: Option<&super::Want>,
     ) -> (Vec<ResolvedCall>, Vec<super::CallSite>) {
-        (self.calls_in(file, source, given, index), vec![])
+        let FileModel::Names(per_def) = model else { return (vec![], vec![]) };
+        let mine = index.in_file(file);
+        let mut out = Vec::new();
+        for (&caller, calls) in mine.iter().zip(per_def) {
+            let whole = want.is_none_or(|w| w.whole(index.defs[caller].id.line));
+            for (callee, line) in calls {
+                // The target is a definition named after the callee, so only
+                // a wanted name can reach a wanted definition.
+                if !whole && !want.is_some_and(|w| w.names.contains(callee)) {
+                    continue;
+                }
+                let target = match index.named(callee) {
+                    [single] => Some((*single, Confidence::Exact)),
+                    _ => None,
+                };
+                out.push(ResolvedCall { caller, callee_display: callee.clone(), line: *line, target });
+            }
+        }
+        (out, vec![])
     }
 }
 
 impl NameResolver {
-    fn calls_in(&self, file: &str, source: &[u8], given: Option<&tree_sitter::Tree>, index: &DefIndex) -> Vec<ResolvedCall> {
-        let Some(lang_box) = lang::for_name(self.lang_name) else { return vec![] };
-        let mine: Vec<(usize, &Def)> = index.defs.iter().enumerate().filter(|(_, d)| d.id.file == file).collect();
+    /// For each of `own`, the definitions of the file in index order, its
+    /// (callee, line) call sites.
+    fn calls_in(&self, file: &str, source: &[u8], given: Option<&tree_sitter::Tree>, own: &[Def]) -> Vec<Vec<(String, usize)>> {
+        let mut per_def: Vec<Vec<(String, usize)>> = vec![Vec::new(); own.len()];
+        let Some(lang_box) = lang::for_name(self.lang_name) else { return per_def };
+        let mine: Vec<(usize, &Def)> = own.iter().enumerate().collect();
         if mine.is_empty() {
-            return vec![];
+            return per_def;
         }
         // One parse serves every function in the file.
         let fresh;
         let tree = match given {
             Some(t) => t,
             None => {
-                let mut parser = tree_sitter::Parser::new();
-                if parser.set_language(&lang_box.ts_language()).is_err() {
-                    return vec![];
-                }
-                let Some(t) = parser.parse(source, None) else { return vec![] };
+                let Some(t) = crate::parsed::tree_for(file, self.lang_name, source) else { return per_def };
                 fresh = t;
                 &fresh
             }
@@ -73,8 +90,7 @@ impl NameResolver {
         // its rows filtered by name are that name's rows.
         let any = AnyName::new(lang_box.as_ref());
         let mut named: Option<Vec<(crate::runner::MatchRow, String)>> = None;
-        let mut out = Vec::new();
-        for (caller, def) in mine {
+        for (k, def) in mine {
             let query_str = format!("(*function#{} @f).body((&function @c))", def.name);
             let Ok(ast) = crate::query::parse(&query_str) else { continue };
             let compiled = compiler::compile(&ast, lang_box.as_ref());
@@ -95,14 +111,10 @@ impl NameResolver {
             for m in matches {
                 let (Some(callee), Some(line)) = (parse_capture("c", &m), parse_line("c", &m))
                 else { continue };
-                let target = match index.by_name.get(&callee).map(|v| v.as_slice()) {
-                    Some([single]) => Some((*single, Confidence::Exact)),
-                    _ => None,
-                };
-                out.push(ResolvedCall { caller, callee_display: callee, line, target });
+                per_def[k].push((callee, line));
             }
         }
-        out
+        per_def
     }
 }
 

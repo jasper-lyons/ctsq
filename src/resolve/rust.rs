@@ -11,7 +11,7 @@
 //! supertrait methods, macro-generated code, `pub use` re-export chains, and
 //! exact block-scope shadowing (the last `let` before the call line wins).
 
-use super::{Callee, Confidence, Def, DefId, DefIndex, DefKind, Receiver, ResolvedCall, Resolver};
+use super::{Callee, Confidence, Def, DefId, DefIndex, DefKind, FileModel, Receiver, ResolvedCall, Resolver, Want};
 use std::collections::HashMap;
 use tree_sitter::Node;
 
@@ -24,7 +24,7 @@ impl Resolver for RustResolver {
     }
 
     fn collect_defs_tree(&self, file: &str, source: &[u8], given: Option<&tree_sitter::Tree>) -> Vec<Def> {
-        let tree = match parse_or(given, source) { Some(t) => t, None => return vec![] };
+        let tree = match parse_or(given, file, source) { Some(t) => t, None => return vec![] };
         let mut out = Vec::new();
         let mut mods = file_module_path(file);
         walk_defs(tree.root_node(), source, file, &mut mods, Owner::Free, &mut out);
@@ -35,38 +35,43 @@ impl Resolver for RustResolver {
         self.collect_impls_tree(file, source, None)
     }
 
-    fn collect_impls_tree(&self, _file: &str, source: &[u8], given: Option<&tree_sitter::Tree>) -> Vec<(String, String)> {
-        let tree = match parse_or(given, source) { Some(t) => t, None => return vec![] };
+    fn collect_impls_tree(&self, file: &str, source: &[u8], given: Option<&tree_sitter::Tree>) -> Vec<(String, String)> {
+        let tree = match parse_or(given, file, source) { Some(t) => t, None => return vec![] };
         let mut out = Vec::new();
         walk_impls(tree.root_node(), source, &mut out);
         out
     }
 
-    fn resolve_calls(&self, file: &str, source: &[u8], index: &DefIndex) -> Vec<ResolvedCall> {
-        self.resolve_calls_tree(file, source, None, index).0
+    fn model(&self, file: &str, source: &[u8], given: Option<&tree_sitter::Tree>, _own: &[Def]) -> FileModel {
+        match parse_or(given, file, source) {
+            Some(t) => FileModel::Rust(FileScope::build(t.root_node(), source)),
+            None => FileModel::None,
+        }
     }
 
-    fn resolve_calls_tree(
+    fn resolve_model(
         &self,
         file: &str,
-        source: &[u8],
-        given: Option<&tree_sitter::Tree>,
+        model: &FileModel,
         index: &DefIndex,
+        want: Option<&Want>,
     ) -> (Vec<ResolvedCall>, Vec<super::CallSite>) {
-        let tree = match parse_or(given, source) { Some(t) => t, None => return (vec![], vec![]) };
-        let scope = FileScope::build(tree.root_node(), source);
+        let FileModel::Rust(scope) = model else { return (vec![], vec![]) };
 
         // def line -> index, for attributing calls to their enclosing function
-        let def_at: HashMap<usize, usize> = index.defs.iter().enumerate()
-            .filter(|(_, d)| d.id.file == file)
-            .map(|(i, d)| (d.id.line, i))
+        let def_at: HashMap<usize, usize> = index.in_file(file).iter()
+            .map(|&i| (index.defs[i].id.line, i))
             .collect();
 
         let mut out = Vec::new();
         for fun in &scope.fns {
             let Some(&caller) = def_at.get(&fun.line) else { continue };
-            let ctx = Ctx { file, scope: &scope, fun, index };
+            let ctx = Ctx { file, scope, fun, index };
+            let whole = want.is_none_or(|w| w.whole(fun.line));
             for (callee, line) in &fun.calls {
+                if !whole && !wanted_site(callee, fun, scope, want) {
+                    continue;
+                }
                 // trait-object dispatch can yield several targets → one edge each
                 let targets = resolve_callee(callee, *line, 0, &ctx);
                 let display = callee.name().to_string();
@@ -87,16 +92,34 @@ impl Resolver for RustResolver {
     }
 }
 
-/// The tree a `TreeStore` already holds, else a fresh parse. Cloning a tree
-/// is a cheap reference count.
-fn parse_or(given: Option<&tree_sitter::Tree>, source: &[u8]) -> Option<tree_sitter::Tree> {
-    given.cloned().or_else(|| parse(source))
+/// Whether a call outside the wanted functions can resolve to a definition
+/// named in `want.names`, or stay unresolved under such a name: its callee
+/// is one of the names, or it calls a local holding a function value or an
+/// imported name, either of which can reach a definition of another name.
+fn wanted_site(callee: &Callee, fun: &FnScope, scope: &FileScope, want: Option<&Want>) -> bool {
+    let Some(w) = want else { return true };
+    if w.names.contains(callee.name()) {
+        return true;
+    }
+    match callee {
+        Callee::Bare(v) => {
+            scope.imports.contains_key(v)
+                || fun.bindings.iter().any(|(_, b, bind)| b == v && matches!(bind, Binding::FnValue(_)))
+        }
+        _ => false,
+    }
 }
 
+#[cfg(test)]
 fn parse(source: &[u8]) -> Option<tree_sitter::Tree> {
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&tree_sitter_rust::LANGUAGE.into()).ok()?;
-    parser.parse(source, None)
+    crate::parsed::parse_text("rust", source)
+}
+
+/// The tree a `TreeStore` already holds, else the parse cache's tree of
+/// `file` when `source` is that file's text, else a fresh parse. Cloning a
+/// tree is a cheap reference count.
+fn parse_or(given: Option<&tree_sitter::Tree>, file: &str, source: &[u8]) -> Option<tree_sitter::Tree> {
+    given.cloned().or_else(|| crate::parsed::tree_for(file, "rust", source))
 }
 
 fn text<'a>(node: Node, source: &'a [u8]) -> &'a str {
@@ -311,8 +334,9 @@ struct FnScope {
     calls: Vec<(Callee, usize)>,
 }
 
+/// The calls, bindings and imports of one Rust file, read from its tree.
 #[derive(Debug)]
-struct FileScope {
+pub struct FileScope {
     /// local name → full path segments (aliases included).
     imports: HashMap<String, Vec<String>>,
     /// `use path::*` glob paths.
@@ -756,6 +780,8 @@ fn trait_dispatch(tr: &str, name: &str, ctx: &Ctx) -> Vec<(usize, Confidence)> {
     });
     if !is_trait_method { return vec![]; }
 
+    // every `impl tr for X` block holds the trait's name
+    ctx.index.ask(tr);
     let mut implementors: Vec<&str> = ctx.index.impls.iter()
         .filter(|(_, t)| t == tr)
         .map(|(ty, _)| ty.as_str())
@@ -823,7 +849,7 @@ fn method_on(ty: &str, name: &str, ctx: &Ctx) -> Option<(usize, Confidence)> {
 }
 
 fn name_candidates<'a>(ctx: &'a Ctx, name: &str) -> impl Iterator<Item = usize> + 'a {
-    ctx.index.by_name.get(name).map(|v| v.as_slice()).unwrap_or(&[]).iter().copied()
+    ctx.index.named(name).iter().copied()
 }
 
 /// Most recent binding of `var` at or before `line` in this function.

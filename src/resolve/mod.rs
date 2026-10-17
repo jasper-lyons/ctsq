@@ -19,7 +19,10 @@ pub mod imports;
 pub mod rust;
 pub mod tsconfig;
 
-use std::collections::HashMap;
+pub mod scoped;
+
+use std::cell::{OnceCell, RefCell};
+use std::collections::{HashMap, HashSet};
 
 /// Identity of a definition: where it lives.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -61,6 +64,13 @@ pub struct DefIndex {
     /// (type, trait) implements-relations from `impl Trait for Type` blocks.
     /// Separate from method defs so empty impls (all defaults) still count.
     pub impls: Vec<(String, String)>,
+    /// Every name a resolver read the index by, while recording (see
+    /// `scoped`). None when not recording.
+    asked: RefCell<Option<HashSet<String>>>,
+    /// file -> indices into `defs`, in index order, built on first use.
+    by_file: OnceCell<HashMap<String, Vec<usize>>>,
+    /// The Go resolver's constructed types, built on first use.
+    pub(crate) go_constructed: OnceCell<HashSet<String>>,
 }
 
 impl DefIndex {
@@ -68,6 +78,72 @@ impl DefIndex {
         self.by_name.entry(def.name.clone()).or_default().push(self.defs.len());
         self.defs.push(def);
     }
+
+    /// The definitions named `name`, in index order. Resolvers read names
+    /// through here (or note them with `ask`), so a scoped build learns
+    /// which names its answers depend on.
+    pub fn named(&self, name: &str) -> &[usize] {
+        self.ask(name);
+        self.by_name.get(name).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Note that an answer depends on `name`: every definition, impl block
+    /// or construction it reads holds that name in its file.
+    pub fn ask(&self, name: &str) {
+        if let Some(s) = self.asked.borrow_mut().as_mut() {
+            if !s.contains(name) {
+                s.insert(name.to_string());
+            }
+        }
+    }
+
+    /// Start recording the names asked, dropping any recorded before.
+    pub fn record(&self) {
+        *self.asked.borrow_mut() = Some(HashSet::new());
+    }
+
+    /// Stop recording and hand back what was asked.
+    pub fn take_asked(&self) -> HashSet<String> {
+        self.asked.borrow_mut().take().unwrap_or_default()
+    }
+
+    /// Indices of the definitions in `file`, in index order.
+    pub fn in_file(&self, file: &str) -> &[usize] {
+        let map = self.by_file.get_or_init(|| {
+            let mut m: HashMap<String, Vec<usize>> = HashMap::new();
+            for (i, d) in self.defs.iter().enumerate() {
+                m.entry(d.id.file.clone()).or_default().push(i);
+            }
+            m
+        });
+        map.get(file).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+}
+
+/// What a scoped build needs resolved in one file: every call inside the
+/// functions declared at `lines`, and every call that can resolve to a
+/// definition named in `names`, or stay unresolved under such a name.
+pub struct Want<'a> {
+    pub names: &'a HashSet<String>,
+    pub lines: Option<&'a HashSet<usize>>,
+}
+
+impl Want<'_> {
+    /// Whether every call in the function declared at `line` is wanted.
+    pub fn whole(&self, line: usize) -> bool {
+        self.lines.is_some_and(|l| l.contains(&line))
+    }
+}
+
+/// One file's calls as a resolver extracted them from its tree, so the tree
+/// can be dropped before the calls are resolved.
+pub enum FileModel {
+    Go(go::FileScope),
+    Rust(rust::FileScope),
+    /// Fallback: for each definition of the file, in order, its (callee, line)
+    /// call sites.
+    Names(Vec<Vec<(String, usize)>>),
+    None,
 }
 
 /// Receiver of a method call.
@@ -211,15 +287,24 @@ pub trait Resolver {
     }
     /// Phase 2 with an already parsed tree, plus the per-site table. Only the
     /// Go resolver fills the sites, the others return none.
+    #[cfg(test)]
     fn resolve_calls_tree(
         &self,
         file: &str,
         source: &[u8],
-        _tree: Option<&tree_sitter::Tree>,
+        tree: Option<&tree_sitter::Tree>,
         index: &DefIndex,
     ) -> (Vec<ResolvedCall>, Vec<CallSite>) {
-        (self.resolve_calls(file, source, index), vec![])
+        let own: Vec<Def> = index.in_file(file).iter().map(|&i| index.defs[i].clone()).collect();
+        let model = self.model(file, source, tree, &own);
+        self.resolve_model(file, &model, index, None)
     }
+    /// The calls of one file, read from its tree. `own` is the file's
+    /// definitions in index order.
+    fn model(&self, file: &str, source: &[u8], tree: Option<&tree_sitter::Tree>, own: &[Def]) -> FileModel;
+    /// Phase 2 over a model: the calls `want` asks for, or all of them,
+    /// resolved against `index`.
+    fn resolve_model(&self, file: &str, model: &FileModel, index: &DefIndex, want: Option<&Want>) -> (Vec<ResolvedCall>, Vec<CallSite>);
     /// Phase 1b: explicit implements-relations (`impl Trait for Type`).
     /// Languages with structural conformance (Go) don't need this.
     fn collect_impls(&self, _file: &str, _source: &[u8]) -> Vec<(String, String)> {
@@ -231,7 +316,10 @@ pub trait Resolver {
         self.collect_impls(file, source)
     }
     /// Phase 2: call sites in one file, resolved against the full project index.
-    fn resolve_calls(&self, file: &str, source: &[u8], index: &DefIndex) -> Vec<ResolvedCall>;
+    #[cfg(test)]
+    fn resolve_calls(&self, file: &str, source: &[u8], index: &DefIndex) -> Vec<ResolvedCall> {
+        self.resolve_calls_tree(file, source, None, index).0
+    }
 }
 
 pub fn resolver_for(lang_name: &str) -> Box<dyn Resolver> {
@@ -441,8 +529,7 @@ pub fn def_report(
     }
     if !missing.is_empty() {
         // A miss already read the outline for its report, so it is reused.
-        let outline = scan.outline.get_or_insert_with(|| outline_of(jobs));
-        err.push_str(&not_found_from(&missing, outline));
+        err.push_str(&not_found_from(&missing, &scan.whole_outline()));
     }
     NamesOut { out, err, code: if shown == 0 { 1 } else { 0 } }
 }
@@ -460,6 +547,11 @@ pub fn def_rows(
     scan: &mut DefScan,
     names_seen: &mut Vec<String>,
 ) -> Vec<(String, usize, Confidence)> {
+    let bare = crate::explain::bare_name(expr);
+    // A definition of a name holds its bytes, so the files holding the name
+    // give every definition and outline entry of it.
+    scan.cover(def_query_name(expr));
+    scan.cover(bare);
     let index = &scan.index;
     let rows: Vec<(String, usize, Confidence)> = resolve_def_query(expr, index)
         .into_iter()
@@ -474,49 +566,121 @@ pub fn def_rows(
 
     // A struct, class, type alias or top-level variable is not callable, so the
     // index never held it. This is the step `explain` takes next.
-    let bare = crate::explain::bare_name(expr);
     let mut found: Vec<(String, usize)> = Vec::new();
-    let outline = scan.outline.get_or_insert_with(|| outline_of(jobs));
-    for (file, _kind, name, line) in outline.iter() {
+    for (file, _kind, name, line) in scan.files.iter().flatten().flat_map(|f| f.outline.iter()) {
         if name == bare {
             found.push((file.clone(), *line));
         }
-        names_seen.push(name.clone());
     }
-    names_seen.extend(scan.index.by_name.keys().cloned());
     found.sort();
     found.dedup();
     if found.is_empty() {
         found = nested_def_sites(bare, jobs);
     }
+    if found.is_empty() {
+        // The miss report suggests from every name in the folder.
+        scan.cover_all();
+        for (_, _, name, _) in scan.files.iter().flatten().flat_map(|f| f.outline.iter()) {
+            names_seen.push(name.clone());
+        }
+        names_seen.extend(scan.index.by_name.keys().cloned());
+    }
     let conf = if found.len() == 1 { Confidence::Exact } else { Confidence::Guess };
     found.into_iter().map(|(f, l)| (f, l, conf)).collect()
 }
 
+/// The name `resolve_def_query` looks `expr` up by.
+fn def_query_name(expr: &str) -> &str {
+    if expr.contains("::") {
+        expr.split("::")
+            .filter(|s| !s.is_empty() && !matches!(*s, "crate" | "self" | "super"))
+            .last()
+            .unwrap_or("")
+    } else if let Some((_, name)) = expr.rsplit_once('.') {
+        name
+    } else {
+        expr
+    }
+}
+
+/// What `def` learns from one file: its call-graph definitions and its outline
+/// entries as (file, kind, name, line).
+struct ScannedFile {
+    defs: Vec<Def>,
+    outline: Vec<(String, &'static str, String, usize)>,
+}
+
 /// What `def` learns from the files, shared by every name asked: the call-graph
-/// definition index, and the outline names once a miss needed them.
+/// definition index and the outline, over the files holding a name asked so
+/// far. Each file is parsed, read and dropped in turn.
 pub struct DefScan {
+    jobs: Vec<(String, &'static str)>,
+    /// Per job, once read. None also for an unreadable file.
+    files: Vec<Option<ScannedFile>>,
+    read: Vec<bool>,
+    covered: HashSet<String>,
     index: DefIndex,
-    /// (file, kind, name, line) of every outline entry, built on the first miss.
-    outline: Option<Vec<(String, &'static str, String, usize)>>,
 }
 
 impl DefScan {
-    /// Index every job, parsing and dropping one file at a time.
+    /// Nothing read yet: `cover` reads the files a name needs.
     pub fn new(jobs: &[(String, &'static str)]) -> DefScan {
-        let mut index = DefIndex::default();
-        let mut outline = Vec::new();
-        for (file, lang) in jobs {
+        DefScan {
+            jobs: jobs.to_vec(),
+            files: (0..jobs.len()).map(|_| None).collect(),
+            read: vec![false; jobs.len()],
+            covered: HashSet::new(),
+            index: DefIndex::default(),
+        }
+    }
+
+    /// Read every file holding `name`, then rebuild the index in job order.
+    fn cover(&mut self, name: &str) {
+        if !self.covered.insert(name.to_string()) {
+            return;
+        }
+        let pick: Vec<usize> = (0..self.jobs.len())
+            .filter(|&j| !self.read[j])
+            .filter(|&j| crate::parsed::source(&self.jobs[j].0).is_some_and(|s| crate::needle::holds(&s, name)))
+            .collect();
+        self.read_jobs(&pick);
+    }
+
+    /// Read every file, for a miss report.
+    fn cover_all(&mut self) {
+        let pick: Vec<usize> = (0..self.jobs.len()).filter(|&j| !self.read[j]).collect();
+        self.read_jobs(&pick);
+    }
+
+    fn read_jobs(&mut self, pick: &[usize]) {
+        if pick.is_empty() {
+            return;
+        }
+        for &j in pick {
+            self.read[j] = true;
+            let (file, lang) = &self.jobs[j];
             let Some(p) = crate::parsed::get(file, lang) else { continue };
-            for def in resolver_for(p.lang).collect_defs_tree(file, &p.source, p.tree.as_ref()) {
-                index.push(def);
-            }
+            let defs = resolver_for(p.lang).collect_defs_tree(file, &p.source, p.tree.as_ref());
             // Read while the parse is held, so a miss needs no second parse.
-            for (kind, name, line) in crate::tree::collect_def_locs(file, lang) {
-                outline.push((file.clone(), kind, name, line));
+            let outline = crate::tree::collect_def_locs(file, lang)
+                .into_iter()
+                .map(|(kind, name, line)| (file.clone(), kind, name, line))
+                .collect();
+            self.files[j] = Some(ScannedFile { defs, outline });
+        }
+        let mut index = DefIndex::default();
+        for f in self.files.iter().flatten() {
+            for d in &f.defs {
+                index.push(d.clone());
             }
         }
-        DefScan { index, outline: Some(outline) }
+        self.index = index;
+    }
+
+    /// (file, kind, name, line) of every outline entry in the folder.
+    fn whole_outline(&mut self) -> Vec<(String, &'static str, String, usize)> {
+        self.cover_all();
+        self.files.iter().flatten().flat_map(|f| f.outline.iter().cloned()).collect()
     }
 }
 

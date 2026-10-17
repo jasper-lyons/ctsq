@@ -1,7 +1,7 @@
 //! Project-wide call graph: every definition indexed, every call site
 //! resolved, with forward/reverse adjacency for in-memory traversal.
 
-use super::{resolver_for, CallSite, DefId, DefIndex, ResolvedCall, TreeStore};
+use super::{resolver_for, CallSite, Def, DefId, DefIndex, FileModel, ParsedFile, ResolvedCall, TreeStore, Want};
 use std::collections::{HashMap, HashSet};
 
 /// Graph node identity: a known definition (file:line) or an external name.
@@ -24,40 +24,83 @@ pub struct CallGraph {
     pub sites: Vec<CallSite>,
 }
 
-/// Build from files on disk, each read and parsed once through the cache. The
-/// trees live only as long as this call; a caller that wants later stages to
-/// share them builds a `TreeStore` and keeps it (see `build_from_store`).
+/// Build from files on disk. Each file is parsed once through the cache, read
+/// for its definitions and calls, and dropped, so no run holds every tree.
 pub fn build(jobs: &[(String, &'static str)]) -> CallGraph {
-    build_from_store(&TreeStore::build(jobs))
+    let mut loaded = Vec::new();
+    let mut at: HashMap<&str, usize> = HashMap::new();
+    for (file, lang) in jobs {
+        let Some(p) = crate::parsed::get(file, lang) else { continue };
+        let l = Loaded::read(file, &p);
+        // A path given twice keeps its first place, as `TreeStore` does.
+        match at.get(file.as_str()) {
+            Some(&i) => loaded[i] = l,
+            None => {
+                at.insert(file, loaded.len());
+                loaded.push(l);
+            }
+        }
+    }
+    let files: Vec<&Loaded> = loaded.iter().collect();
+    let index = index_of(&files);
+    let resolved = files.iter().map(|l| l.resolve(&index, None)).collect();
+    finish(index, resolved)
 }
 
 /// Build from a `TreeStore`, so no resolver parses again. Same graph as `build`
 /// on the same files.
 pub fn build_from_store(store: &TreeStore) -> CallGraph {
-    let files: Vec<(&str, &'static str, &[u8], Option<&tree_sitter::Tree>)> = store
-        .iter()
-        .map(|(f, p)| (f, p.lang, p.source.as_slice(), p.tree.as_ref()))
-        .collect();
-    assemble(&files)
+    let loaded: Vec<Loaded> = store.iter().map(|(f, p)| Loaded::read(f, p)).collect();
+    let files: Vec<&Loaded> = loaded.iter().collect();
+    let index = index_of(&files);
+    let resolved = files.iter().map(|l| l.resolve(&index, None)).collect();
+    finish(index, resolved)
 }
 
-fn assemble(files: &[(&str, &'static str, &[u8], Option<&tree_sitter::Tree>)]) -> CallGraph {
-    // Pass 1: index every definition.
-    let mut index = DefIndex::default();
-    for &(file, lang_name, source, tree) in files {
-        let resolver = resolver_for(lang_name);
-        for def in resolver.collect_defs_tree(file, source, tree) {
-            index.push(def);
-        }
-        index.impls.extend(resolver.collect_impls_tree(file, source, tree));
+/// What a file gives the graph, read from its tree so the tree can go: its
+/// definitions, its impl relations and its calls, not yet resolved.
+pub(crate) struct Loaded {
+    pub file: String,
+    pub lang: &'static str,
+    pub defs: Vec<Def>,
+    pub impls: Vec<(String, String)>,
+    pub model: FileModel,
+}
+
+impl Loaded {
+    pub fn read(file: &str, p: &ParsedFile) -> Loaded {
+        let r = resolver_for(p.lang);
+        let tree = p.tree.as_ref();
+        let defs = r.collect_defs_tree(file, &p.source, tree);
+        let impls = r.collect_impls_tree(file, &p.source, tree);
+        let model = r.model(file, &p.source, tree, &defs);
+        Loaded { file: file.to_string(), lang: p.lang, defs, impls, model }
     }
 
-    // Pass 2: resolve call sites against the full index.
+    /// This file's calls, the ones `want` asks for or all, against `index`.
+    pub fn resolve(&self, index: &DefIndex, want: Option<&Want>) -> (Vec<ResolvedCall>, Vec<CallSite>) {
+        resolver_for(self.lang).resolve_model(&self.file, &self.model, index, want)
+    }
+}
+
+/// Pass 1: the definition index over `files`, in their order.
+pub(crate) fn index_of(files: &[&Loaded]) -> DefIndex {
+    let mut index = DefIndex::default();
+    for l in files {
+        for def in &l.defs {
+            index.push(def.clone());
+        }
+        index.impls.extend(l.impls.iter().cloned());
+    }
+    index
+}
+
+/// Pass 2's results, one entry per file in file order, made into the graph.
+pub(crate) fn finish(index: DefIndex, resolved: Vec<(Vec<ResolvedCall>, Vec<CallSite>)>) -> CallGraph {
     let mut calls: Vec<ResolvedCall> = Vec::new();
     let mut sites: Vec<CallSite> = Vec::new();
     let mut seen: HashSet<(usize, String, Option<usize>)> = HashSet::new();
-    for &(file, lang_name, source, tree) in files {
-        let (resolved, file_sites) = resolver_for(lang_name).resolve_calls_tree(file, source, tree, &index);
+    for (resolved, file_sites) in resolved {
         sites.extend(file_sites);
         for rc in resolved {
             // one edge per (caller, callee) pair; first call site wins

@@ -62,9 +62,7 @@ pub fn report_scoped(
     hider: &mut files::Hider,
     scope: Option<scope::Opts>,
 ) -> (String, i32) {
-    // Held to the end so the hider and the scope printer reuse these parses.
-    let store = crate::resolve::TreeStore::build(jobs);
-    let g = graph::build_from_store(&store);
+    let g = graph_for(dir, &[function.to_string()], jobs, max_depth);
     let printer = scope.map(|o| scope::Printer::new(o, jobs));
     let mut w = Walk { g: &g, max_depth, out: String::new(), shown: 0, hider, hidden: Hidden::default(), scope: printer };
     walk_name(&mut w, dir, function);
@@ -91,9 +89,7 @@ pub fn report_many(
     hider: &mut files::Hider,
     scope: Option<scope::Opts>,
 ) -> crate::resolve::NamesOut {
-    // Held to the end so the hider and the scope printer reuse these parses.
-    let store = crate::resolve::TreeStore::build(jobs);
-    let g = graph::build_from_store(&store);
+    let g = graph_for(dir, names, jobs, max_depth);
     let printer = scope.map(|o| scope::Printer::new(o, jobs));
     let mut w = Walk { g: &g, max_depth, out: String::new(), shown: 0, hider, hidden: Hidden::default(), scope: printer };
     let mut missing: Vec<String> = Vec::new();
@@ -143,6 +139,14 @@ pub fn report_many(
     }
     err.push_str(&crate::resolve::not_found_line(&missing, jobs));
     crate::resolve::NamesOut { out, err, code: if resolved { 0 } else { 1 } }
+}
+
+/// The graph a walk from `names` reads, built from the files it needs. Its
+/// edges within `max_depth` of the names are the whole-folder graph's, so a
+/// test never changes how a call resolves.
+fn graph_for(dir: Direction, names: &[String], jobs: &[(String, &'static str)], max_depth: usize) -> CallGraph {
+    let (up, down) = if dir == Direction::Up { (max_depth, 0) } else { (0, max_depth) };
+    crate::resolve::scoped::build(jobs, &crate::resolve::scoped::Seeds { names: names.to_vec(), up, down })
 }
 
 /// One name's tree, appended to `w.out`. True when a definition of the name

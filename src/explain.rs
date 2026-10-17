@@ -10,7 +10,7 @@ use crate::calltree::short_path;
 use crate::footer::{footer, Hidden};
 use crate::compiler::{self, lang};
 use crate::files;
-use crate::resolve::graph::{self, CallGraph, NodeKey};
+use crate::resolve::graph::{CallGraph, NodeKey};
 use crate::resolve::{resolve_def_query, Confidence, DefKind};
 use crate::{query, runner, tree};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -60,14 +60,15 @@ pub fn report_many(
     let mut hidden = Hidden::default();
     // Held to the end: the graph, the definitions, the references and the
     // outline all read these parses, so each file is parsed once per run.
-    let store = crate::resolve::TreeStore::build(jobs);
+    let _held = hold_named(names, jobs);
+    let g = graph_for(names, jobs, opts);
     let mut out = String::new();
     let mut miss_text = String::new();
     let mut missing: Vec<String> = Vec::new();
     let mut any = false;
     for symbol in names {
         let before = hidden.tests + hidden.excluded;
-        let (text, found) = body(symbol, jobs, &store, opts, hider, &mut hidden);
+        let (text, found) = body(symbol, jobs, &g, opts, hider, &mut hidden);
         if found {
             any = true;
         } else if hidden.tests + hidden.excluded == before {
@@ -100,6 +101,49 @@ pub fn report_many(
     crate::resolve::NamesOut { out, err, code: if any { 0 } else { 1 } }
 }
 
+/// The graph the walks of every name read, built from the files they need:
+/// callers and callees `opts.depth` levels from each name's definitions.
+fn graph_for(names: &[String], jobs: &[(String, &'static str)], opts: &Options) -> CallGraph {
+    let mut seeds: Vec<String> = Vec::new();
+    for s in names {
+        for n in [bare_name(s), query_name(s)] {
+            if !seeds.iter().any(|x| x == n) {
+                seeds.push(n.to_string());
+            }
+        }
+    }
+    crate::resolve::scoped::build(jobs, &crate::resolve::scoped::Seeds { names: seeds, up: opts.depth, down: opts.depth })
+}
+
+/// The name `resolve_def_query` looks `expr` up by.
+fn query_name(expr: &str) -> &str {
+    if expr.contains("::") {
+        expr.split("::")
+            .filter(|s| !s.is_empty() && !matches!(*s, "crate" | "self" | "super"))
+            .last()
+            .unwrap_or(expr)
+    } else if let Some((_, name)) = expr.rsplit_once('.') {
+        name
+    } else {
+        expr
+    }
+}
+
+/// Whether `file` can hold a definition, an outline entry or an `id#` match
+/// of `bare`: each of those holds its bytes.
+fn may_hold(file: &str, bare: &str) -> bool {
+    crate::parsed::source(file).is_some_and(|s| crate::needle::holds(&s, bare))
+}
+
+/// The parses of the files holding any name's bare form, held so the
+/// definitions, the references and the outline share one parse each.
+fn hold_named(names: &[String], jobs: &[(String, &'static str)]) -> Vec<std::rc::Rc<crate::parsed::ParsedFile>> {
+    jobs.iter()
+        .filter(|(f, _)| names.iter().any(|n| may_hold(f, bare_name(n))))
+        .filter_map(|(f, l)| crate::parsed::get(f, l))
+        .collect()
+}
+
 // ── Report ───────────────────────────────────────────────────────────────────
 
 /// Build the whole report as text, hiding nothing. Split out from `run` so
@@ -121,8 +165,8 @@ pub fn report_hiding(
     hider: &mut files::Hider,
 ) -> (String, bool) {
     let mut hidden = Hidden::default();
-    let store = crate::resolve::TreeStore::build(jobs);
-    let (mut out, found) = body(symbol, jobs, &store, opts, hider, &mut hidden);
+    let g = graph_for(&[symbol.to_string()], jobs, opts);
+    let (mut out, found) = body(symbol, jobs, &g, opts, hider, &mut hidden);
     let shown = out.matches("\nDEFINITION ").count();
     out.push_str(&footer(shown, "definition", &hidden));
     (out, found)
@@ -131,7 +175,7 @@ pub fn report_hiding(
 fn body(
     symbol: &str,
     jobs: &[(String, &'static str)],
-    store: &crate::resolve::TreeStore,
+    g: &CallGraph,
     opts: &Options,
     hider: &mut files::Hider,
     hidden: &mut Hidden,
@@ -142,8 +186,7 @@ fn body(
     // caller and a reference, or a definition and a reference, counts once.
     let mut hidden_seen: HashSet<(String, usize)> = HashSet::new();
 
-    let g = graph::build_from_store(store);
-    let sites = keep_once(hider, definition_sites(symbol, &g, jobs), |s| (s.file.clone(), s.line), hidden, &mut hidden_seen);
+    let sites = keep_once(hider, definition_sites(symbol, g, jobs), |s| (s.file.clone(), s.line), hidden, &mut hidden_seen);
 
     if sites.is_empty() {
         out.push_str(&format!("SYMBOL {} (no definition resolved)\n", symbol));
@@ -309,6 +352,9 @@ fn definition_sites(symbol: &str, g: &CallGraph, jobs: &[(String, &'static str)]
     // A class or struct is invisible to the call-graph index, so take it from
     // the outline. When the index resolved nothing, take any kind.
     for (file, lang_name) in jobs {
+        if !may_hold(file, bare) {
+            continue;
+        }
         for (kind, name, line) in tree::collect_def_locs(file, lang_name) {
             if name != bare {
                 continue;
@@ -535,6 +581,9 @@ fn references(symbol: &str, jobs: &[(String, &'static str)]) -> Vec<(String, usi
     let mut out = Vec::new();
 
     for (file, lang_name) in jobs {
+        if !may_hold(file, bare_name(symbol)) {
+            continue;
+        }
         let (lang_box, compiled) = cache.entry(lang_name).or_insert_with(|| {
             let l = lang::for_name(lang_name).expect("lang_name always valid here");
             let c = compiler::compile(&ast, l.as_ref());

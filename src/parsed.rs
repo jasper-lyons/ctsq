@@ -165,7 +165,8 @@ pub fn get(path: &str, lang: &'static str) -> Option<Rc<ParsedFile>> {
     }
     let source = source(path)?;
     let tree = parse_text(lang, &source);
-    PARSES.fetch_add(1, Ordering::Relaxed);    let weight = source.len().saturating_mul(TREE_WEIGHT);
+    PARSES.fetch_add(1, Ordering::Relaxed);
+    let weight = source.len().saturating_mul(TREE_WEIGHT);
     let p = Rc::new(ParsedFile { lang, source, tree });
     CACHE.with(|c| {
         let mut c = c.borrow_mut();
@@ -174,6 +175,16 @@ pub fn get(path: &str, lang: &'static str) -> Option<Rc<ParsedFile>> {
         c.keep((path.to_string(), Some(lang)), Kept::Tree(p.clone()), weight);
     });
     Some(p)
+}
+
+/// The tree of `source`: the cached parse of `path` when `source` is that
+/// file's text, else a fresh uncached parse. For callers that hold a path and
+/// bytes but cannot be sure the bytes are the file's.
+pub fn tree_for(path: &str, lang: &'static str, source: &[u8]) -> Option<tree_sitter::Tree> {
+    match self::source(path) {
+        Some(s) if s.as_slice() == source => get(path, lang).and_then(|p| p.tree.clone()),
+        _ => parse_text(lang, source),
+    }
 }
 
 /// Parse text that has no path, uncached and not counted.

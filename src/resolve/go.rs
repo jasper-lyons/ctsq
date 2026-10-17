@@ -16,7 +16,8 @@
 //! params first (they shadow package names), then the import map.
 
 use super::{
-    CallSite, Callee, Confidence, Def, DefId, DefIndex, DefKind, Receiver, ResolvedCall, Resolver,
+    CallSite, Callee, Confidence, Def, DefId, DefIndex, DefKind, FileModel, Receiver, ResolvedCall,
+    Resolver, Want,
 };
 use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
@@ -30,7 +31,7 @@ impl Resolver for GoResolver {
     }
 
     fn collect_defs_tree(&self, file: &str, source: &[u8], given: Option<&tree_sitter::Tree>) -> Vec<Def> {
-        let tree = match parse_or(given, source) { Some(t) => t, None => return vec![] };
+        let tree = match parse_or(given, file, source) { Some(t) => t, None => return vec![] };
         let pkg = file_package_path(file);
         let mut out = Vec::new();
         let mut cursor = tree.root_node().walk();
@@ -75,8 +76,8 @@ impl Resolver for GoResolver {
         self.collect_impls_tree(file, source, None)
     }
 
-    fn collect_impls_tree(&self, _file: &str, source: &[u8], given: Option<&tree_sitter::Tree>) -> Vec<(String, String)> {
-        let Some(tree) = parse_or(given, source) else { return vec![] };
+    fn collect_impls_tree(&self, file: &str, source: &[u8], given: Option<&tree_sitter::Tree>) -> Vec<(String, String)> {
+        let Some(tree) = parse_or(given, file, source) else { return vec![] };
         let mut seen: HashSet<String> = HashSet::new();
         let mut stack = vec![tree.root_node()];
         while let Some(n) = stack.pop() {
@@ -108,33 +109,38 @@ impl Resolver for GoResolver {
         out
     }
 
-    fn resolve_calls(&self, file: &str, source: &[u8], index: &DefIndex) -> Vec<ResolvedCall> {
-        self.resolve_calls_tree(file, source, None, index).0
+    fn model(&self, file: &str, source: &[u8], given: Option<&tree_sitter::Tree>, _own: &[Def]) -> FileModel {
+        match parse_or(given, file, source) {
+            Some(t) => FileModel::Go(FileScope::build(t.root_node(), source)),
+            None => FileModel::None,
+        }
     }
 
-    fn resolve_calls_tree(
+    fn resolve_model(
         &self,
         file: &str,
-        source: &[u8],
-        given: Option<&tree_sitter::Tree>,
+        model: &FileModel,
         index: &DefIndex,
+        want: Option<&Want>,
     ) -> (Vec<ResolvedCall>, Vec<CallSite>) {
-        let tree = match parse_or(given, source) { Some(t) => t, None => return (vec![], vec![]) };
-        let scope = FileScope::build(tree.root_node(), source);
-        let constructed = constructed_types(index);
+        let FileModel::Go(scope) = model else { return (vec![], vec![]) };
+        let constructed = index.go_constructed.get_or_init(|| constructed_types(index));
 
         // def line -> index, for attributing calls to their enclosing function
-        let def_at: HashMap<usize, usize> = index.defs.iter().enumerate()
-            .filter(|(_, d)| d.id.file == file)
-            .map(|(i, d)| (d.id.line, i))
+        let def_at: HashMap<usize, usize> = index.in_file(file).iter()
+            .map(|&i| (index.defs[i].id.line, i))
             .collect();
 
         let mut out = Vec::new();
         let mut sites = Vec::new();
         for fun in &scope.fns {
             let Some(&caller) = def_at.get(&fun.line) else { continue };
-            let ctx = Ctx { file, scope: &scope, fun, index, constructed: &constructed };
+            let ctx = Ctx { file, scope, fun, index, constructed };
+            let whole = want.is_none_or(|w| w.whole(fun.line));
             for call in &fun.calls {
+                if !whole && !wanted_site(&call.callee, fun, want) {
+                    continue;
+                }
                 let line = call.line;
                 // interface dispatch can yield several targets → one edge each
                 let targets: Vec<Option<(usize, Confidence)>> =
@@ -163,6 +169,21 @@ impl Resolver for GoResolver {
     }
 }
 
+/// Whether a call outside the wanted functions can resolve to a definition
+/// named in `want.names`, or stay unresolved under such a name: its callee
+/// is one of the names, or it calls a local holding a function value, which
+/// can reach a definition of any name.
+fn wanted_site(callee: &Callee, fun: &FnScope, want: Option<&Want>) -> bool {
+    let Some(w) = want else { return true };
+    if w.names.contains(callee.name()) {
+        return true;
+    }
+    match callee {
+        Callee::Bare(v) => fun.bindings.iter().any(|(_, b, bind)| b == v && matches!(bind, Binding::FnValue(_))),
+        _ => false,
+    }
+}
+
 /// Marker trait name under which `collect_impls` records a constructed type.
 pub const CONSTRUCTED: &str = "#constructed";
 
@@ -184,16 +205,16 @@ pub fn constructed_types(index: &DefIndex) -> HashSet<String> {
     set
 }
 
+#[cfg(test)]
 fn parse(source: &[u8]) -> Option<tree_sitter::Tree> {
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
-    parser.parse(source, None)
+    crate::parsed::parse_text("go", source)
 }
 
-/// The tree a `TreeStore` already holds, else a fresh parse. Cloning a tree
-/// is a cheap reference count.
-fn parse_or(given: Option<&tree_sitter::Tree>, source: &[u8]) -> Option<tree_sitter::Tree> {
-    given.cloned().or_else(|| parse(source))
+/// The tree a `TreeStore` already holds, else the parse cache's tree of
+/// `file` when `source` is that file's text, else a fresh parse. Cloning a
+/// tree is a cheap reference count.
+fn parse_or(given: Option<&tree_sitter::Tree>, file: &str, source: &[u8]) -> Option<tree_sitter::Tree> {
+    given.cloned().or_else(|| crate::parsed::tree_for(file, "go", source))
 }
 
 fn text<'a>(node: Node, source: &'a [u8]) -> &'a str {
@@ -319,8 +340,9 @@ struct CallRec {
     args: Vec<(usize, usize)>,
 }
 
+/// The calls, bindings and imports of one Go file, read from its tree.
 #[derive(Debug)]
-struct FileScope {
+pub struct FileScope {
     /// local package name (alias included) → import path segments.
     imports: HashMap<String, Vec<String>>,
     /// `import . "path"` dot-import path segments.
@@ -738,6 +760,8 @@ fn resolve_method(
 /// program constructs somewhere count (rapid type analysis). With no such
 /// implementor the edge points at the signature itself.
 fn interface_impls(iface: &str, name: &str, ctx: &Ctx) -> Vec<(usize, Confidence)> {
+    // the interface's methods are declared in a file holding its name
+    ctx.index.ask(iface);
     let sig_methods: Vec<&str> = ctx.index.defs.iter()
         .filter(|d| matches!(&d.kind, DefKind::InterfaceMethod { interface } if interface == iface))
         .map(|d| d.name.as_str())
@@ -755,7 +779,7 @@ fn interface_impls(iface: &str, name: &str, ctx: &Ctx) -> Vec<(usize, Confidence
     let mut impls: Vec<usize> = name_candidates(ctx, name)
         .filter(|&i| matches!(
             &ctx.index.defs[i].kind,
-            DefKind::Method { receiver, .. } if ctx.constructed.contains(receiver) && implements(receiver)
+            DefKind::Method { receiver, .. } if constructed(receiver, ctx) && implements(receiver)
         ))
         .collect();
     impls.sort_by(|&a, &b| {
@@ -772,6 +796,14 @@ fn interface_impls(iface: &str, name: &str, ctx: &Ctx) -> Vec<(usize, Confidence
         1 => vec![(impls[0], Confidence::Exact)],
         _ => impls.into_iter().map(|i| (i, Confidence::Guess)).collect(),
     }
+}
+
+/// Whether the program constructs `ty` somewhere. Every piece of evidence (a
+/// composite literal, `new(T)`, a function returning T, a function named
+/// `NewT`) holds T's name in its file.
+fn constructed(ty: &str, ctx: &Ctx) -> bool {
+    ctx.index.ask(ty);
+    ctx.constructed.contains(ty)
 }
 
 /// Resolve `pkg.Fn` where `pkg` maps to import path segments: functions named
@@ -822,7 +854,7 @@ fn method_on(ty: &str, name: &str, ctx: &Ctx) -> Option<(usize, Confidence)> {
 }
 
 fn name_candidates<'a>(ctx: &'a Ctx, name: &str) -> impl Iterator<Item = usize> + 'a {
-    ctx.index.by_name.get(name).map(|v| v.as_slice()).unwrap_or(&[]).iter().copied()
+    ctx.index.named(name).iter().copied()
 }
 
 /// Most recent binding of `var` at or before `line` in this function.
