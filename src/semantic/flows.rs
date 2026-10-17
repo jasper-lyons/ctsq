@@ -22,7 +22,7 @@ use crate::flow::{
 };
 use crate::query::ast::{Combinator, Query};
 use crate::resolve::go::{binding_type_qualified, go_imports, go_signatures, GoSignature};
-use crate::resolve::graph::CallGraph;
+use crate::resolve::scoped::FlowGraph;
 use crate::resolve::{DefIndex, DefKind, TreeStore};
 
 #[derive(Debug, Clone)]
@@ -82,7 +82,7 @@ pub fn evaluate_flows(
     query: &Query,
     open: Option<Combinator>,
     store: &TreeStore,
-    graph: &CallGraph,
+    graph: &FlowGraph,
     root: &Path,
     scan: &Path,
     opts: &FlowOptions,
@@ -284,7 +284,7 @@ fn evaluate_upward(
     tail: Option<&Query>,
     eventually: bool,
     store: &TreeStore,
-    graph: &CallGraph,
+    graph: &FlowGraph,
     root: &Path,
     scan: &Path,
     opts: &FlowOptions,
@@ -681,15 +681,13 @@ fn print_tree_with(h: &Hop, depth: usize, upward: bool, out: &mut String) {
 /// The `Outside` hook that walks into in-repo callees.
 struct Walk<'a> {
     store: &'a TreeStore,
-    graph: &'a CallGraph,
+    graph: &'a FlowGraph,
     cfg: &'a LangConfig,
     module: &'a Module,
     models: ModelOutside<'a>,
     /// Whether calls are followed into callees (`==>`).
     follow: bool,
     max: usize,
-    /// (file, call start, call end) to indices into `graph.sites`.
-    sites: HashMap<(String, usize, usize), Vec<usize>>,
     sigs: RefCell<HashMap<String, Vec<GoSignature>>>,
     /// Files of the functions being walked, innermost last.
     files: RefCell<Vec<String>>,
@@ -700,8 +698,9 @@ struct Walk<'a> {
     memo: RefCell<HashMap<(String, usize, Vec<usize>, bool, String), CallEffect>>,
     /// The end predicate, used inside callees too.
     end: &'a EndFn<'a>,
-    /// Outside implementations of module interfaces, found on first use.
-    outside: std::cell::OnceCell<HashMap<String, Vec<widen::OutsideImpl>>>,
+    /// Outside implementations of module interfaces, by interface, found on
+    /// first use.
+    outside: RefCell<HashMap<String, Vec<widen::OutsideImpl>>>,
     /// Print the outside implementations of the interfaces widened (`--expand`).
     expand: bool,
     /// Interfaces whose widened calls were followed and have outside implementations.
@@ -715,19 +714,13 @@ struct Walk<'a> {
 impl<'a> Walk<'a> {
     fn new(
         store: &'a TreeStore,
-        graph: &'a CallGraph,
+        graph: &'a FlowGraph,
         cfg: &'a LangConfig,
         module: &'a Module,
         end: &'a EndFn<'a>,
         follow: bool,
         max: usize,
     ) -> Walk<'a> {
-        let mut sites: HashMap<(String, usize, usize), Vec<usize>> = HashMap::new();
-        for (i, s) in graph.sites.iter().enumerate() {
-            if let Some(d) = graph.index.defs.get(s.caller) {
-                sites.entry((d.id.file.clone(), s.start_byte, s.end_byte)).or_default().push(i);
-            }
-        }
         Walk {
             store,
             graph,
@@ -736,13 +729,12 @@ impl<'a> Walk<'a> {
             models: ModelOutside::with_module(cfg, module),
             follow,
             max,
-            sites,
             sigs: RefCell::new(HashMap::new()),
             files: RefCell::new(vec![]),
             active: RefCell::new(vec![]),
             memo: RefCell::new(HashMap::new()),
             end,
-            outside: std::cell::OnceCell::new(),
+            outside: RefCell::new(HashMap::new()),
             expand: false,
             widened_ifaces: RefCell::new(vec![]),
             tail: None,
@@ -776,7 +768,7 @@ impl<'a> Walk<'a> {
     /// Also gives the pointer parameters and pointer receiver the callee
     /// stored the data in, as `CallEffect::Into` writes.
     fn into_callee(&self, def: usize, site: &CallSite) -> Option<(FlowResult, Vec<(Slot, Paths)>)> {
-        let d = &self.graph.index.defs[def];
+        let d = self.graph.def(def);
         let sig = self.signature(&d.id.file, d.id.line)?;
         let mut params: Vec<(&crate::resolve::go::GoParam, Paths)> = vec![];
         for (k, &i) in site.tracked_args.iter().enumerate() {
@@ -837,13 +829,12 @@ impl<'a> Walk<'a> {
                 return None;
             }
         }
-        let ids = self.sites.get(&(file.to_string(), site.node.start_byte(), site.node.end_byte()))?;
-        let targets: Vec<usize> = ids.iter().filter_map(|&i| self.graph.sites[i].target.map(|(t, _)| t)).collect();
+        let targets = self.graph.site_targets(file, site.node.start_byte(), site.node.end_byte())?;
         if targets.is_empty() {
             return None;
         }
         if site.method.is_some()
-            && targets.iter().all(|&t| matches!(self.graph.index.defs[t].kind, DefKind::InterfaceMethod { .. }))
+            && targets.iter().all(|&t| matches!(self.graph.def(t).kind, DefKind::InterfaceMethod { .. }))
         {
             // An interface with no implementation in the scanned files.
             return Some(CallEffect::Stop { tag: "stopped: interface".into(), rows: vec![] });
@@ -937,27 +928,18 @@ impl<'a> Walk<'a> {
         effect
     }
 
-    fn outside_map(&self) -> &HashMap<String, Vec<widen::OutsideImpl>> {
-        self.outside.get_or_init(|| {
-            let files: Vec<(&str, Node, &[u8])> = self
-                .store
-                .iter()
-                .filter(|(_, pf)| pf.lang == "go")
-                .filter_map(|(f, pf)| pf.tree.as_ref().map(|t| (f, t.root_node(), pf.source.as_slice())))
-                .collect();
-            widen::outside_impls(&files, &self.graph.index, self.cfg.module_path.as_deref())
-        })
-    }
-
     /// Outside implementations of the interface named `iface`.
     fn outside_of(&self, iface: &str) -> Vec<widen::OutsideImpl> {
-        self.outside_map().get(iface).cloned().unwrap_or_default()
+        if let Some(v) = self.outside.borrow().get(iface) {
+            return v.clone();
+        }
+        let v = widen::outside_impls_for(iface, self.store, self.graph, self.cfg.module_path.as_deref());
+        self.outside.borrow_mut().insert(iface.to_string(), v.clone());
+        v
     }
 
     fn has_outside(&self, site: &CallSite) -> bool {
-        site.recv_type
-            .as_deref()
-            .is_some_and(|t| self.outside_map().contains_key(t.rsplit('.').next().unwrap_or(t)))
+        site.recv_type.as_deref().is_some_and(|t| !self.outside_of(t.rsplit('.').next().unwrap_or(t)).is_empty())
     }
 
     /// Rows for the outside implementations of the interfaces this run
@@ -1020,7 +1002,7 @@ impl<'a> Walk<'a> {
         }
         if let [a] = assigns.as_slice() {
             if let Some(def) = self.function_def(&a.value, &a.file) {
-                let target = self.graph.index.defs[def].name.clone();
+                let target = self.graph.def(def).name.clone();
                 return Some(self.walk_targets(site, file, &[def], target));
             }
             if local {
@@ -1051,17 +1033,14 @@ impl<'a> Walk<'a> {
         let name = value.rsplit('.').next()?;
         let cands: Vec<usize> = self
             .graph
-            .index
-            .by_name
-            .get(name)?
-            .iter()
-            .copied()
-            .filter(|&i| matches!(self.graph.index.defs[i].kind, DefKind::Function))
-            .filter(|&i| self.graph.index.defs[i].id.file.ends_with(".go"))
+            .by_name(name)
+            .into_iter()
+            .filter(|&i| matches!(self.graph.def(i).kind, DefKind::Function))
+            .filter(|&i| self.graph.def(i).id.file.ends_with(".go"))
             .collect();
         let dir = |f: &str| Path::new(f).parent().map(|p| p.to_path_buf());
         if !value.contains('.') {
-            return cands.iter().copied().find(|&i| dir(&self.graph.index.defs[i].id.file) == dir(file));
+            return cands.iter().copied().find(|&i| dir(&self.graph.def(i).id.file) == dir(file));
         }
         match cands.as_slice() {
             [one] => Some(*one),
@@ -1270,7 +1249,7 @@ mod tests {
         for (f, src) in files {
             store.insert(f, "go", src.as_bytes().to_vec());
         }
-        let g = crate::resolve::graph::build_from_store(&store);
+        let g = FlowGraph::whole(&crate::resolve::graph::build_from_store(&store));
         let (head, open) = match open_end(q) {
             Some((h, c)) => (h, Some(c)),
             None => (q.to_string(), None),

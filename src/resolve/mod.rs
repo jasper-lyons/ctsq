@@ -221,17 +221,35 @@ pub struct CallSite {
 /// One parsed file, shared with the process-wide cache in `parsed`.
 pub use crate::parsed::ParsedFile;
 
-#[allow(dead_code)] // wired by the path command
 /// Every file of one run, shared by the call graph and the flow engine. A view
 /// over `parsed`: each file is read and parsed once per run, whoever asks
 /// first. Files keep the order they were added in.
+///
+/// A store made with `lazy` parses a file only when it is asked for, by path
+/// or by a name its text holds (`holding`), so a walk that visits a few files
+/// parses only those. `iter` still visits, and parses, every file.
 #[derive(Default)]
 pub struct TreeStore {
-    files: Vec<(String, std::rc::Rc<ParsedFile>)>,
+    files: Vec<StoreEntry>,
     by_path: HashMap<String, usize>,
+    /// The word index of a lazy store, over its jobs.
+    words: Option<std::rc::Rc<scoped::Words>>,
+    /// Job index to entry, for a lazy store.
+    entry_of_job: HashMap<usize, usize>,
 }
 
-#[allow(dead_code)] // wired by the path command
+struct StoreEntry {
+    path: String,
+    lang: &'static str,
+    parsed: OnceCell<Option<std::rc::Rc<ParsedFile>>>,
+}
+
+impl StoreEntry {
+    fn parsed(&self) -> Option<&ParsedFile> {
+        self.parsed.get_or_init(|| crate::parsed::get(&self.path, self.lang)).as_deref()
+    }
+}
+
 impl TreeStore {
     /// Every job from the cache, parsing the ones not yet parsed. Unreadable
     /// files are left out.
@@ -245,6 +263,32 @@ impl TreeStore {
         store
     }
 
+    /// The same files as `build`, each parsed on first use. `words` is the
+    /// word index over the same `jobs`, which also says which are readable.
+    pub fn lazy(jobs: &[(String, &'static str)], words: std::rc::Rc<scoped::Words>) -> TreeStore {
+        let mut store = TreeStore::default();
+        for (j, (file, lang)) in jobs.iter().enumerate() {
+            if words.source(j).is_none() {
+                continue;
+            }
+            let i = match store.by_path.get(file.as_str()) {
+                Some(&i) => {
+                    // A path given twice keeps its first place and its last grammar.
+                    store.files[i].lang = lang;
+                    i
+                }
+                None => {
+                    store.by_path.insert(file.clone(), store.files.len());
+                    store.files.push(StoreEntry { path: file.clone(), lang, parsed: OnceCell::new() });
+                    store.files.len() - 1
+                }
+            };
+            store.entry_of_job.insert(j, i);
+        }
+        store.words = Some(words);
+        store
+    }
+
     /// Parse `source` and add it under `file`, replacing an earlier entry.
     /// Tests and template bodies use this for text with no file behind it, so
     /// it bypasses the cache.
@@ -254,22 +298,69 @@ impl TreeStore {
     }
 
     fn put(&mut self, file: &str, entry: std::rc::Rc<ParsedFile>) {
+        let e = StoreEntry { path: file.to_string(), lang: entry.lang, parsed: OnceCell::from(Some(entry)) };
         match self.by_path.get(file) {
-            Some(&i) => self.files[i].1 = entry,
+            Some(&i) => self.files[i] = e,
             None => {
                 self.by_path.insert(file.to_string(), self.files.len());
-                self.files.push((file.to_string(), entry));
+                self.files.push(e);
             }
         }
     }
 
     pub fn get(&self, file: &str) -> Option<&ParsedFile> {
-        self.by_path.get(file).map(|&i| &*self.files[i].1)
+        self.by_path.get(file).and_then(|&i| self.files[i].parsed())
     }
 
-    /// (path, parsed file) in insertion order.
+    /// (path, parsed file) in insertion order, every file parsed.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &ParsedFile)> {
-        self.files.iter().map(|(f, p)| (f.as_str(), &**p))
+        self.files.iter().filter_map(|e| e.parsed().map(|p| (e.path.as_str(), p)))
+    }
+
+    /// (path, grammar) of every file in insertion order, none parsed.
+    pub fn paths(&self) -> impl Iterator<Item = (&str, &'static str)> {
+        self.files.iter().map(|e| (e.path.as_str(), e.lang))
+    }
+
+    /// The text of `file` without parsing it.
+    pub fn source(&self, file: &str) -> Option<crate::parsed::Source> {
+        let &i = self.by_path.get(file)?;
+        let e = &self.files[i];
+        match e.parsed.get() {
+            Some(p) => p.as_ref().map(|p| p.source.clone()),
+            None => crate::parsed::source(&e.path),
+        }
+    }
+
+    /// The files whose text holds one of `names` as a whole word, in
+    /// insertion order, parsed. Every other file is left unparsed. A file
+    /// that cannot hold a name cannot define, call or bind it.
+    pub fn holding(&self, names: &[&str]) -> Vec<(&str, &ParsedFile)> {
+        let idx: Vec<usize> = match &self.words {
+            Some(w) => {
+                let mut v: Vec<usize> = names
+                    .iter()
+                    .flat_map(|n| w.holders(n))
+                    .filter_map(|j| self.entry_of_job.get(&j).copied())
+                    .collect();
+                v.sort();
+                v.dedup();
+                v
+            }
+            None => (0..self.files.len())
+                .filter(|&i| self.files[i].parsed().is_some_and(|p| scoped::holds_any(&p.source, names)))
+                .collect(),
+        };
+        idx.into_iter().filter_map(|i| self.files[i].parsed().map(|p| (self.files[i].path.as_str(), p))).collect()
+    }
+
+    /// The path of the parsed file whose text is `src`, by address.
+    pub fn file_of(&self, src: &[u8]) -> Option<&str> {
+        let ptr = src.as_ptr();
+        self.files.iter().find_map(|e| match e.parsed.get() {
+            Some(Some(p)) if p.source.as_ptr() == ptr => Some(e.path.as_str()),
+            _ => None,
+        })
     }
 
     pub fn len(&self) -> usize {

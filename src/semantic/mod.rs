@@ -106,22 +106,22 @@ pub fn segment_rows(seg: &Query, store: &TreeStore) -> Result<Vec<(String, Vec<c
     let mut first_err: Option<String> = None;
     let mut accepted = false;
     let mut out = Vec::new();
-    for (file, pf) in store.iter() {
-        if pf.tree.is_none() {
-            continue;
-        }
-        let Some(lang) = compiler::lang::for_name(pf.lang) else { continue };
-        let checked = compiler::validate(seg, lang.as_ref(), pf.lang)
-            .and_then(|_| attrs::check_lang(&attrs, pf.lang));
+    for (file, lang_name) in store.paths() {
+        // A file with no grammar has no tree. Checked without parsing, so a
+        // file the needles rule out is never parsed.
+        let Some(lang) = compiler::lang::for_name(lang_name) else { continue };
+        let checked = compiler::validate(seg, lang.as_ref(), lang_name)
+            .and_then(|_| attrs::check_lang(&attrs, lang_name));
         if let Err(e) = checked {
             first_err.get_or_insert(e);
             continue;
         }
         accepted = true;
         // A file lacking a name the segment filters on cannot hold a row.
-        if !needles.holds(&pf.source) {
+        if !needles.is_none() && !store.source(file).is_some_and(|s| needles.holds(&s)) {
             continue;
         }
+        let Some(pf) = store.get(file) else { continue };
         let Some(tree) = &pf.tree else { continue };
         let compiled = compiled_segment(seg, lang.as_ref(), pf.lang);
         let rows = crate::runner::run_rows_on(&compiled, lang.as_ref(), &pf.source, tree, false)?;
@@ -164,6 +164,15 @@ fn compiled_segment(seg: &Query, lang: &dyn compiler::lang::Lang, lang_name: &'s
 /// line starts its code. The header ends where its body starts, or with the
 /// declaration when it has none.
 pub fn def_headers(file: &str, root: Node, source: &[u8], index: &DefIndex) -> Vec<(usize, usize, usize)> {
+    header_spans(root, source, index.defs.iter().enumerate().filter(|(_, d)| d.id.file == file))
+}
+
+/// `def_headers` over the given (key, definition) pairs of one file.
+fn header_spans<'d>(
+    root: Node,
+    source: &[u8],
+    defs: impl Iterator<Item = (usize, &'d crate::resolve::Def)>,
+) -> Vec<(usize, usize, usize)> {
     let mut line_starts = vec![0usize];
     for (i, b) in source.iter().enumerate() {
         if *b == b'\n' {
@@ -171,10 +180,7 @@ pub fn def_headers(file: &str, root: Node, source: &[u8], index: &DefIndex) -> V
         }
     }
     let mut out = Vec::new();
-    for (i, d) in index.defs.iter().enumerate() {
-        if d.id.file != file {
-            continue;
-        }
+    for (i, d) in defs {
         let Some(&ls) = line_starts.get(d.id.line.saturating_sub(1)) else { continue };
         let col = source[ls..]
             .iter()
@@ -197,6 +203,27 @@ pub fn def_headers(file: &str, root: Node, source: &[u8], index: &DefIndex) -> V
         out.push((i, node.start_byte(), end));
     }
     out
+}
+
+/// Names of the definitions `segment_defs` would give, read from each
+/// matching file's own definitions, so no index is needed. A file's
+/// definitions are the ones the index holds for it, so the names are the
+/// same.
+pub fn segment_def_names(seg: &Query, store: &TreeStore) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for (file, rows) in segment_rows(seg, store)? {
+        let Some(pf) = store.get(&file) else { continue };
+        let Some(tree) = &pf.tree else { continue };
+        let defs = crate::resolve::resolver_for(pf.lang).collect_defs_tree(&file, &pf.source, Some(tree));
+        for (i, start, end) in header_spans(tree.root_node(), &pf.source, defs.iter().enumerate()) {
+            if rows.iter().any(|r| r.start_byte < end && r.end_byte > start) {
+                out.push(defs[i].name.clone());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
 }
 
 #[cfg(test)]

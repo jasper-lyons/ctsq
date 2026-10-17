@@ -21,7 +21,7 @@ use tree_sitter::Node;
 use super::Hop;
 use crate::config::{LangConfig, Slot};
 use crate::resolve::go::{binding_type_qualified, go_imports};
-use crate::resolve::graph::CallGraph;
+use crate::resolve::scoped::{FlowGraph, Site};
 use crate::resolve::{DefIndex, DefKind, TreeStore};
 
 const FUNCTIONS: &[&str] = &["function_declaration", "method_declaration", "func_literal"];
@@ -437,16 +437,12 @@ pub type UpEnd<'e> = dyn Fn(&str, Node) -> bool + 'e;
 /// The upward walk over every Go file in a store.
 pub struct Up<'a> {
     pub store: &'a TreeStore,
-    pub graph: &'a CallGraph,
+    pub graph: &'a FlowGraph,
     /// Models, when loaded. Without them every outside call is unmodelled.
     pub cfg: Option<&'a LangConfig>,
     /// Deepest chain of function crossings followed.
     pub max: usize,
     pub end: Option<&'a UpEnd<'a>>,
-    /// (file, call start, call end) to indices into `graph.sites`.
-    sites: HashMap<(String, usize, usize), Vec<usize>>,
-    /// def to the sites that call it.
-    callers: HashMap<usize, Vec<usize>>,
     /// (def, slot) being walked, against recursion.
     active: RefCell<Vec<(usize, String)>>,
     depth: Cell<usize>,
@@ -455,25 +451,13 @@ pub struct Up<'a> {
 }
 
 impl<'a> Up<'a> {
-    pub fn new(store: &'a TreeStore, graph: &'a CallGraph, cfg: Option<&'a LangConfig>, max: usize) -> Up<'a> {
-        let mut sites: HashMap<(String, usize, usize), Vec<usize>> = HashMap::new();
-        let mut callers: HashMap<usize, Vec<usize>> = HashMap::new();
-        for (i, s) in graph.sites.iter().enumerate() {
-            if let Some(d) = graph.index.defs.get(s.caller) {
-                sites.entry((d.id.file.clone(), s.start_byte, s.end_byte)).or_default().push(i);
-            }
-            if let Some((t, _)) = s.target {
-                callers.entry(t).or_default().push(i);
-            }
-        }
+    pub fn new(store: &'a TreeStore, graph: &'a FlowGraph, cfg: Option<&'a LangConfig>, max: usize) -> Up<'a> {
         Up {
             store,
             graph,
             cfg,
             max,
             end: None,
-            sites,
-            callers,
             active: RefCell::new(vec![]),
             depth: Cell::new(0),
             budget: Cell::new(BUDGET),
@@ -493,27 +477,17 @@ impl<'a> Up<'a> {
 
     /// The def index of a function node, matched by file and line.
     pub fn def_of(&self, file: &str, func: Node) -> Option<usize> {
-        let line = line_of(func);
-        self.graph.index.defs.iter().position(|d| {
-            d.id.file == file && d.id.line == line && !matches!(d.kind, DefKind::InterfaceMethod { .. })
-        })
+        self.graph.def_at(file, line_of(func))
     }
 
     /// Sites calling `def`, in file then document order.
-    pub fn callers_of(&self, def: usize) -> Vec<usize> {
-        let mut v = self.callers.get(&def).cloned().unwrap_or_default();
-        v.sort_by_key(|&i| {
-            let s = &self.graph.sites[i];
-            (self.graph.index.defs[s.caller].id.file.clone(), s.start_byte)
-        });
-        v.dedup();
-        v
+    pub fn callers_of(&self, def: usize) -> Vec<std::rc::Rc<Site>> {
+        self.graph.callers_of(def)
     }
 
     /// In-repo targets of a call node.
     pub fn targets(&self, file: &str, call: Node) -> Option<Vec<usize>> {
-        let ids = self.sites.get(&(file.to_string(), call.start_byte(), call.end_byte()))?;
-        let t: Vec<usize> = ids.iter().filter_map(|&i| self.graph.sites[i].target.map(|(t, _)| t)).collect();
+        let t = self.graph.site_targets(file, call.start_byte(), call.end_byte())?;
         if t.is_empty() {
             None
         } else {
@@ -523,9 +497,8 @@ impl<'a> Up<'a> {
 
     /// The node of argument `pos` at caller site `site`, with its file, or
     /// the receiver when `receiver`.
-    pub fn arg_at(&self, site: usize, pos: usize, receiver: bool) -> Option<(String, Node<'a>)> {
-        let s = &self.graph.sites[site];
-        let file = self.graph.index.defs[s.caller].id.file.clone();
+    pub fn arg_at(&self, s: &Site, pos: usize, receiver: bool) -> Option<(String, Node<'a>)> {
+        let file = s.file.clone();
         let (root, _) = self.tree(&file)?;
         if receiver {
             let call = root.descendant_for_byte_range(s.start_byte, s.end_byte)?;
@@ -685,7 +658,7 @@ impl<'a> Up<'a> {
         self.depth.set(self.depth.get() + 1);
         let mut children = vec![];
         for s in sites {
-            let Some((cfile, arg)) = self.arg_at(s, pos, receiver) else { continue };
+            let Some((cfile, arg)) = self.arg_at(&s, pos, receiver) else { continue };
             let Some((croot, csrc)) = self.tree(&cfile) else { continue };
             let o = fold("moved", vec![self.expr(&cfile, croot, csrc, arg, 0)]);
             children.push(self.hop(&cfile, csrc, arg, function_at(croot, arg.start_byte()), o));
@@ -832,7 +805,7 @@ impl<'a> Up<'a> {
             if self.active.borrow().contains(&mark) {
                 continue;
             }
-            let d = &self.graph.index.defs[t];
+            let d = self.graph.def(t);
             let Some((root, src)) = self.tree(&d.id.file) else { continue };
             let file = d.id.file.clone();
             let Some(func) = func_at_line(root, d.id.line) else { continue };
@@ -1029,7 +1002,7 @@ mod tests {
     fn a_param_walks_to_each_callers_argument() {
         let src = "package t\nfunc r(n string) {}\nfunc a() { r(\"x\") }\nfunc b() { v := \"y\"; r(v) }\n";
         let s = store(&[("t/a.go", src)]);
-        let g = crate::resolve::graph::build_from_store(&s);
+        let g = crate::resolve::scoped::FlowGraph::whole(&crate::resolve::graph::build_from_store(&s));
         let up = Up::new(&s, &g, None, 12);
         let root = s.get("t/a.go").unwrap().tree.as_ref().unwrap().root_node();
         let h = up.start("t/a.go", ident(root, src, "n", 0)).unwrap();
@@ -1044,7 +1017,7 @@ mod tests {
     fn a_call_result_goes_back_into_the_callee_return() {
         let src = "package t\nfunc mk() string {\n\treturn \"lit\"\n}\nfunc F() {\n\tq := mk()\n\t_ = q\n}\n";
         let s = store(&[("t/a.go", src)]);
-        let g = crate::resolve::graph::build_from_store(&s);
+        let g = crate::resolve::scoped::FlowGraph::whole(&crate::resolve::graph::build_from_store(&s));
         let up = Up::new(&s, &g, None, 12);
         let root = s.get("t/a.go").unwrap().tree.as_ref().unwrap().root_node();
         let h = up.start("t/a.go", ident(root, src, "q", 0)).unwrap();
@@ -1057,7 +1030,7 @@ mod tests {
     fn a_field_read_goes_back_to_its_store_and_an_outside_call_is_unmodelled() {
         let src = "package t\nimport \"x/y\"\ntype B struct{ P string }\nfunc F() {\n\tb := B{}\n\tb.P = y.Get()\n\tq := b.P\n\t_ = q\n}\n";
         let s = store(&[("t/a.go", src)]);
-        let g = crate::resolve::graph::build_from_store(&s);
+        let g = crate::resolve::scoped::FlowGraph::whole(&crate::resolve::graph::build_from_store(&s));
         let up = Up::new(&s, &g, None, 12);
         let root = s.get("t/a.go").unwrap().tree.as_ref().unwrap().root_node();
         let h = up.start("t/a.go", ident(root, src, "q", 0)).unwrap();
@@ -1070,7 +1043,7 @@ mod tests {
     fn recursion_and_max_depth_stop() {
         let src = "package t\nfunc r(n int) { r(n - 1) }\nfunc a() { r(3) }\n";
         let s = store(&[("t/a.go", src)]);
-        let g = crate::resolve::graph::build_from_store(&s);
+        let g = crate::resolve::scoped::FlowGraph::whole(&crate::resolve::graph::build_from_store(&s));
         let root = s.get("t/a.go").unwrap().tree.as_ref().unwrap().root_node();
         let up = Up::new(&s, &g, None, 12);
         let h = up.start("t/a.go", ident(root, src, "n", 0)).unwrap();

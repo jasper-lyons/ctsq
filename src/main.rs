@@ -1517,6 +1517,34 @@ fn run_refs(
     }
 }
 
+/// Routes of a call query over the graph its walk reads (plans/perf/scoped-graph.md,
+/// section path): the edges into every definition within `--max` calls of an
+/// end set. When a start has no route within `--max`, telling a cut route
+/// from none needs the walk without that bound, so the graph is built again
+/// over every caller of the end sets at any depth. None when the query's
+/// scope cannot be read, so the caller builds the whole graph.
+fn scoped_call_routes(
+    ast: &query::ast::Query,
+    jobs: &[(String, &'static str)],
+    words: &std::rc::Rc<resolve::scoped::Words>,
+    store: &resolve::TreeStore,
+    opts: &semantic::calls::CallOptions,
+) -> Option<Result<semantic::calls::CallRoutes, String>> {
+    let (ends, all) = semantic::calls::scope_names(ast, store)?;
+    let mut p = resolve::scoped::Prepared::with_words(jobs, words.clone());
+    p.cover(&all);
+    let near = p.build_keep(&resolve::scoped::Seeds { names: ends.clone(), up: opts.max, down: 0 });
+    Some(match semantic::calls::evaluate_calls_near(ast, store, &near, opts) {
+        Ok(Some(r)) => Ok(r),
+        Ok(None) => {
+            drop(near);
+            let wide = p.build_keep(&resolve::scoped::Seeds { names: ends, up: usize::MAX, down: 0 });
+            semantic::calls::evaluate_calls(ast, store, &wide, opts)
+        }
+        Err(e) => Err(e),
+    })
+}
+
 /// `ctsq path`. Returns the exit code: 0 routes found, 1 none or an unknown
 /// kind, 2 usage or query error.
 #[allow(clippy::too_many_arguments)]
@@ -1562,9 +1590,16 @@ fn run_path(
         .iter()
         .flat_map(|p| files::resolve_jobs_lenient(p, lang_override, no_ignore))
         .collect();
-    let store = resolve::TreeStore::build(&jobs);
-    let graph = resolve::graph::build_from_store(&store);
+    let words = std::rc::Rc::new(resolve::scoped::Words::new(&jobs));
+    let store = resolve::TreeStore::lazy(&jobs, words.clone());
     if flows {
+        // The flow engine asks the graph one call or one name at a time, and
+        // a lazy graph answers each from the files that can change it.
+        let graph = if resolve::scoped::whole() {
+            resolve::scoped::FlowGraph::whole(&resolve::graph::build_from_store(&store))
+        } else {
+            resolve::scoped::FlowGraph::lazy(&jobs, words.clone())
+        };
         let scan = std::path::Path::new(&paths[0]);
         let root = config::find_repo_root(scan);
         let opts = semantic::flows::FlowOptions { max, only: only.to_vec(), expand };
@@ -1580,7 +1615,12 @@ fn run_path(
         };
     }
     let opts = semantic::calls::CallOptions { max, all, ..Default::default() };
-    match semantic::calls::evaluate_calls(&ast, &store, &graph, &opts) {
+    let scoped = if resolve::scoped::whole() { None } else { scoped_call_routes(&ast, &jobs, &words, &store, &opts) };
+    let result = scoped.unwrap_or_else(|| {
+        let graph = resolve::graph::build_from_store(&store);
+        semantic::calls::evaluate_calls(&ast, &store, &graph, &opts)
+    });
+    match result {
         Ok(routes) => {
             print!(
                 "{}",

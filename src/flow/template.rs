@@ -27,7 +27,7 @@ use super::{Hop, Paths};
 use crate::config::models::TemplateLoad;
 use crate::config::{gomod, LangConfig, Mechanics};
 use crate::query::ast::Query;
-use crate::resolve::graph::CallGraph;
+use crate::resolve::scoped::FlowGraph;
 use crate::resolve::TreeStore;
 
 /// Import paths of the template packages.
@@ -85,7 +85,7 @@ struct Chain<'t> {
 /// Links template calls to their templates.
 pub struct Linker<'a> {
     pub store: &'a TreeStore,
-    pub graph: &'a CallGraph,
+    pub graph: &'a FlowGraph,
     pub cfg: &'a LangConfig,
 }
 

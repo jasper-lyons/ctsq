@@ -351,6 +351,21 @@ pub struct FileScope {
 }
 
 impl FileScope {
+    /// The declaration line of each function, and for each call (start byte,
+    /// end byte) its (function, call) position, the order `resolve_model`
+    /// emits sites in.
+    pub(crate) fn call_positions(&self) -> (Vec<usize>, HashMap<(usize, usize), (usize, usize)>) {
+        let mut at = HashMap::new();
+        for (f, fun) in self.fns.iter().enumerate() {
+            for (c, call) in fun.calls.iter().enumerate() {
+                at.entry((call.start_byte, call.end_byte)).or_insert((f, c));
+            }
+        }
+        (self.fns.iter().map(|f| f.line).collect(), at)
+    }
+}
+
+impl FileScope {
     fn build(root: Node, source: &[u8]) -> FileScope {
         let mut s = FileScope { imports: HashMap::new(), globs: vec![], fns: vec![] };
         let mut fn_stack = Vec::new();

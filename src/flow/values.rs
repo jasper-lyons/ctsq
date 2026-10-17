@@ -11,7 +11,7 @@ use std::path::Path;
 use tree_sitter::Node;
 
 use super::upward::{reaching, Def, Up};
-use crate::resolve::graph::CallGraph;
+use crate::resolve::scoped::FlowGraph;
 use crate::resolve::TreeStore;
 
 /// The strings an expression can hold, each with the file and line it was
@@ -66,7 +66,7 @@ impl ValueSet {
 const MAX_PRODUCT: usize = 16;
 
 /// The value set of string expression `node` in `file`.
-pub fn value_set(store: &TreeStore, graph: &CallGraph, file: &str, node: Node) -> ValueSet {
+pub fn value_set(store: &TreeStore, graph: &FlowGraph, file: &str, node: Node) -> ValueSet {
     let up = Up::new(store, graph, None, usize::MAX);
     let w = Walk { store, up, active: RefCell::new(vec![]) };
     w.expr(file, node)
@@ -237,7 +237,7 @@ impl<'a> Walk<'a> {
         self.active.borrow_mut().push((def, pos));
         let mut out = ValueSet::default();
         for s in sites {
-            match self.up.arg_at(s, pos, false) {
+            match self.up.arg_at(&s, pos, false) {
                 Some((f, a)) => out.join(self.expr(&f, a)),
                 None => out.join(ValueSet::open(format!("a call of {} without argument {}", fname, pos + 1))),
             }
@@ -257,7 +257,7 @@ mod tests {
         for (f, src) in files {
             store.insert(f, "go", src.as_bytes().to_vec());
         }
-        let g = crate::resolve::graph::build_from_store(&store);
+        let g = crate::resolve::scoped::FlowGraph::whole(&crate::resolve::graph::build_from_store(&store));
         let src = files[0].1;
         // A whole-word occurrence, so `n` does not match inside `func`.
         let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');

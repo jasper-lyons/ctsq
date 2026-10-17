@@ -18,6 +18,8 @@
 use super::graph::{self, CallGraph, Loaded, NodeKey};
 use super::{DefId, Want};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// What a walk starts from and how far it goes.
 pub struct Seeds {
@@ -48,6 +50,17 @@ impl<'a> Prepared<'a> {
         Prepared(Scope::new(jobs))
     }
 
+    /// A scoped build over a word index the caller already built.
+    pub fn with_words(jobs: &'a [(String, &'static str)], words: Rc<Words>) -> Prepared<'a> {
+        Prepared(Scope::with_words(jobs, words))
+    }
+
+    /// Put every file holding one of `names` in the index, so definitions a
+    /// caller reads by those names are all there, without walking from them.
+    pub fn cover(&mut self, names: &[String]) {
+        self.0.cover(names);
+    }
+
     /// Read job `j` from a parse of it, if it is not read yet. A file read
     /// that no walk needs only adds definitions the index may hold anyway.
     pub fn offer(&mut self, j: usize, p: &crate::parsed::ParsedFile) {
@@ -56,7 +69,12 @@ impl<'a> Prepared<'a> {
         }
     }
 
-    pub fn build(self, seeds: &Seeds) -> CallGraph {
+    pub fn build(mut self, seeds: &Seeds) -> CallGraph {
+        self.0.run(seeds)
+    }
+
+    /// `build`, keeping every file read so far for a later, wider build.
+    pub fn build_keep(&mut self, seeds: &Seeds) -> CallGraph {
         self.0.run(seeds)
     }
 }
@@ -75,7 +93,7 @@ enum State {
 
 struct Scope<'a> {
     jobs: &'a [(String, &'static str)],
-    words: Words,
+    words: Rc<Words>,
     files: Vec<State>,
     /// Names whose holding files are all loaded.
     covered: HashSet<String>,
@@ -84,6 +102,10 @@ struct Scope<'a> {
 
 impl<'a> Scope<'a> {
     fn new(jobs: &'a [(String, &'static str)]) -> Scope<'a> {
+        Scope::with_words(jobs, Rc::new(Words::new(jobs)))
+    }
+
+    fn with_words(jobs: &'a [(String, &'static str)], words: Rc<Words>) -> Scope<'a> {
         let mut job_of: HashMap<&str, usize> = HashMap::new();
         let mut files = Vec::with_capacity(jobs.len());
         for (i, (f, _)) in jobs.iter().enumerate() {
@@ -94,7 +116,7 @@ impl<'a> Scope<'a> {
                 files.push(State::Unread);
             }
         }
-        Scope { jobs, words: Words::new(jobs), files, covered: HashSet::new(), job_of }
+        Scope { jobs, words, files, covered: HashSet::new(), job_of }
     }
 
     /// Read job `j`: its definitions and its calls, so it is parsed once
@@ -131,7 +153,7 @@ impl<'a> Scope<'a> {
             .collect()
     }
 
-    fn run(mut self, seeds: &Seeds) -> CallGraph {
+    fn run(&mut self, seeds: &Seeds) -> CallGraph {
         self.cover(&seeds.names);
         let mut up_front: Vec<(NodeKey, String)> = Vec::new();
         let mut down_front: Vec<DefId> = Vec::new();
@@ -249,7 +271,7 @@ impl<'a> Scope<'a> {
 /// A definition's name, and a call's callee name, is a token of its file,
 /// and a lexer takes the longest run of identifier bytes, so a file holding
 /// a name holds it bounded by bytes that cannot continue it.
-struct Words {
+pub(crate) struct Words {
     sources: Vec<Option<crate::parsed::Source>>,
     tokens: HashMap<Box<str>, Vec<u32>>,
 }
@@ -259,7 +281,7 @@ fn word_byte(b: u8) -> bool {
 }
 
 impl Words {
-    fn new(jobs: &[(String, &'static str)]) -> Words {
+    pub(crate) fn new(jobs: &[(String, &'static str)]) -> Words {
         let mut tokens: HashMap<Box<str>, Vec<u32>> = HashMap::new();
         let mut sources = Vec::with_capacity(jobs.len());
         for (j, (file, _)) in jobs.iter().enumerate() {
@@ -295,8 +317,13 @@ impl Words {
         Words { sources, tokens }
     }
 
+    /// The text of job `j`, None when it could not be read.
+    pub(crate) fn source(&self, j: usize) -> Option<&crate::parsed::Source> {
+        self.sources.get(j).and_then(|s| s.as_ref())
+    }
+
     /// Jobs whose file holds `name`, in job order.
-    fn holders(&self, name: &str) -> Vec<usize> {
+    pub(crate) fn holders(&self, name: &str) -> Vec<usize> {
         if !name.is_empty() && name.bytes().all(word_byte) {
             return self.tokens.get(name).map(|v| v.iter().map(|&j| j as usize).collect()).unwrap_or_default();
         }
@@ -341,6 +368,368 @@ pub(crate) fn holds_any(hay: &[u8], names: &[&str]) -> bool {
         }
         false
     })
+}
+
+/// One call site as the flow engine reads it: `CallSite` with its file, and
+/// its caller and target as `FlowGraph` definition keys.
+#[derive(Debug, Clone)]
+pub struct Site {
+    pub file: String,
+    pub caller: usize,
+    pub target: Option<usize>,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub args: Vec<(usize, usize)>,
+}
+
+/// The call graph as the flow engine (`path` with `=>`, `==>`, `<=`, `<==`)
+/// reads it: the sites of a call, the callers of a definition, the
+/// definitions of a name and the definition at a line. Definitions are keys
+/// handed out by the graph. A lazy graph answers each question from the
+/// files that can change the answer, loading and resolving them on first
+/// use, so the answer equals the whole-folder graph's:
+/// - the sites of a call: its file, resolved for the function holding it,
+///   against an index grown until no name it asks is uncovered;
+/// - the callers of a definition named N: every file holding N, resolved for
+///   the calls that can reach N;
+/// - the definitions named N, or interface N: the files holding N.
+///
+/// Keys of a lazy graph are handed out in the order definitions are first
+/// met, so every answer that lists definitions orders them as the whole
+/// index does (job order, then file order) rather than by key.
+pub struct FlowGraph {
+    kind: FlowKind,
+}
+
+enum FlowKind {
+    Whole(WholeFlow),
+    Lazy(RefCell<LazyFlow>),
+}
+
+struct WholeFlow {
+    defs: Vec<Rc<super::Def>>,
+    by_name: HashMap<String, Vec<usize>>,
+    sites: Vec<Rc<Site>>,
+    ranges: HashMap<(String, usize, usize), Vec<usize>>,
+    callers: HashMap<usize, Vec<usize>>,
+}
+
+/// What a lazy graph has resolved in one file: its sites by emission
+/// position (function, call, target), and which functions and callee names
+/// it was resolved for.
+#[derive(Default)]
+struct FileSites {
+    sites: std::collections::BTreeMap<(usize, usize, usize), Rc<Site>>,
+    lines: HashSet<usize>,
+    names: HashSet<String>,
+}
+
+struct LazyFlow {
+    jobs: Vec<(String, &'static str)>,
+    words: Rc<Words>,
+    job_of: HashMap<String, usize>,
+    files: Vec<State>,
+    covered: HashSet<String>,
+    /// The index over the loaded files with each entry's (job, position in
+    /// its file), rebuilt when a file is loaded.
+    index: Option<(super::DefIndex, Vec<(usize, usize)>)>,
+    defs: Vec<Rc<super::Def>>,
+    key_of: HashMap<(usize, usize), usize>,
+    /// Each key's (job, position), for ordering.
+    place: Vec<(usize, usize)>,
+    resolved: HashMap<usize, FileSites>,
+}
+
+impl FlowGraph {
+    pub fn whole(g: &CallGraph) -> FlowGraph {
+        let defs: Vec<Rc<super::Def>> = g.index.defs.iter().map(|d| Rc::new(d.clone())).collect();
+        let mut sites = Vec::new();
+        let mut ranges: HashMap<(String, usize, usize), Vec<usize>> = HashMap::new();
+        let mut callers: HashMap<usize, Vec<usize>> = HashMap::new();
+        for s in &g.sites {
+            let Some(d) = g.index.defs.get(s.caller) else { continue };
+            let i = sites.len();
+            ranges.entry((d.id.file.clone(), s.start_byte, s.end_byte)).or_default().push(i);
+            if let Some((t, _)) = s.target {
+                callers.entry(t).or_default().push(i);
+            }
+            sites.push(Rc::new(Site {
+                file: d.id.file.clone(),
+                caller: s.caller,
+                target: s.target.map(|(t, _)| t),
+                start_byte: s.start_byte,
+                end_byte: s.end_byte,
+                args: s.args.clone(),
+            }));
+        }
+        FlowGraph { kind: FlowKind::Whole(WholeFlow { defs, by_name: g.index.by_name.clone(), sites, ranges, callers }) }
+    }
+
+    pub fn lazy(jobs: &[(String, &'static str)], words: Rc<Words>) -> FlowGraph {
+        let mut job_of: HashMap<String, usize> = HashMap::new();
+        let mut files = Vec::with_capacity(jobs.len());
+        for (i, (f, _)) in jobs.iter().enumerate() {
+            if job_of.contains_key(f.as_str()) {
+                files.push(State::Skipped);
+            } else {
+                job_of.insert(f.clone(), i);
+                files.push(State::Unread);
+            }
+        }
+        let jobs = jobs.to_vec();
+        FlowGraph {
+            kind: FlowKind::Lazy(RefCell::new(LazyFlow {
+                jobs,
+                words,
+                job_of,
+                files,
+                covered: HashSet::new(),
+                index: None,
+                defs: Vec::new(),
+                key_of: HashMap::new(),
+                place: Vec::new(),
+                resolved: HashMap::new(),
+            })),
+        }
+    }
+
+    /// The definition behind key `i`.
+    pub fn def(&self, i: usize) -> Rc<super::Def> {
+        match &self.kind {
+            FlowKind::Whole(w) => w.defs[i].clone(),
+            FlowKind::Lazy(l) => l.borrow().defs[i].clone(),
+        }
+    }
+
+    /// The targets of the sites at (start, end) in `file`, in site order,
+    /// unresolved ones left out. None when no site is there.
+    pub fn site_targets(&self, file: &str, start: usize, end: usize) -> Option<Vec<usize>> {
+        match &self.kind {
+            FlowKind::Whole(w) => {
+                let ids = w.ranges.get(&(file.to_string(), start, end))?;
+                Some(ids.iter().filter_map(|&i| w.sites[i].target).collect())
+            }
+            FlowKind::Lazy(l) => l.borrow_mut().site_targets(file, start, end),
+        }
+    }
+
+    /// Sites calling `def`, in file then document order.
+    pub fn callers_of(&self, def: usize) -> Vec<Rc<Site>> {
+        match &self.kind {
+            FlowKind::Whole(w) => {
+                let mut v = w.callers.get(&def).cloned().unwrap_or_default();
+                v.sort_by_key(|&i| (w.sites[i].file.clone(), w.sites[i].start_byte));
+                v.dedup();
+                v.into_iter().map(|i| w.sites[i].clone()).collect()
+            }
+            FlowKind::Lazy(l) => l.borrow_mut().callers_of(def),
+        }
+    }
+
+    /// The first definition, in index order, declared in `file` at `line`
+    /// that is not an interface method.
+    pub fn def_at(&self, file: &str, line: usize) -> Option<usize> {
+        let fits = |d: &super::Def| {
+            d.id.file == file && d.id.line == line && !matches!(d.kind, super::DefKind::InterfaceMethod { .. })
+        };
+        match &self.kind {
+            FlowKind::Whole(w) => w.defs.iter().position(|d| fits(d)),
+            FlowKind::Lazy(l) => {
+                let mut l = l.borrow_mut();
+                let &j = l.job_of.get(file)?;
+                l.load(j);
+                let k = match &l.files[j] {
+                    State::Loaded(ld) => ld.defs.iter().position(fits)?,
+                    _ => return None,
+                };
+                Some(l.key(j, k))
+            }
+        }
+    }
+
+    /// The definitions named `name`, in index order.
+    pub fn by_name(&self, name: &str) -> Vec<usize> {
+        match &self.kind {
+            FlowKind::Whole(w) => w.by_name.get(name).cloned().unwrap_or_default(),
+            FlowKind::Lazy(l) => l.borrow_mut().by_name(name),
+        }
+    }
+
+    /// Whether some interface named `name` declares a method.
+    pub fn is_interface(&self, name: &str) -> bool {
+        let is = |d: &super::Def| matches!(&d.kind, super::DefKind::InterfaceMethod { interface } if interface == name);
+        match &self.kind {
+            FlowKind::Whole(w) => w.defs.iter().any(|d| is(d)),
+            FlowKind::Lazy(l) => {
+                let mut l = l.borrow_mut();
+                l.cover(&[name.to_string()]);
+                l.words.holders(name).into_iter().any(|j| match &l.files[j] {
+                    State::Loaded(ld) => ld.defs.iter().any(is),
+                    _ => false,
+                })
+            }
+        }
+    }
+}
+
+impl LazyFlow {
+    fn load(&mut self, j: usize) {
+        if !matches!(self.files[j], State::Unread) {
+            return;
+        }
+        let (file, lang) = &self.jobs[j];
+        self.files[j] = match crate::parsed::get(file, lang) {
+            Some(p) => State::Loaded(Loaded::read(file, &p)),
+            None => State::Skipped,
+        };
+        self.index = None;
+    }
+
+    fn cover(&mut self, names: &[String]) {
+        for n in names {
+            if self.covered.insert(n.clone()) {
+                for j in self.words.holders(n) {
+                    self.load(j);
+                }
+            }
+        }
+    }
+
+    fn key(&mut self, j: usize, k: usize) -> usize {
+        if let Some(&i) = self.key_of.get(&(j, k)) {
+            return i;
+        }
+        let State::Loaded(l) = &self.files[j] else { unreachable!("a key is only made for a loaded file") };
+        let i = self.defs.len();
+        self.defs.push(Rc::new(l.defs[k].clone()));
+        self.key_of.insert((j, k), i);
+        self.place.push((j, k));
+        i
+    }
+
+    fn by_name(&mut self, name: &str) -> Vec<usize> {
+        self.cover(&[name.to_string()]);
+        let mut out = Vec::new();
+        for j in self.words.holders(name) {
+            let ks: Vec<usize> = match &self.files[j] {
+                State::Loaded(l) => (0..l.defs.len()).filter(|&k| l.defs[k].name == name).collect(),
+                _ => continue,
+            };
+            for k in ks {
+                out.push(self.key(j, k));
+            }
+        }
+        out
+    }
+
+    fn ensure_index(&mut self) {
+        if self.index.is_some() {
+            return;
+        }
+        let mut owner = Vec::new();
+        let mut loaded = Vec::new();
+        for (j, s) in self.files.iter().enumerate() {
+            if let State::Loaded(l) = s {
+                owner.extend((0..l.defs.len()).map(|k| (j, k)));
+                loaded.push(l);
+            }
+        }
+        self.index = Some((graph::index_of(&loaded), owner));
+    }
+
+    /// Resolve job `j` for the functions declared at `lines` and the calls
+    /// that can reach a definition named in `names`, adding the sites.
+    fn resolve(&mut self, j: usize, lines: &HashSet<usize>, names: &HashSet<String>) {
+        self.load(j);
+        let fs = self.resolved.entry(j).or_default();
+        let lines: HashSet<usize> = lines.difference(&fs.lines).copied().collect();
+        let names: HashSet<String> = names.difference(&fs.names).cloned().collect();
+        if lines.is_empty() && names.is_empty() {
+            return;
+        }
+        fs.lines.extend(lines.iter().copied());
+        fs.names.extend(names.iter().cloned());
+        let sites = loop {
+            self.ensure_index();
+            let (index, _) = self.index.as_ref().expect("built");
+            let State::Loaded(l) = &self.files[j] else { return };
+            index.record();
+            let want = Want { names: &names, lines: Some(&lines) };
+            let (_, sites) = l.resolve(index, Some(&want));
+            let mut new: Vec<String> = index.take_asked().into_iter().filter(|n| !self.covered.contains(n)).collect();
+            if new.is_empty() {
+                break sites;
+            }
+            new.sort();
+            self.cover(&new);
+        };
+        let positions = match &self.files[j] {
+            State::Loaded(Loaded { model: super::FileModel::Go(scope), .. }) => scope.call_positions().1,
+            _ => HashMap::new(),
+        };
+        let file = self.jobs[j].0.clone();
+        let mut last: Option<((usize, usize), usize)> = None;
+        let mut made = Vec::new();
+        for s in sites {
+            let Some(&(f, c)) = positions.get(&(s.start_byte, s.end_byte)) else { continue };
+            // Interface dispatch gives one site per target, consecutively.
+            let k = match last {
+                Some((p, k)) if p == (f, c) => k + 1,
+                _ => 0,
+            };
+            last = Some(((f, c), k));
+            made.push(((f, c, k), s));
+        }
+        for (pos, s) in made {
+            if self.resolved[&j].sites.contains_key(&pos) {
+                continue;
+            }
+            let owner = &self.index.as_ref().expect("built").1;
+            let (cj, ck) = owner[s.caller];
+            let caller = self.key(cj, ck);
+            let target = s.target.map(|(t, _)| {
+                let (tj, tk) = self.index.as_ref().expect("built").1[t];
+                self.key(tj, tk)
+            });
+            let site = Site { file: file.clone(), caller, target, start_byte: s.start_byte, end_byte: s.end_byte, args: s.args };
+            self.resolved.get_mut(&j).expect("entry").sites.insert(pos, Rc::new(site));
+        }
+    }
+
+    fn site_targets(&mut self, file: &str, start: usize, end: usize) -> Option<Vec<usize>> {
+        let &j = self.job_of.get(file)?;
+        self.load(j);
+        let (lines, at) = match &self.files[j] {
+            State::Loaded(Loaded { model: super::FileModel::Go(scope), .. }) => scope.call_positions(),
+            _ => return None,
+        };
+        let &(f, c) = at.get(&(start, end))?;
+        self.resolve(j, &HashSet::from([lines[f]]), &HashSet::new());
+        let fs = &self.resolved[&j];
+        let here: Vec<&Rc<Site>> = fs.sites.range((f, c, 0)..=(f, c, usize::MAX)).map(|(_, s)| s).collect();
+        if here.is_empty() {
+            return None;
+        }
+        Some(here.iter().filter_map(|s| s.target).collect())
+    }
+
+    fn callers_of(&mut self, def: usize) -> Vec<Rc<Site>> {
+        let name = self.defs[def].name.clone();
+        self.cover(&[name.clone()]);
+        let names = HashSet::from([name.clone()]);
+        let mut out = Vec::new();
+        for j in self.words.holders(&name) {
+            if !matches!(self.files[j], State::Loaded(_)) {
+                continue;
+            }
+            self.resolve(j, &HashSet::new(), &names);
+            if let Some(fs) = self.resolved.get(&j) {
+                out.extend(fs.sites.values().filter(|s| s.target == Some(def)).cloned());
+            }
+        }
+        out.sort_by(|a, b| (&a.file, a.start_byte).cmp(&(&b.file, b.start_byte)));
+        out
+    }
 }
 
 #[cfg(test)]

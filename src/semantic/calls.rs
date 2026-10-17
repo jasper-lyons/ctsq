@@ -109,6 +109,63 @@ pub fn evaluate_calls(
     graph: &CallGraph,
     opts: &CallOptions,
 ) -> Result<CallRoutes, String> {
+    Ok(evaluate(query, store, graph, opts, true)?.expect("a whole graph answers every start"))
+}
+
+/// `evaluate_calls` over a graph that holds, of the whole graph, every edge
+/// into a definition within `opts.max` calls of an end set (`scope_names`).
+/// The walk reads no other edge. None when a start has no route within
+/// `max`: whether it has a longer one is a walk without that bound.
+pub fn evaluate_calls_near(
+    query: &Query,
+    store: &TreeStore,
+    graph: &CallGraph,
+    opts: &CallOptions,
+) -> Result<Option<CallRoutes>, String> {
+    evaluate(query, store, graph, opts, false)
+}
+
+/// The names a call query's graph is built from: the definitions every
+/// segment but the start matches (the walk reads edges into them and into
+/// their callers, up to `max` levels), and the definitions of every segment
+/// and `:not()`, which the index must hold. None when the query is not a
+/// well-formed call query, so the caller builds the whole graph and the
+/// evaluation reports the error.
+pub fn scope_names(query: &Query, store: &TreeStore) -> Option<(Vec<String>, Vec<String>)> {
+    let split = split_query(query).ok()?;
+    let down = |c: &Combinator| matches!(c, Combinator::Calls | Combinator::CallsEventually);
+    let up = |c: &Combinator| matches!(c, Combinator::CalledBy | Combinator::CalledByEventually);
+    if split.joins.is_empty() || !(split.joins.iter().all(down) || split.joins.iter().all(up)) {
+        return None;
+    }
+    let upward = split.joins.iter().all(up);
+    let mut names = Vec::new();
+    for seg in &split.segments {
+        names.push(super::segment_def_names(seg, store).ok()?);
+    }
+    // In call order every set but the first is a target of some leg.
+    let n = names.len();
+    let ends: Vec<String> = if upward { names[..n - 1].concat() } else { names[1..].concat() };
+    let mut all: Vec<String> = names.concat();
+    for sel in split.nots.iter().flatten() {
+        let q = Query { head: sel.clone(), tail: vec![] };
+        all.extend(super::segment_def_names(&q, store).ok()?);
+    }
+    let tidy = |mut v: Vec<String>| {
+        v.sort();
+        v.dedup();
+        v
+    };
+    Some((tidy(ends), tidy(all)))
+}
+
+fn evaluate(
+    query: &Query,
+    store: &TreeStore,
+    graph: &CallGraph,
+    opts: &CallOptions,
+    wide_ok: bool,
+) -> Result<Option<CallRoutes>, String> {
     let split = split_query(query)?;
     if split.joins.is_empty() {
         return Err("no call or data-flow arrow in the query, use one of -> --> <- <-- (calls) or => ==> <= <== (data flow)".into());
@@ -162,8 +219,13 @@ pub fn evaluate_calls(
         let mut chain: Vec<HashSet<usize>> = sets.iter().map(|v| v.iter().copied().collect()).collect();
         chain[start_pos] = HashSet::from([s]);
         let mut found = walk.chain_routes(&chain, &direct);
-        if found.is_empty() && !wide.chain_routes(&chain, &direct).is_empty() {
-            cut += 1;
+        if found.is_empty() {
+            if !wide_ok {
+                return Ok(None);
+            }
+            if !wide.chain_routes(&chain, &direct).is_empty() {
+                cut += 1;
+            }
         }
         found.sort_by(|a, b| {
             a.len().cmp(&b.len()).then_with(|| {
@@ -178,7 +240,7 @@ pub fn evaluate_calls(
         routes.extend(found.into_iter().map(|steps| to_route(s, &steps, graph)));
     }
 
-    Ok(CallRoutes {
+    Ok(Some(CallRoutes {
         routes,
         upward,
         segment_matches,
@@ -186,7 +248,7 @@ pub fn evaluate_calls(
         truncated: walk.truncated.get(),
         cut,
         max: opts.max,
-    })
+    }))
 }
 
 /// A route step: the def reached, and the call edge that reached it.
