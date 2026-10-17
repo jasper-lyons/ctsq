@@ -142,46 +142,42 @@ pub struct CallSite {
     pub args: Vec<(usize, usize)>,
 }
 
-#[allow(dead_code)] // wired by the path command
-/// One parsed file in a `TreeStore`.
-pub struct ParsedFile {
-    pub lang: &'static str,
-    pub source: Vec<u8>,
-    /// None when the language has no grammar here or the parse failed.
-    pub tree: Option<tree_sitter::Tree>,
-}
+/// One parsed file, shared with the process-wide cache in `parsed`.
+pub use crate::parsed::ParsedFile;
 
 #[allow(dead_code)] // wired by the path command
-/// Every file of one run, read and parsed once, shared by the call graph and
-/// the flow engine. Files keep the order they were added in.
+/// Every file of one run, shared by the call graph and the flow engine. A view
+/// over `parsed`: each file is read and parsed once per run, whoever asks
+/// first. Files keep the order they were added in.
 #[derive(Default)]
 pub struct TreeStore {
-    files: Vec<(String, ParsedFile)>,
+    files: Vec<(String, std::rc::Rc<ParsedFile>)>,
     by_path: HashMap<String, usize>,
 }
 
 #[allow(dead_code)] // wired by the path command
 impl TreeStore {
-    /// Read and parse every job. Unreadable files are left out.
+    /// Every job from the cache, parsing the ones not yet parsed. Unreadable
+    /// files are left out.
     pub fn build(jobs: &[(String, &'static str)]) -> TreeStore {
         let mut store = TreeStore::default();
         for (file, lang) in jobs {
-            if let Ok(source) = std::fs::read(file) {
-                store.insert(file, lang, source);
+            if let Some(p) = crate::parsed::get(file, lang) {
+                store.put(file, p);
             }
         }
         store
     }
 
     /// Parse `source` and add it under `file`, replacing an earlier entry.
-    /// Tests use this to build a store from inline sources.
+    /// Tests and template bodies use this for text with no file behind it, so
+    /// it bypasses the cache.
     pub fn insert(&mut self, file: &str, lang: &'static str, source: Vec<u8>) {
-        let tree = crate::compiler::lang::for_name(lang).and_then(|l| {
-            let mut parser = tree_sitter::Parser::new();
-            parser.set_language(&l.ts_language()).ok()?;
-            parser.parse(&source, None)
-        });
-        let entry = ParsedFile { lang, source, tree };
+        let tree = crate::parsed::parse_text(lang, &source);
+        self.put(file, std::rc::Rc::new(ParsedFile { lang, source: std::rc::Rc::new(source), tree }));
+    }
+
+    fn put(&mut self, file: &str, entry: std::rc::Rc<ParsedFile>) {
         match self.by_path.get(file) {
             Some(&i) => self.files[i].1 = entry,
             None => {
@@ -192,12 +188,12 @@ impl TreeStore {
     }
 
     pub fn get(&self, file: &str) -> Option<&ParsedFile> {
-        self.by_path.get(file).map(|&i| &self.files[i].1)
+        self.by_path.get(file).map(|&i| &*self.files[i].1)
     }
 
     /// (path, parsed file) in insertion order.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &ParsedFile)> {
-        self.files.iter().map(|(f, p)| (f.as_str(), p))
+        self.files.iter().map(|(f, p)| (f.as_str(), &**p))
     }
 
     pub fn len(&self) -> usize {

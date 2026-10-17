@@ -6,6 +6,7 @@ mod files;
 mod find;
 mod footer;
 mod miss;
+mod parsed;
 mod query;
 mod runner;
 mod scope;
@@ -659,6 +660,7 @@ fn reset_sigpipe() {}
 
 fn main() {
     reset_sigpipe();
+    parsed::report_stats_at_exit();
     let cli = Cli::parse();
     let hide = files::HideOpts { tests: cli.tests, exclude: cli.exclude.clone() };
     footer::set_max(cli.max_matches.map(|n| n as usize));
