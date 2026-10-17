@@ -17,7 +17,7 @@ Question: show me the function `fmt_tokens`.
 
 ```
 ctsq -q '*function#fmt_tokens' --body src/tree.rs
-src/tree.rs:111-117: fn fmt_tokens(n: usize) -> String {
+src/tree.rs:112-118: fn fmt_tokens(n: usize) -> String {
     if n >= 1000 {
         format!("{:.1}k", n as f64 / 1000.0)
 ...
@@ -31,9 +31,9 @@ Question: show me `fmt_tokens` and `count_items` together.
 
 ```
 ctsq -q '*function#/^(fmt_tokens|count_items)$/' --body src/tree.rs
-src/tree.rs:111-117: fn fmt_tokens(n: usize) -> String {
+src/tree.rs:112-118: fn fmt_tokens(n: usize) -> String {
 ...
-src/tree.rs:119-121: fn count_items(items: &[Item]) -> usize {
+src/tree.rs:120-122: fn count_items(items: &[Item]) -> usize {
     items.iter().map(|i| 1 + count_items(&i.children)).sum()
 }
 ```
@@ -46,8 +46,8 @@ Question: where is `fmt_tokens` used?
 
 ```
 ctsq -q 'id#fmt_tokens' src/
-src/tree.rs:70: fmt_tokens(source.len() / 4),
-src/tree.rs:111: fn fmt_tokens(n: usize) -> String {
+src/tree.rs:71: fmt_tokens(source.len() / 4),
+src/tree.rs:112: fn fmt_tokens(n: usize) -> String {
 2 matches
 hidden: 2 in tests (--tests)
 ```
@@ -79,14 +79,14 @@ Question: what is in `src/tree.rs`, and what does `count_items` do?
 
 ```
 ctsq tree src/tree.rs
-src/tree.rs  796 lines  ~8.4k tokens  30 entries
+src/tree.rs  796 lines  ~8.4k tokens  31 entries
 ├── pub struct Outline {  :5
-├── pub fn report(path: &str, lang_name: Option<&str>, hider: &mut crate::files::Hider) -> Outline {  :19  (58 lines)
-├── fn drop_scoped(items: &mut Vec<Item>, scopes: &[(usize, usize)]) -> usize {  :95  (13 lines)
-├── fn fmt_tokens(n: usize) -> String {  :111
-├── fn count_items(items: &[Item]) -> usize {  :119
+├── pub fn report(path: &str, lang_name: Option<&str>, hider: &mut crate::files::Hider) -> Outline {  :19  (59 lines)
+├── fn drop_scoped(items: &mut Vec<Item>, scopes: &[(usize, usize)]) -> usize {  :96  (13 lines)
+├── fn fmt_tokens(n: usize) -> String {  :112
+├── fn count_items(items: &[Item]) -> usize {  :120
 ...
-30 entries
+31 entries
 hidden: 13 in tests (--tests)
 ```
 
@@ -94,7 +94,7 @@ The header gives the file size, so you know whether a whole Read is sensible. Th
 
 ```
 ctsq -q '*function#count_items' --body src/tree.rs
-src/tree.rs:119-121: fn count_items(items: &[Item]) -> usize {
+src/tree.rs:120-122: fn count_items(items: &[Item]) -> usize {
     items.iter().map(|i| 1 + count_items(&i.children)).sum()
 }
 ```
@@ -108,7 +108,7 @@ ctsq callers count_items src/
 count_items()
 ├── report()  [tree.rs:19]
 ...
-└── count_items()  [tree.rs:119] (cycle)
+└── count_items()  [tree.rs:120] (cycle)
 11 callers
 hidden: 12 in tests (--tests)
 ```
@@ -142,13 +142,13 @@ Question: what is `count_items` and how is it used?
 ctsq explain count_items src/
 SYMBOL count_items (1 definition)
 
-DEFINITION src/tree.rs:119  function
+DEFINITION src/tree.rs:120  function
 fn count_items(items: &[Item]) -> usize {
     items.iter().map(|i| 1 + count_items(&i.children)).sum()
 }
 
 CALLERS (1 level)
-  src/tree.rs:49  report()  [tree.rs:19]  hidden.count(why, count_items(&items));
+  src/tree.rs:50  report()  [tree.rs:19]  hidden.count(why, count_items(&items));
 ...
 ```
 
@@ -231,11 +231,11 @@ fixtures/scope/Asset.tsx:11: const saveAssetNow = () => props.asset  ?
 
 ```
 ctsq -q 'id#hide_rows' --scope src/
-src/main.rs:1023: hide_rows(&mut hider, file, &source, rows, true, &mut hidden)
-  in src/main.rs:660-1102  fn main() {
-src/main.rs:1107: fn hide_rows(
-src/main.rs:1404: for r in &hide_rows(&mut hider, file, &source, rows, false, &mut name_hidden) {
-  in src/main.rs:1363-1440  fn run_refs(
+src/main.rs:1028: hide_rows(&mut hider, file, source, fetched.tree(), rows, true, &mut hidden)
+  in src/main.rs:661-1107  fn main() {
+src/main.rs:1158: fn hide_rows(
+src/main.rs:1457: for r in &hide_rows(&mut hider, file, source, fetched.tree(), rows, false, &mut name_hidden) {
+  in src/main.rs:1415-1493  fn run_refs(
 3 matches
 ```
 
@@ -356,8 +356,8 @@ Question: where are `fmt_tokens` and `count_items` defined, and is `Nothingness`
 
 ```
 ctsq def fmt_tokens count_items Nothingness src/
-src/tree.rs:111: fn fmt_tokens(n: usize) -> String {
-src/tree.rs:119: fn count_items(items: &[Item]) -> usize {
+src/tree.rs:112: fn fmt_tokens(n: usize) -> String {
+src/tree.rs:120: fn count_items(items: &[Item]) -> usize {
 not found: Nothingness
 [exit 0]
 ```
@@ -370,7 +370,7 @@ Question: a name has dozens of hits and you only need a taste. `--max-matches N`
 
 ```
 ctsq -q 'id#fmt_tokens' src/ --max-matches 1
-src/tree.rs:70: fmt_tokens(source.len() / 4),
+src/tree.rs:71: fmt_tokens(source.len() / 4),
 1 match
 hidden: 2 in tests (--tests)
 hidden: 1 over --max-matches 1 in 1 file (--max-matches 2)
