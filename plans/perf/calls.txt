@@ -1,0 +1,53 @@
+# ROOT<TAB>ARGS. M=Mavexa, E=emc-gigs, C=this repo (path of the worktree running the harness).
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	-q 'id#writeError' backend
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	-q 'id#/^write/' backend
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	-q '*function#register' --body backend
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	-q '*function#register.body(&function#writeError)' backend
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	-q '(*function#register @a) ~ (*function#login @b)' backend
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	-q 'id#writeError' --scope backend
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	-q 'id#Landing' frontend/src
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	-q '*function' --body frontend/src/components/Landing.tsx
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	-q 'id#zzqqx' backend
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	tree backend
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	tree backend/internal/api/auth.go
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	tree frontend/src
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	def writeError backend
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	def writeError --scope backend
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	def writeError register login backend
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	refs writeError backend
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	explain writeError backend
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	callers writeError backend
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	callees register backend
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	callgraph backend --format edges
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	files -q 'id#writeError' -q 'id#decodeBody' backend
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	scopeof backend/internal/api/auth.go:200
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	scopeof backend/internal/api/auth.go:200 backend/internal/api/handler.go:1215 backend/internal/api/campaigns.go:80
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	scopeof backend/internal/api/auth.go:200 --siblings --callers
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	find
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	find route /api/auth
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	find error 'decode: %w (%s)'
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	find text 'Welcome'
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	find label Email
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	find component Landing
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	path 'function#login --> function#writeError' backend
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	path 'field#signupRequest.Email ==>' backend
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	imports frontend/src/app.tsx frontend/src
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	importers frontend/src/components/Landing.tsx frontend/src
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	importgraph frontend/src --format edges
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	example 'writeError(w, 400, msg)' -l go
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	types go
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	config path
+/Users/jasperlyons/workspace/projects/mavexa/mavexa	config dump go
+/Users/jasperlyons/workspace/projects/eastbournemusic/emc-gigs	-q 'id#authenticate' app
+/Users/jasperlyons/workspace/projects/eastbournemusic/emc-gigs	def authenticate app
+/Users/jasperlyons/workspace/projects/eastbournemusic/emc-gigs	explain authenticate app
+/Users/jasperlyons/workspace/projects/eastbournemusic/emc-gigs	callers authenticate app
+/Users/jasperlyons/workspace/projects/eastbournemusic/emc-gigs	find route /gigs
+/Users/jasperlyons/workspace/projects/eastbournemusic/emc-gigs	tree app
+/Users/jasperlyons/workspace/projects/jasperlyons/ctsq/.claude/worktrees/agent-af8b64c91b61820cf	-q 'id#run' src
+/Users/jasperlyons/workspace/projects/jasperlyons/ctsq/.claude/worktrees/agent-af8b64c91b61820cf	tree src
+/Users/jasperlyons/workspace/projects/jasperlyons/ctsq/.claude/worktrees/agent-af8b64c91b61820cf	def run_rows src
+/Users/jasperlyons/workspace/projects/jasperlyons/ctsq/.claude/worktrees/agent-af8b64c91b61820cf	explain run_rows src
+/Users/jasperlyons/workspace/projects/jasperlyons/ctsq/.claude/worktrees/agent-af8b64c91b61820cf	callers run_rows src
+/Users/jasperlyons/workspace/projects/jasperlyons/ctsq/.claude/worktrees/agent-af8b64c91b61820cf	callgraph src --format edges
+/Users/jasperlyons/workspace/projects/jasperlyons/ctsq/.claude/worktrees/agent-af8b64c91b61820cf	importgraph src --format edges
