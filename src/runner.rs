@@ -85,6 +85,26 @@ pub fn run_rows(
     run_rows_on(compiled, lang, source, &tree, body)
 }
 
+/// `run_rows` over `file` as the run's cache holds it (`parsed::get`), so the
+/// file is read and parsed once however many queries and consumers ask.
+/// `lang_name` is the job's lang name, the cache key. A file that cannot be
+/// read is an error. A query with no pattern returns no rows without parsing.
+#[allow(dead_code)] // for the graph and consumer packages
+pub fn run_rows_cached(
+    compiled: &CompiledQuery,
+    lang: &dyn Lang,
+    file: &str,
+    lang_name: &'static str,
+    body: bool,
+) -> Result<Vec<MatchRow>, String> {
+    if compiled.is_empty() {
+        return Ok(vec![]);
+    }
+    let p = crate::parsed::get(file, lang_name).ok_or_else(|| format!("failed to read {}", file))?;
+    let tree = p.tree.as_ref().ok_or("failed to parse source")?;
+    run_rows_on(compiled, lang, &p.source, tree, body)
+}
+
 /// `run_rows` over a tree the caller already parsed from `source` with `lang`'s
 /// grammar, so several queries can share one parse.
 pub fn run_rows_on(
@@ -642,6 +662,29 @@ mod tests {
         let rows = rows_for("(id#itemCols @n)", "go", "package main\n\nconst itemCols = 1\n", false);
         assert_eq!(rows[0].src_line.as_deref(), Some("const itemCols = 1"));
         assert_eq!(caps(&rows[0]), vec![("n", "itemCols")]);
+    }
+
+    #[test]
+    fn a_cached_run_matches_a_run_over_the_text_and_parses_once() {
+        let d = std::env::temp_dir().join(format!("ctsq-runner-cached-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("a.go");
+        let src = "package main\n\nconst itemCols = 1\n\nfunc f() { _ = itemCols }\n";
+        std::fs::write(&f, src).unwrap();
+        let path = f.to_str().unwrap();
+        let ast = crate::query::parse("id#itemCols").unwrap();
+        let l = lang::for_name("go").unwrap();
+        let compiled = crate::compiler::compile(&ast, l.as_ref());
+        let lines = |rows: Vec<MatchRow>| rows.into_iter().map(|r| (r.line, r.node_text)).collect::<Vec<_>>();
+        let cached = run_rows_cached(&compiled, l.as_ref(), path, "go", false).unwrap();
+        let again = run_rows_cached(&compiled, l.as_ref(), path, "go", false).unwrap();
+        let plain = run_rows(&compiled, l.as_ref(), src.as_bytes(), false).unwrap();
+        assert_eq!(lines(cached), lines(plain.clone()));
+        assert_eq!(lines(again), lines(plain));
+        let first = crate::parsed::get(path, "go").unwrap();
+        assert!(std::rc::Rc::ptr_eq(&first, &crate::parsed::get(path, "go").unwrap()));
+        assert!(run_rows_cached(&compiled, l.as_ref(), d.join("gone.go").to_str().unwrap(), "go", false).is_err());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

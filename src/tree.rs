@@ -1,5 +1,5 @@
 use crate::compiler::lang;
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
 /// One file's outline and what it left out.
 pub struct Outline {
@@ -17,7 +17,7 @@ pub struct Outline {
 /// `hider` decides which files and test scopes are left out, and the caller
 /// prints the summed footer once (BUILD.md A11).
 pub fn report(path: &str, lang_name: Option<&str>, hider: &mut crate::files::Hider) -> Outline {
-    let source = match std::fs::read(path) {
+    let source = match crate::parsed::try_source(path) {
         Ok(s) => s,
         Err(e) => { eprintln!("Failed to read {}: {}", path, e); std::process::exit(1); }
     };
@@ -32,14 +32,15 @@ pub fn report(path: &str, lang_name: Option<&str>, hider: &mut crate::files::Hid
         Some(n) => n,
         None => { eprintln!("Cannot detect language. Use --lang"); std::process::exit(1); }
     };
-    let lang_box = match lang::for_name(lang_name) {
+    // The cache keys on the canonical name. `lang_name` itself still picks
+    // the extractor, as before.
+    let canonical = match lang::lang_for_name_canonical(lang_name) {
         Some(l) => l,
         None => { eprintln!("Unknown language: {}", lang_name); std::process::exit(1); }
     };
 
-    let mut parser = Parser::new();
-    parser.set_language(&lang_box.ts_language()).unwrap();
-    let tree = parser.parse(&source, None).expect("parse failed");
+    let parsed = crate::parsed::get(path, canonical);
+    let tree = parsed.as_ref().and_then(|p| p.tree.as_ref()).expect("parse failed");
 
     let root = tree.root_node();
     let mut items = collect_items(root, &source, lang_name);
@@ -49,7 +50,7 @@ pub fn report(path: &str, lang_name: Option<&str>, hider: &mut crate::files::Hid
         hidden.count(why, count_items(&items));
         return Outline { text: String::new(), entries: 0, hidden };
     }
-    let scopes = hider.scope_lines_in(path, Some(&source), Some(&tree));
+    let scopes = hider.scope_lines_in(path, Some(&source), Some(tree));
     if !scopes.is_empty() {
         hidden.tests += drop_scoped(&mut items, &scopes);
     }
@@ -602,13 +603,17 @@ fn extract_go(node: Node, source: &[u8], top: bool) -> Option<Item> {
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
+/// Outline items of `path`, from the run's cached parse. Empty when the file
+/// cannot be read or `lang_name` has no grammar.
+fn cached_items(path: &str, lang_name: &str) -> Vec<Item> {
+    let Some(canonical) = lang::lang_for_name_canonical(lang_name) else { return vec![] };
+    let Some(p) = crate::parsed::get(path, canonical) else { return vec![] };
+    let Some(tree) = p.tree.as_ref() else { return vec![] };
+    collect_items(tree.root_node(), &p.source, lang_name)
+}
+
 pub fn collect_function_locs(path: &str, lang_name: &str) -> Vec<(String, usize)> {
-    let source = match std::fs::read(path) { Ok(s) => s, Err(_) => return vec![] };
-    let lang_box = match lang::for_name(lang_name) { Some(l) => l, None => return vec![] };
-    let mut parser = Parser::new();
-    if parser.set_language(&lang_box.ts_language()).is_err() { return vec![]; }
-    let tree = match parser.parse(&source, None) { Some(t) => t, None => return vec![] };
-    let items = collect_items(tree.root_node(), &source, lang_name);
+    let items = cached_items(path, lang_name);
     let mut locs = Vec::new();
     fn_locs_recursive(&items, &mut locs);
     locs
@@ -618,12 +623,7 @@ pub fn collect_function_locs(path: &str, lang_name: &str) -> Vec<(String, usize)
 /// "var" — the same vocabulary `tree` prints. Used by `explain` to resolve
 /// names the call-graph index does not hold, such as classes and variables.
 pub fn collect_def_locs(path: &str, lang_name: &str) -> Vec<(&'static str, String, usize)> {
-    let source = match std::fs::read(path) { Ok(s) => s, Err(_) => return vec![] };
-    let lang_box = match lang::for_name(lang_name) { Some(l) => l, None => return vec![] };
-    let mut parser = Parser::new();
-    if parser.set_language(&lang_box.ts_language()).is_err() { return vec![]; }
-    let tree = match parser.parse(&source, None) { Some(t) => t, None => return vec![] };
-    let items = collect_items(tree.root_node(), &source, lang_name);
+    let items = cached_items(path, lang_name);
     let mut locs = Vec::new();
     def_locs_recursive(&items, &mut locs);
     locs
