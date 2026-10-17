@@ -165,8 +165,7 @@ pub fn get(path: &str, lang: &'static str) -> Option<Rc<ParsedFile>> {
     }
     let source = source(path)?;
     let tree = parse_text(lang, &source);
-    PARSES.fetch_add(1, Ordering::Relaxed);
-    let weight = source.len().saturating_mul(TREE_WEIGHT);
+    PARSES.fetch_add(1, Ordering::Relaxed);    let weight = source.len().saturating_mul(TREE_WEIGHT);
     let p = Rc::new(ParsedFile { lang, source, tree });
     CACHE.with(|c| {
         let mut c = c.borrow_mut();

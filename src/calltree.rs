@@ -62,7 +62,9 @@ pub fn report_scoped(
     hider: &mut files::Hider,
     scope: Option<scope::Opts>,
 ) -> (String, i32) {
-    let g = graph::build(jobs);
+    // Held to the end so the hider and the scope printer reuse these parses.
+    let store = crate::resolve::TreeStore::build(jobs);
+    let g = graph::build_from_store(&store);
     let printer = scope.map(|o| scope::Printer::new(o, jobs));
     let mut w = Walk { g: &g, max_depth, out: String::new(), shown: 0, hider, hidden: Hidden::default(), scope: printer };
     walk_name(&mut w, dir, function);
@@ -89,7 +91,9 @@ pub fn report_many(
     hider: &mut files::Hider,
     scope: Option<scope::Opts>,
 ) -> crate::resolve::NamesOut {
-    let g = graph::build(jobs);
+    // Held to the end so the hider and the scope printer reuse these parses.
+    let store = crate::resolve::TreeStore::build(jobs);
+    let g = graph::build_from_store(&store);
     let printer = scope.map(|o| scope::Printer::new(o, jobs));
     let mut w = Walk { g: &g, max_depth, out: String::new(), shown: 0, hider, hidden: Hidden::default(), scope: printer };
     let mut missing: Vec<String> = Vec::new();

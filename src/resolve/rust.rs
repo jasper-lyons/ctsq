@@ -20,22 +20,40 @@ pub struct RustResolver;
 
 impl Resolver for RustResolver {
     fn collect_defs(&self, file: &str, source: &[u8]) -> Vec<Def> {
-        let tree = match parse(source) { Some(t) => t, None => return vec![] };
+        self.collect_defs_tree(file, source, None)
+    }
+
+    fn collect_defs_tree(&self, file: &str, source: &[u8], given: Option<&tree_sitter::Tree>) -> Vec<Def> {
+        let tree = match parse_or(given, source) { Some(t) => t, None => return vec![] };
         let mut out = Vec::new();
         let mut mods = file_module_path(file);
         walk_defs(tree.root_node(), source, file, &mut mods, Owner::Free, &mut out);
         out
     }
 
-    fn collect_impls(&self, _file: &str, source: &[u8]) -> Vec<(String, String)> {
-        let tree = match parse(source) { Some(t) => t, None => return vec![] };
+    fn collect_impls(&self, file: &str, source: &[u8]) -> Vec<(String, String)> {
+        self.collect_impls_tree(file, source, None)
+    }
+
+    fn collect_impls_tree(&self, _file: &str, source: &[u8], given: Option<&tree_sitter::Tree>) -> Vec<(String, String)> {
+        let tree = match parse_or(given, source) { Some(t) => t, None => return vec![] };
         let mut out = Vec::new();
         walk_impls(tree.root_node(), source, &mut out);
         out
     }
 
     fn resolve_calls(&self, file: &str, source: &[u8], index: &DefIndex) -> Vec<ResolvedCall> {
-        let tree = match parse(source) { Some(t) => t, None => return vec![] };
+        self.resolve_calls_tree(file, source, None, index).0
+    }
+
+    fn resolve_calls_tree(
+        &self,
+        file: &str,
+        source: &[u8],
+        given: Option<&tree_sitter::Tree>,
+        index: &DefIndex,
+    ) -> (Vec<ResolvedCall>, Vec<super::CallSite>) {
+        let tree = match parse_or(given, source) { Some(t) => t, None => return (vec![], vec![]) };
         let scope = FileScope::build(tree.root_node(), source);
 
         // def line -> index, for attributing calls to their enclosing function
@@ -65,8 +83,14 @@ impl Resolver for RustResolver {
                 }
             }
         }
-        out
+        (out, vec![])
     }
+}
+
+/// The tree a `TreeStore` already holds, else a fresh parse. Cloning a tree
+/// is a cheap reference count.
+fn parse_or(given: Option<&tree_sitter::Tree>, source: &[u8]) -> Option<tree_sitter::Tree> {
+    given.cloned().or_else(|| parse(source))
 }
 
 fn parse(source: &[u8]) -> Option<tree_sitter::Tree> {

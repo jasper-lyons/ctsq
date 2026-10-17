@@ -71,8 +71,12 @@ impl Resolver for GoResolver {
 
     /// Types this file constructs (composite literals, `new(T)`), recorded as
     /// `(T, CONSTRUCTED)`. Interface dispatch widens only to these.
-    fn collect_impls(&self, _file: &str, source: &[u8]) -> Vec<(String, String)> {
-        let Some(tree) = parse(source) else { return vec![] };
+    fn collect_impls(&self, file: &str, source: &[u8]) -> Vec<(String, String)> {
+        self.collect_impls_tree(file, source, None)
+    }
+
+    fn collect_impls_tree(&self, _file: &str, source: &[u8], given: Option<&tree_sitter::Tree>) -> Vec<(String, String)> {
+        let Some(tree) = parse_or(given, source) else { return vec![] };
         let mut seen: HashSet<String> = HashSet::new();
         let mut stack = vec![tree.root_node()];
         while let Some(n) = stack.pop() {

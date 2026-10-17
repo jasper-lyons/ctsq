@@ -54,6 +54,7 @@ fn cached_query(lang: &tree_sitter::Language, text: &str) -> Result<std::rc::Rc<
 }
 
 /// Backwards-compatible wrapper: the node-text rendering only.
+#[cfg(test)]
 pub fn run(
     compiled: &CompiledQuery,
     lang: &dyn Lang,
