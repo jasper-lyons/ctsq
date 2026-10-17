@@ -145,9 +145,16 @@ struct Scope {
 }
 
 impl Scope {
+    /// Whether this selector can match in `source` at all: a selector with
+    /// an anchor cannot when the literal does not occur.
+    fn may_match(&self, source: &[u8]) -> bool {
+        self.anchor.as_ref().is_none_or(|a| !occurrences(source, a.as_bytes()).is_empty())
+    }
+
     /// Rows of this selector in `source`. With an anchor, a file without the
     /// literal is not searched (nor parsed, when `tree` is None), and a file
-    /// with it is searched only around each occurrence.
+    /// with it is searched only around each occurrence. A None `tree` parses
+    /// `source` as text with no path, uncached.
     fn rows(&self, source: &[u8], tree: Option<&tree_sitter::Tree>) -> Vec<crate::runner::MatchRow> {
         let spans: Option<Vec<std::ops::Range<usize>>> = self.anchor.as_ref().map(|a| occurrences(source, a.as_bytes()));
         if spans.as_ref().is_some_and(|s| s.is_empty()) {
@@ -353,16 +360,31 @@ impl Hider {
         let owned;
         let source = match source {
             Some(s) => s,
-            None => match std::fs::read(file) {
-                Ok(s) => {
+            None => match crate::parsed::source(file) {
+                Some(s) => {
                     owned = s;
-                    &owned
+                    owned.as_slice()
                 }
-                Err(_) => return vec![],
+                None => return vec![],
             },
         };
         let (root, lang_name) = self.jobs[file].clone();
         let t = self.tests_for(&root, lang_name);
+        // Without a tree from the caller, the cached parse of the file, fetched
+        // only once a scope can match, so a file no scope can match is not parsed.
+        let cached;
+        let tree = match tree {
+            Some(t) => Some(t),
+            None => {
+                let rust_markers = lang_name == "rust" && (contains(source, b"mod test") || contains(source, b"cfg("));
+                if rust_markers || (lang_name != "rust" && t.scopes.iter().any(|s| s.may_match(source))) {
+                    cached = crate::parsed::get(file, lang_name);
+                    cached.as_ref().and_then(|p| p.tree.as_ref())
+                } else {
+                    None
+                }
+            }
+        };
         let mut ranges = Vec::new();
         let mut add_rows = |rows: Vec<crate::runner::MatchRow>| {
             for r in rows {
@@ -373,14 +395,6 @@ impl Hider {
             // A Rust file with neither `mod test` nor `cfg(` has no test scope,
             // so it is not parsed. Otherwise one parse serves every scope.
             if contains(source, b"mod test") || contains(source, b"cfg(") {
-                let parsed;
-                let tree = match tree {
-                    Some(t) => Some(t),
-                    None => {
-                        parsed = parse_rust(source);
-                        parsed.as_ref()
-                    }
-                };
                 if let Some(tree) = tree {
                     for s in &t.scopes {
                         add_rows(s.rows(source, Some(tree)));
@@ -495,13 +509,6 @@ pub fn glob_regex(glob: &str) -> regex::Regex {
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     crate::resolve::holds(haystack, std::str::from_utf8(needle).unwrap_or(""))
-}
-
-fn parse_rust(source: &[u8]) -> Option<tree_sitter::Tree> {
-    let l = lang::for_name("rust")?;
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&l.ts_language()).ok()?;
-    parser.parse(source, None)
 }
 
 /// Rust items under `#[cfg(test)]`, from the attribute line to the item's end.
@@ -737,7 +744,7 @@ mod tests {
         fs::write(d.join("lib.rs"), src).unwrap();
         let (mut h, jobs) = hider_over(&d, &HideOpts::default());
         let f = &jobs[0].0;
-        let tree = parse_rust(src.as_bytes()).unwrap();
+        let tree = crate::parsed::parse_text("rust", src.as_bytes()).unwrap();
         let with_tree = h.scope_lines_in(f, Some(src.as_bytes()), Some(&tree));
         assert_eq!(with_tree, vec![(3, 6), (9, 10)]);
         let (mut h2, _) = hider_over(&d, &HideOpts::default());
@@ -796,7 +803,7 @@ mod tests {
         assert!(occurrences(b"test", b"tests").is_empty());
         // The anchored search finds what a whole-tree search finds.
         let src = b"// tests\nmod a { mod tests { fn t() {} } }\nfn tests() {}\nmod tests {}\n";
-        let tree = parse_rust(src).unwrap();
+        let tree = crate::parsed::parse_text("rust", src).unwrap();
         let s = Scope { lang: lang::for_name("rust").unwrap(), query: c.clone(), anchor: Some("tests".into()) };
         let lines = |rows: Vec<crate::runner::MatchRow>| rows.iter().map(|r| r.line).collect::<Vec<_>>();
         let whole = crate::runner::run_rows_on(&c, l.as_ref(), src, &tree, false).unwrap();

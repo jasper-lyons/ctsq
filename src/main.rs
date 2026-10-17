@@ -1006,23 +1006,26 @@ fn main() {
             println!("\n=== Matches in {} ===", file);
         }
 
-        let source = if file == "-" {
-            stdin_bytes.as_ref().expect("stdin pre-read").clone()
+        // A file's text and tree come from the run's cache, so test hiding
+        // and anything after reuse this parse. Stdin has no path to key on.
+        let fetched = if file == "-" {
+            Fetched::Text(std::rc::Rc::new(stdin_bytes.as_ref().expect("stdin pre-read").clone()))
         } else {
-            match std::fs::read(file) {
-                Ok(s) => s,
+            match fetch(file, lang_name, compiled.is_empty()) {
+                Ok(f) => f,
                 Err(e) => {
                     eprintln!("Failed to read {}: {}", file, e);
                     continue;
                 }
             }
         };
+        let source: &[u8] = fetched.source();
 
         let display = if file == "-" { "<stdin>" } else { file.as_str() };
 
-        let result = runner::run_rows(compiled, lang_box.as_ref(), &source, cli.body).map(|rows| {
-            let rows = semantic::attrs::filter_rows(rows, &attrs, lang_name, &lang_box.ts_language(), &source);
-            hide_rows(&mut hider, file, &source, rows, true, &mut hidden)
+        let result = fetched.rows(compiled, lang_box.as_ref(), cli.body).map(|rows| {
+            let rows = semantic::attrs::filter_rows(rows, &attrs, lang_name, &lang_box.ts_language(), source);
+            hide_rows(&mut hider, file, source, fetched.tree(), rows, true, &mut hidden)
         });
         match result {
             Ok(rows) if rows.is_empty() => {
@@ -1034,7 +1037,7 @@ fn main() {
                 Some(ctx) => {
                     print_with_context(
                         display,
-                        &source,
+                        source,
                         &rows,
                         ctx,
                         &mut printed_a_block,
@@ -1058,8 +1061,8 @@ fn main() {
                             total_matches += 1;
                             println!("{}", out);
                             if let Some(o) = scope_opts {
-                                if let Some(s) = scopes.hit(display, lang_name, &source, r.start_byte) {
-                                    print!("{}", scope::render(&s, &source, o.body, ""));
+                                if let Some(s) = scopes.hit(display, lang_name, source, r.start_byte) {
+                                    print!("{}", scope::render(&s, source, o.body, ""));
                                 }
                             }
                         }
@@ -1103,13 +1106,60 @@ fn main() {
     print!("{}", footer::tail(total_matches, "match", &hidden, scope_opts.is_some()));
 }
 
+/// A file's text and, when the query has patterns, its tree: from the run's
+/// cache for a file, unparsed text for stdin.
+enum Fetched {
+    File(std::rc::Rc<parsed::ParsedFile>),
+    /// Read but not parsed: stdin, or a query with no pattern for the language.
+    Text(parsed::Source),
+}
+
+impl Fetched {
+    fn source(&self) -> &[u8] {
+        match self {
+            Fetched::File(p) => &p.source,
+            Fetched::Text(s) => s,
+        }
+    }
+
+    fn tree(&self) -> Option<&tree_sitter::Tree> {
+        match self {
+            Fetched::File(p) => p.tree.as_ref(),
+            Fetched::Text(_) => None,
+        }
+    }
+
+    /// `runner::run_rows`, over the cached tree when there is one.
+    fn rows(&self, compiled: &compiler::CompiledQuery, l: &dyn lang::Lang, body: bool) -> Result<Vec<runner::MatchRow>, String> {
+        match self.tree() {
+            Some(t) => runner::run_rows_on(compiled, l, self.source(), t, body),
+            None => runner::run_rows(compiled, l, self.source(), body),
+        }
+    }
+}
+
+/// `file` from the cache, parsed with `lang_name`'s grammar unless `text_only`
+/// (a query with no pattern matches nothing and needs no tree).
+fn fetch(file: &str, lang_name: &'static str, text_only: bool) -> std::io::Result<Fetched> {
+    let source = parsed::try_source(file)?;
+    if text_only {
+        return Ok(Fetched::Text(source));
+    }
+    Ok(match parsed::get(file, lang_name) {
+        Some(p) => Fetched::File(p),
+        None => Fetched::Text(source),
+    })
+}
+
 /// Drop the rows `hider` hides, counting them in `hidden`. With `per_line` a
 /// hidden row counts once per line, the way `-q` prints one line per match.
-/// Without it every row counts, the way `refs` prints every row.
+/// Without it every row counts, the way `refs` prints every row. `tree` is
+/// the file's parse when the caller holds it, so test scopes reuse it.
 fn hide_rows(
     hider: &mut files::Hider,
     file: &str,
     source: &[u8],
+    tree: Option<&tree_sitter::Tree>,
     rows: Vec<runner::MatchRow>,
     per_line: bool,
     hidden: &mut footer::Hidden,
@@ -1129,7 +1179,7 @@ fn hide_rows(
         hidden.count(why, count(&lines));
         return vec![];
     }
-    let scopes = hider.scope_lines(file, Some(source));
+    let scopes = hider.scope_lines_in(file, Some(source), tree);
     if scopes.is_empty() {
         return rows;
     }
@@ -1397,21 +1447,22 @@ fn run_refs(
                 let c = compiler::compile(ast, l.as_ref());
                 (l, c)
             });
-            let source = match std::fs::read(file) {
-                Ok(s) => s,
+            let fetched = match fetch(file, lang_name, compiled.is_empty()) {
+                Ok(f) => f,
                 Err(e) => { eprintln!("Failed to read {}: {}", file, e); continue; }
             };
-            match runner::run_rows(compiled, lang_box.as_ref(), &source, false) {
+            let source = fetched.source();
+            match fetched.rows(compiled, lang_box.as_ref(), false) {
                 Ok(rows) => {
-                    for r in &hide_rows(&mut hider, file, &source, rows, false, &mut name_hidden) {
+                    for r in &hide_rows(&mut hider, file, source, fetched.tree(), rows, false, &mut name_hidden) {
                         if !footer::take(file) {
                             continue;
                         }
                         shown += 1;
                         println!("{}", with_path(file, &r.node_text));
                         if let Some(o) = scope_opts {
-                            if let Some(s) = scopes.hit(file, lang_name, &source, r.start_byte) {
-                                print!("{}", scope::render(&s, &source, o.body, ""));
+                            if let Some(s) = scopes.hit(file, lang_name, source, r.start_byte) {
+                                print!("{}", scope::render(&s, source, o.body, ""));
                             }
                         }
                     }
