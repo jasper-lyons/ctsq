@@ -351,6 +351,15 @@ impl Words {
             .collect()
     }
 
+    /// The jobs of `holders(name)` that can declare type `name`
+    /// (`go_could_type`), any file of another language kept.
+    pub(crate) fn typers(&self, name: &str) -> Vec<usize> {
+        self.holders(name)
+            .into_iter()
+            .filter(|&j| self.langs[j] != "go" || self.sources[j].as_ref().is_some_and(|s| go_could_type(s, name)))
+            .collect()
+    }
+
     /// Jobs whose file holds `name`, in job order.
     pub(crate) fn holders(&self, name: &str) -> Vec<usize> {
         if !name.is_empty() && name.bytes().all(word_byte) {
@@ -521,6 +530,19 @@ pub(crate) fn go_could_name(src: &[u8], name: &str) -> bool {
     })
 }
 
+/// Whether Go source `src` can declare type `name`: first on its line (a
+/// grouped type spec) or on a line opening with `type`. An interface's
+/// methods sit under its declaration.
+pub(crate) fn go_could_type(src: &[u8], name: &str) -> bool {
+    if name.is_empty() || !name.bytes().all(word_byte) {
+        return true;
+    }
+    word_lines(src, name).any(|(ls, _, at)| {
+        let lead = src[ls..ls + at].trim_ascii_start();
+        lead.is_empty() || lead.starts_with(b"type")
+    })
+}
+
 pub(crate) fn go_could_bind(src: &[u8], name: &str) -> bool {
     if name.is_empty() || !name.bytes().all(word_byte) {
         return true;
@@ -658,6 +680,8 @@ struct LazyFlow {
     covered: HashSet<String>,
     /// Names whose every file that can define them is loaded.
     named: HashSet<String>,
+    /// Names whose every file that can declare them as a type is loaded.
+    typed: HashSet<String>,
     /// The index over the loaded files with each entry's (job, position in
     /// its file), rebuilt when a file is loaded.
     index: Option<(super::DefIndex, Vec<(usize, usize)>)>,
@@ -712,6 +736,7 @@ impl FlowGraph {
                 files,
                 covered: HashSet::new(),
                 named: HashSet::new(),
+                typed: HashSet::new(),
                 index: None,
                 defs: Vec::new(),
                 key_of: HashMap::new(),
@@ -832,6 +857,17 @@ impl LazyFlow {
         }
     }
 
+    /// Load every file that can declare one of `names` as a type.
+    fn cover_typed(&mut self, names: &[String]) {
+        for n in names {
+            if !self.covered.contains(n) && self.typed.insert(n.clone()) {
+                for j in self.words.typers(n) {
+                    self.load(j);
+                }
+            }
+        }
+    }
+
     fn key(&mut self, j: usize, k: usize) -> usize {
         if let Some(&i) = self.key_of.get(&(j, k)) {
             return i;
@@ -893,17 +929,26 @@ impl LazyFlow {
             index.record();
             let want = Want { names: &names, lines: Some(&lines) };
             let (_, sites) = l.resolve(index, Some(&want));
-            let (named, other) = index.take_asked_split();
+            let (named, iface, other) = index.take_asked_split();
             let mut new_named: Vec<String> =
                 named.into_iter().filter(|n| !self.covered.contains(n) && !self.named.contains(n)).collect();
+            // A name read as an interface is also read by `named` when it is
+            // both, so both covers run for it.
+            let mut new_iface: Vec<String> = iface
+                .into_iter()
+                .filter(|n| !self.covered.contains(n) && (!self.typed.contains(n) || !self.named.contains(n)))
+                .collect();
             let mut new: Vec<String> = other.into_iter().filter(|n| !self.covered.contains(n)).collect();
-            if new.is_empty() && new_named.is_empty() {
+            if new.is_empty() && new_named.is_empty() && new_iface.is_empty() {
                 break sites;
             }
             new.sort();
             new_named.sort();
+            new_iface.sort();
             self.cover(&new);
             self.cover_named(&new_named);
+            self.cover_named(&new_iface);
+            self.cover_typed(&new_iface);
         };
         let positions = match &self.files[j] {
             State::Loaded(Loaded { model: super::FileModel::Go(scope), .. }) => scope.call_positions().1,

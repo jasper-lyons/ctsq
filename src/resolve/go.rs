@@ -776,7 +776,7 @@ fn resolve_method(
 /// implementor the edge points at the signature itself.
 fn interface_impls(iface: &str, name: &str, ctx: &Ctx) -> Vec<(usize, Confidence)> {
     // the interface's methods are declared in a file holding its name
-    ctx.index.ask(iface);
+    ctx.index.ask_interface(iface);
     let sig_methods: Vec<&str> = ctx.index.defs.iter()
         .filter(|d| matches!(&d.kind, DefKind::InterfaceMethod { interface } if interface == iface))
         .map(|d| d.name.as_str())

@@ -70,6 +70,8 @@ pub struct DefIndex {
     /// The names asked through `named`, and through `ask`, while recording.
     asked_named: RefCell<Option<HashSet<String>>>,
     asked_other: RefCell<Option<HashSet<String>>>,
+    /// The names asked through `ask_interface`, while recording.
+    asked_iface: RefCell<Option<HashSet<String>>>,
     /// file -> indices into `defs`, in index order, built on first use.
     by_file: OnceCell<HashMap<String, Vec<usize>>>,
     /// The Go resolver's constructed types, built on first use.
@@ -106,6 +108,17 @@ impl DefIndex {
         }
     }
 
+    /// Note that an answer depends on the methods interface `name` declares,
+    /// which sit under its type declaration.
+    pub fn ask_interface(&self, name: &str) {
+        self.note(name);
+        if let Some(s) = self.asked_iface.borrow_mut().as_mut() {
+            if !s.contains(name) {
+                s.insert(name.to_string());
+            }
+        }
+    }
+
     fn note(&self, name: &str) {
         if let Some(s) = self.asked.borrow_mut().as_mut() {
             if !s.contains(name) {
@@ -119,15 +132,19 @@ impl DefIndex {
         *self.asked.borrow_mut() = Some(HashSet::new());
         *self.asked_named.borrow_mut() = Some(HashSet::new());
         *self.asked_other.borrow_mut() = Some(HashSet::new());
+        *self.asked_iface.borrow_mut() = Some(HashSet::new());
     }
 
-    /// `take_asked`, split into the names only `named` read (the
-    /// definitions named so) and every other name.
-    pub fn take_asked_split(&self) -> (HashSet<String>, HashSet<String>) {
+    /// `take_asked`, split into the names read only through `named` (the
+    /// definitions named so), only through `ask_interface` or `named`, and
+    /// through `ask`.
+    pub fn take_asked_split(&self) -> (HashSet<String>, HashSet<String>, HashSet<String>) {
         self.take_asked();
         let other = self.asked_other.borrow_mut().take().unwrap_or_default();
+        let iface: HashSet<String> =
+            self.asked_iface.borrow_mut().take().unwrap_or_default().into_iter().filter(|n| !other.contains(n)).collect();
         let named = self.asked_named.borrow_mut().take().unwrap_or_default();
-        (named.into_iter().filter(|n| !other.contains(n)).collect(), other)
+        (named.into_iter().filter(|n| !other.contains(n) && !iface.contains(n)).collect(), iface, other)
     }
 
     /// Stop recording and hand back what was asked.
