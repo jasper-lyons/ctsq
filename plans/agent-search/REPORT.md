@@ -82,3 +82,22 @@ This round supersedes the "Left undone" items above about the held questions and
 - **`find` listing:** the columns line up.
 - **Performance:** `plans/agent-search/measure/bench.sh` compares the new binary with the pre-build one (5f867dc). The tables are in DELIVERY.md. On Mavexa, `explain` went from 33s to 7.6s and `callers` from 29s to 4.8s. Two calls are still slower than before: `-q id#` on this repo at 1.17x and `callers` at 1.09x. Both are the cost of hiding tests, and both match the old binary with `--tests`.
 - **Docs and install:** the docs drafts were re-copied to `~/.claude/CLAUDE.md`, `~/.claude/skills/ctsq/SKILL.md` and `control/.agents/skills/ctsq/SKILL.md`, and `make install` was run from this branch.
+
+## Performance round (2026-10-17)
+
+Plans: `plans/parse-cache/PLAN.md` and `plans/perf/PLAN.md`. Full tables: `plans/perf/RESULTS-ce8b812.md` (before) and `plans/perf/RESULTS-89d3cf4.md` (after). Re-run the profile with `plans/perf/profile.sh`.
+
+- **Parse cache** (`src/parsed.rs`): each file is read once, and parsed once per grammar while some part of the code still uses it, with a 4MB window of recent parses. `CTSQ_PARSE_STATS=1` prints parse counts.
+- **Skip files that cannot match** (`src/needle.rs`): a query's exact names must appear in a file's text before it is parsed. The same check covers `find` keys, and a sibling query (`A ~ B`) first checks that each side matches somewhere in the file.
+- **Scoped call graph** (`src/resolve/scoped.rs`): `callers`, `callees`, `explain`, `def` and `scopeof --callers` load only the files their walk can reach, then drop each parse.
+- **Lazy `path`:** call routes and data flow load files on demand, using Go text filters. A per-file scope table is now cached in the Go resolver. That table was being rebuilt for every typed operand, which was the cause of the 78-second trace.
+- **Identity:** every package was checked against a reference binary. The three checks cover 161, 648 and 943 calls. The final adversarial review found three Go edge cases where output changed, and all three are fixed and covered.
+- **Results on Mavexa, against the pre-build binary:**
+  - `path field#signupRequest.Email ==>`: 74s to 1.9s
+  - `path login --> writeError`: 5.1s to 1.2s
+  - `explain writeError`: 4.3s to 0.4s
+  - `callers writeError`: 2.7s to 0.8s
+  - `-q id#writeError`: 1.2s to 0.15s
+
+  No profiled call is over 2s. Memory on graph and `path` calls is below the reference binary. Some simple calls (`tree`, `-q`) use a constant 5 to 11MB more, cause not located.
+- **Follow-ups:** in `plans/perf/PLAN.md` under "Follow-ups for path data flow".
