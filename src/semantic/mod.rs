@@ -103,6 +103,7 @@ pub fn segment_defs(seg: &Query, store: &TreeStore, index: &DefIndex) -> Result<
 pub fn segment_rows(seg: &Query, store: &TreeStore) -> Result<Vec<(String, Vec<crate::runner::MatchRow>)>, String> {
     let attrs = attrs::last_selector_attrs(seg)?;
     let needles = crate::needle::Needles::from_query(seg);
+    let attr_words = attr_needles(&attrs);
     let mut first_err: Option<String> = None;
     let mut accepted = false;
     let mut out = Vec::new();
@@ -121,6 +122,13 @@ pub fn segment_rows(seg: &Query, store: &TreeStore) -> Result<Vec<(String, Vec<c
         if !needles.is_none() && !store.source(file).is_some_and(|s| needles.holds(&s)) {
             continue;
         }
+        if !attr_words.is_empty()
+            && !store.source(file).is_some_and(|s| {
+                attr_words.iter().all(|w| crate::resolve::scoped::holds_any(&s, &[w.as_str(), &format!("New{}", w)]))
+            })
+        {
+            continue;
+        }
         let Some(pf) = store.get(file) else { continue };
         let Some(tree) = &pf.tree else { continue };
         let compiled = compiled_segment(seg, lang.as_ref(), pf.lang);
@@ -136,6 +144,21 @@ pub fn segment_rows(seg: &Query, store: &TreeStore) -> Result<Vec<(String, Vec<c
         }
     }
     Ok(out)
+}
+
+/// Names a file must hold, as a whole word or after `New`, to give a row the
+/// equality `qual` and `in` filters in `attrs` accept. Each filter compares
+/// with a name read from the file: an import qualifier, the nearest enclosing
+/// declaration, or a Go operand's type, which `resolve::go::binding_type`
+/// reads from the file's own declarations with no index, so from a type
+/// written in it or from a `NewT` call (`new_convention_type`).
+fn attr_needles(attrs: &[crate::query::ast::AttrMatch]) -> Vec<String> {
+    attrs
+        .iter()
+        .filter(|a| matches!(a.key.as_str(), "qual" | "in") && a.op == crate::query::ast::AttrOp::Eq)
+        .filter(|a| !a.value.is_empty() && a.value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+        .map(|a| a.value.clone())
+        .collect()
 }
 
 thread_local! {

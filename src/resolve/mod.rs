@@ -445,6 +445,12 @@ impl NameFinder {
         self.entries_of(self.words.binders(name))
     }
 
+    /// The holders of `name` that can declare a struct field of that name
+    /// (`scoped::go_could_field`).
+    pub fn fielders(&self, name: &str) -> Vec<(String, &'static str)> {
+        self.entries_of(self.words.fielders(name))
+    }
+
     fn entries_of(&self, jobs: Vec<usize>) -> Vec<(String, &'static str)> {
         let mut v: Vec<usize> = jobs.into_iter().filter_map(|j| self.entry_of_job.get(&j).copied()).collect();
         v.sort();

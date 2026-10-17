@@ -274,7 +274,10 @@ impl<'a> Scope<'a> {
 pub(crate) struct Words {
     sources: Vec<Option<crate::parsed::Source>>,
     langs: Vec<&'static str>,
-    tokens: HashMap<Box<str>, Vec<u32>>,
+    /// Each word with its id and the jobs holding it.
+    tokens: HashMap<Box<str>, (u32, Vec<u32>)>,
+    /// Each Go job's declaration words, scanned on first use.
+    go_decls: Vec<std::cell::OnceCell<GoDecls>>,
 }
 
 fn word_byte(b: u8) -> bool {
@@ -283,7 +286,7 @@ fn word_byte(b: u8) -> bool {
 
 impl Words {
     pub(crate) fn new(jobs: &[(String, &'static str)]) -> Words {
-        let mut tokens: HashMap<Box<str>, Vec<u32>> = HashMap::new();
+        let mut tokens: HashMap<Box<str>, (u32, Vec<u32>)> = HashMap::new();
         let mut sources = Vec::with_capacity(jobs.len());
         for (j, (file, _)) in jobs.iter().enumerate() {
             let src = crate::parsed::source(file);
@@ -302,20 +305,26 @@ impl Words {
                     // ASCII only, so the run is valid UTF-8.
                     let w = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
                     match tokens.get_mut(w) {
-                        Some(v) => {
+                        Some((_, v)) => {
                             if v.last() != Some(&(j as u32)) {
                                 v.push(j as u32);
                             }
                         }
                         None => {
-                            tokens.insert(w.into(), vec![j as u32]);
+                            let id = tokens.len() as u32;
+                            tokens.insert(w.into(), (id, vec![j as u32]));
                         }
                     }
                 }
             }
             sources.push(src);
         }
-        Words { sources, tokens, langs: jobs.iter().map(|(_, l)| *l).collect() }
+        Words {
+            sources,
+            tokens,
+            langs: jobs.iter().map(|(_, l)| *l).collect(),
+            go_decls: (0..jobs.len()).map(|_| std::cell::OnceCell::new()).collect(),
+        }
     }
 
     /// The text of job `j`, None when it could not be read.
@@ -327,43 +336,56 @@ impl Words {
     /// an answer: a Go file only when `go_could_declare` says so, a file of
     /// any other language always.
     pub(crate) fn declarers(&self, name: &str) -> Vec<usize> {
-        self.holders(name)
-            .into_iter()
-            .filter(|&j| self.langs[j] != "go" || self.sources[j].as_ref().is_some_and(|s| go_could_declare(s, name)))
-            .collect()
+        self.go_filtered(name, |d| &d.declare)
     }
 
     /// The jobs of `holders(name)` that `go_could_bind` keeps, any file of
     /// another language kept.
     pub(crate) fn binders(&self, name: &str) -> Vec<usize> {
+        self.go_filtered(name, |d| &d.bind)
+    }
+
+    /// The jobs of `holders(name)` that `go_could_field` keeps, any file of
+    /// another language kept.
+    pub(crate) fn fielders(&self, name: &str) -> Vec<usize> {
+        self.go_filtered(name, |d| &d.field)
+    }
+
+    /// The jobs of `holders(name)` whose Go declarations set (`GoDecls`,
+    /// scanned once per file) holds `name`, any file of another language
+    /// kept, and every holder when `name` is not one identifier.
+    fn go_filtered(&self, name: &str, set: impl Fn(&GoDecls) -> &Vec<u32>) -> Vec<usize> {
+        let word = !name.is_empty() && name.bytes().all(word_byte);
+        let id = self.tokens.get(name).map(|t| t.0);
         self.holders(name)
             .into_iter()
-            .filter(|&j| self.langs[j] != "go" || self.sources[j].as_ref().is_some_and(|s| go_could_bind(s, name)))
+            .filter(|&j| {
+                if self.langs[j] != "go" || !word {
+                    return true;
+                }
+                let Some(s) = self.sources[j].as_ref() else { return false };
+                let d = self.go_decls[j].get_or_init(|| GoDecls::of(s, |w| self.tokens.get(w).map(|t| t.0)));
+                id.is_some_and(|id| set(d).binary_search(&id).is_ok())
+            })
             .collect()
     }
 
     /// The jobs of `holders(name)` that can define `name` (`go_could_name`),
     /// any file of another language kept.
     pub(crate) fn namers(&self, name: &str) -> Vec<usize> {
-        self.holders(name)
-            .into_iter()
-            .filter(|&j| self.langs[j] != "go" || self.sources[j].as_ref().is_some_and(|s| go_could_name(s, name)))
-            .collect()
+        self.go_filtered(name, |d| &d.named)
     }
 
     /// The jobs of `holders(name)` that can declare type `name`
     /// (`go_could_type`), any file of another language kept.
     pub(crate) fn typers(&self, name: &str) -> Vec<usize> {
-        self.holders(name)
-            .into_iter()
-            .filter(|&j| self.langs[j] != "go" || self.sources[j].as_ref().is_some_and(|s| go_could_type(s, name)))
-            .collect()
+        self.go_filtered(name, |d| &d.typed)
     }
 
     /// Jobs whose file holds `name`, in job order.
     pub(crate) fn holders(&self, name: &str) -> Vec<usize> {
         if !name.is_empty() && name.bytes().all(word_byte) {
-            return self.tokens.get(name).map(|v| v.iter().map(|&j| j as usize).collect()).unwrap_or_default();
+            return self.tokens.get(name).map(|(_, v)| v.iter().map(|&j| j as usize).collect()).unwrap_or_default();
         }
         (0..self.sources.len())
             .filter(|&j| self.sources[j].as_ref().is_some_and(|s| holds_bounded(s, name)))
@@ -446,6 +468,7 @@ fn func_part(line: &[u8], at: usize) -> FuncPart {
 
 /// Whole-word occurrences of `name` in `src`, each as (line start, line
 /// end, offset in the line).
+#[cfg(test)]
 fn word_lines<'s>(src: &'s [u8], name: &'s str) -> impl Iterator<Item = (usize, usize, usize)> + 's {
     let n = name.as_bytes();
     let mut from = 0;
@@ -482,34 +505,34 @@ fn word_lines<'s>(src: &'s [u8], name: &'s str) -> impl Iterator<Item = (usize, 
 ///
 /// A file with no such occurrence declares, constructs and returns nothing
 /// called `name`, so no read of `name` is answered from it.
+#[cfg(test)]
 pub(crate) fn go_could_declare(src: &[u8], name: &str) -> bool {
     if name.is_empty() || !name.bytes().all(word_byte) {
         return true;
     }
-    for (ls, le, at) in word_lines(src, name) {
-        let line = &src[ls..le];
-        let lead = line[..at].trim_ascii_start();
-        if lead.is_empty() || lead.starts_with(b"type") || lead.starts_with(b")") {
-            return true;
-        }
-        if lead.starts_with(b"func") && func_part(line, at) != FuncPart::Params {
-            return true;
-        }
-        let next = line[at + name.len()..].trim_ascii_start();
-        let prev_close = at > 0 && line[at - 1] == b']';
-        if (next.starts_with(b"{") && !prev_close) || next.starts_with(b"[") {
-            return true;
-        }
-        let before = &line[..at];
-        let before = match before.strip_suffix(b".") {
-            Some(b) => &b[..b.iter().rposition(|&c| !word_byte(c)).map(|p| p + 1).unwrap_or(0)],
-            None => before,
-        };
-        if before.ends_with(b"new(") {
-            return true;
-        }
+    word_lines(src, name).any(|(ls, le, at)| declare_at(&src[ls..le], at, name.len()))
+}
+
+/// `go_could_declare` for the word of `len` bytes at byte `at` of `line`.
+fn declare_at(line: &[u8], at: usize, len: usize) -> bool {
+    let lead = line[..at].trim_ascii_start();
+    if lead.is_empty() || lead.starts_with(b"type") || lead.starts_with(b")") {
+        return true;
     }
-    false
+    if lead.starts_with(b"func") && func_part(line, at) != FuncPart::Params {
+        return true;
+    }
+    let next = line[at + len..].trim_ascii_start();
+    let prev_close = at > 0 && line[at - 1] == b']';
+    if (next.starts_with(b"{") && !prev_close) || next.starts_with(b"[") {
+        return true;
+    }
+    let before = &line[..at];
+    let before = match before.strip_suffix(b".") {
+        Some(b) => &b[..b.iter().rposition(|&c| !word_byte(c)).map(|p| p + 1).unwrap_or(0)],
+        None => before,
+    };
+    before.ends_with(b"new(")
 }
 
 /// Whether Go source `src` can declare `name` the way `flow::Module` reads
@@ -519,47 +542,321 @@ pub(crate) fn go_could_declare(src: &[u8], name: &str) -> bool {
 /// Whether Go source `src` can define something named `name`: a function
 /// or method (the name on a `func` line) or an interface method (first on
 /// its line).
+#[cfg(test)]
 pub(crate) fn go_could_name(src: &[u8], name: &str) -> bool {
     if name.is_empty() || !name.bytes().all(word_byte) {
         return true;
     }
-    word_lines(src, name).any(|(ls, le, at)| {
-        let line = &src[ls..le];
-        let lead = line[..at].trim_ascii_start();
-        lead.is_empty() || (lead.starts_with(b"func") && func_part(line, at) == FuncPart::Name)
-    })
+    word_lines(src, name).any(|(ls, le, at)| name_at(&src[ls..le], at))
+}
+
+/// `go_could_name` for the word at byte `at` of `line`.
+fn name_at(line: &[u8], at: usize) -> bool {
+    let lead = line[..at].trim_ascii_start();
+    lead.is_empty() || (lead.starts_with(b"func") && func_part(line, at) == FuncPart::Name)
 }
 
 /// Whether Go source `src` can declare type `name`: first on its line (a
 /// grouped type spec) or on a line opening with `type`. An interface's
 /// methods sit under its declaration.
+#[cfg(test)]
 pub(crate) fn go_could_type(src: &[u8], name: &str) -> bool {
     if name.is_empty() || !name.bytes().all(word_byte) {
         return true;
     }
-    word_lines(src, name).any(|(ls, _, at)| {
-        let lead = src[ls..ls + at].trim_ascii_start();
-        lead.is_empty() || lead.starts_with(b"type")
-    })
+    word_lines(src, name).any(|(ls, le, at)| type_at(&src[ls..le], at))
 }
 
+/// `go_could_type` for the word at byte `at` of `line`.
+fn type_at(line: &[u8], at: usize) -> bool {
+    let lead = line[..at].trim_ascii_start();
+    lead.is_empty() || lead.starts_with(b"type")
+}
+
+/// Whether Go source `src` can declare `name` the way `flow::Module` reads
+/// it: a package-level type, struct, `var` or `const`, the name of a
+/// function or method, or a method of a package-level interface. Each is an
+/// identifier token `name` in code (not in a comment or a literal) that sits
+/// - outside every brace, bracket and parenthesis except the parentheses of
+///   a `var (`, `const (`, `type (` or `import (` group, and outside a
+///   function signature, or
+/// - as the name of a top-level `func`, or
+/// - directly inside the braces of an `interface` written there.
+///
+/// A top-level `func` is the keyword `func` at the start of a statement
+/// outside every bracket; its signature runs to its body's `{`, or to the
+/// end of the statement for a declaration without a body. The statement
+/// ends follow Go's semicolon rule: a newline after an identifier, a
+/// literal or a closing bracket ends one.
+#[cfg(test)]
 pub(crate) fn go_could_bind(src: &[u8], name: &str) -> bool {
+    go_scan_for(src, name, binds_here)
+}
+
+fn binds_here(stack: &[Open], sig: bool, want_name: bool) -> bool {
+    let groups = stack.iter().take_while(|&&o| o == Open::Group).count();
+    let top = !sig && groups == stack.len();
+    let iface = !sig && groups + 1 == stack.len() && stack[groups] == Open::Interface;
+    top || iface || (sig && want_name && stack.is_empty())
+}
+
+fn fields_here(stack: &[Open], sig: bool, _: bool) -> bool {
+    !sig && stack.iter().find(|&&o| o != Open::Group) == Some(&Open::Struct)
+}
+
+/// The identifiers of one Go file that `go_could_bind` and `go_could_field`
+/// take, read in one scan, each a sorted list of word ids (`Words`).
+#[derive(Default)]
+pub(crate) struct GoDecls {
+    bind: Vec<u32>,
+    field: Vec<u32>,
+    /// The words `go_could_declare`, `go_could_name` and `go_could_type` take.
+    declare: Vec<u32>,
+    named: Vec<u32>,
+    typed: Vec<u32>,
+}
+
+impl GoDecls {
+    fn of(src: &[u8], id_of: impl Fn(&str) -> Option<u32>) -> GoDecls {
+        let mut d = GoDecls::default();
+        go_scan(src, |w, stack, sig, want_name| {
+            let (bind, field) = (binds_here(stack, sig, want_name), fields_here(stack, sig, want_name));
+            if !bind && !field {
+                return false;
+            }
+            // A word with no id is held nowhere, so never asked.
+            let Some(id) = std::str::from_utf8(w).ok().and_then(&id_of) else { return false };
+            if bind {
+                d.bind.push(id);
+            }
+            if field {
+                d.field.push(id);
+            }
+            false
+        });
+        // Every whole-word occurrence is a maximal run of word bytes.
+        let (mut ls, mut le) = (0, 0);
+        let mut i = 0;
+        while i < src.len() {
+            let b = src[i];
+            if b == b'\n' {
+                ls = i + 1;
+            }
+            if !word_byte(b) {
+                i += 1;
+                continue;
+            }
+            let s = i;
+            while i < src.len() && word_byte(src[i]) {
+                i += 1;
+            }
+            if s >= le {
+                le = src[i..].iter().position(|&c| c == b'\n').map(|p| i + p).unwrap_or(src.len());
+            }
+            let (line, at, len) = (&src[ls..le], s - ls, i - s);
+            let (declare, named, typed) = (declare_at(line, at, len), name_at(line, at), type_at(line, at));
+            if !declare && !named && !typed {
+                continue;
+            }
+            // ASCII only, so the run is valid UTF-8.
+            let Some(id) = id_of(std::str::from_utf8(&src[s..i]).unwrap_or("")) else { continue };
+            for (on, set) in [(declare, &mut d.declare), (named, &mut d.named), (typed, &mut d.typed)] {
+                if on {
+                    set.push(id);
+                }
+            }
+        }
+        for set in [&mut d.bind, &mut d.field, &mut d.declare, &mut d.named, &mut d.typed] {
+            set.sort_unstable();
+            set.dedup();
+            set.shrink_to_fit();
+        }
+        d
+    }
+}
+
+/// Whether Go source `src` can declare a struct field named `name`, as
+/// `flow::Module` reads the fields of package-level structs: an identifier
+/// token in code (see `go_could_bind`) somewhere inside the braces of a
+/// `struct` that sits outside every other bracket but declaration group
+/// parentheses, and outside a function signature. Fields of structs nested
+/// in its field types are read too. An embedded field (`*pkg.Name`) is named
+/// by such a token.
+#[cfg(test)]
+pub(crate) fn go_could_field(src: &[u8], name: &str) -> bool {
+    go_scan_for(src, name, fields_here)
+}
+
+/// What a bracket the Go scanner is inside was opened by.
+#[derive(Clone, Copy, PartialEq)]
+enum Open {
+    /// The parenthesis of a `var`, `const`, `type` or `import` group.
+    Group,
+    /// The brace after `interface`.
+    Interface,
+    /// The brace after `struct`.
+    Struct,
+    Other,
+}
+
+/// Whether some identifier token `name` in code of Go source `src` is one
+/// `accept` takes (see `go_scan`). A name that is not one identifier is
+/// always taken.
+#[cfg(test)]
+fn go_scan_for(src: &[u8], name: &str, accept: fn(&[Open], bool, bool) -> bool) -> bool {
     if name.is_empty() || !name.bytes().all(word_byte) {
         return true;
     }
-    for (ls, le, at) in word_lines(src, name) {
-        let line = &src[ls..le];
-        let lead = line[..at].trim_ascii_start();
-        if lead.is_empty() || lead.starts_with(b"type") || lead.starts_with(b"var") || lead.starts_with(b"const") {
-            return true;
+    go_scan(src, |w, stack, sig, want_name| w == name.as_bytes() && accept(stack, sig, want_name))
+}
+
+/// Hand every identifier token in code of Go source `src` (not in a comment
+/// or a literal) to `visit`, with the brackets around it (outermost first),
+/// whether it is inside a top-level function signature, and whether that
+/// signature has not named its function yet. Stops, giving true, when
+/// `visit` does.
+fn go_scan(src: &[u8], mut visit: impl FnMut(&[u8], &[Open], bool, bool) -> bool) -> bool {
+    let ident = |b: u8| word_byte(b) || b >= 0x80;
+    let n = src.len();
+    let mut stack: Vec<Open> = Vec::new();
+    let (mut sig, mut want_name) = (false, false);
+    // At the start of a statement, and whether the last token can end one.
+    let (mut at_start, mut can_end) = (true, false);
+    let mut prev_word: &[u8] = b"";
+    let end_stmt = |stack: &Vec<Open>, sig: &mut bool, want_name: &mut bool| {
+        if stack.is_empty() {
+            *sig = false;
+            *want_name = false;
         }
-        if lead.starts_with(b"func") && func_part(line, at) == FuncPart::Name {
-            return true;
+    };
+    let mut i = 0;
+    while i < n {
+        let b = src[i];
+        match b {
+            b' ' | b'\t' | b'\r' => {
+                i += 1;
+                continue;
+            }
+            b'\n' => {
+                if can_end {
+                    at_start = true;
+                    can_end = false;
+                    end_stmt(&stack, &mut sig, &mut want_name);
+                }
+                i += 1;
+                continue;
+            }
+            b'/' if src.get(i + 1) == Some(&b'/') => {
+                while i < n && src[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if src.get(i + 1) == Some(&b'*') => {
+                let start = i;
+                i += 2;
+                while i + 1 < n && !(src[i] == b'*' && src[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(n);
+                // A comment holding a newline acts as one.
+                if src[start..i].contains(&b'\n') && can_end {
+                    at_start = true;
+                    can_end = false;
+                    end_stmt(&stack, &mut sig, &mut want_name);
+                }
+                continue;
+            }
+            b'"' | b'\'' => {
+                i += 1;
+                while i < n && src[i] != b && src[i] != b'\n' {
+                    i += if src[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+                prev_word = b"";
+                (at_start, can_end) = (false, true);
+                continue;
+            }
+            b'`' => {
+                i += 1;
+                while i < n && src[i] != b'`' {
+                    i += 1;
+                }
+                i += 1;
+                prev_word = b"";
+                (at_start, can_end) = (false, true);
+                continue;
+            }
+            _ => {}
+        }
+        if ident(b) {
+            let s = i;
+            while i < n && ident(src[i]) {
+                i += 1;
+            }
+            let w = &src[s..i];
+            if visit(w, &stack, sig, want_name) {
+                return true;
+            }
+            if stack.is_empty() && at_start && w == b"func" {
+                sig = true;
+                want_name = true;
+            } else if sig && want_name && stack.is_empty() {
+                want_name = false;
+            }
+            prev_word = w;
+            (at_start, can_end) = (false, true);
+            continue;
+        }
+        i += 1;
+        let word = std::mem::take(&mut prev_word);
+        match b {
+            b'(' => {
+                let group = matches!(word, b"var" | b"const" | b"type" | b"import")
+                    && stack.iter().all(|&o| o == Open::Group);
+                stack.push(if group { Open::Group } else { Open::Other });
+                (at_start, can_end) = (false, false);
+            }
+            b'[' => {
+                stack.push(Open::Other);
+                (at_start, can_end) = (false, false);
+            }
+            b'{' => {
+                if sig && stack.is_empty() {
+                    sig = false;
+                    want_name = false;
+                    stack.push(Open::Other);
+                } else {
+                    stack.push(match word {
+                        b"interface" => Open::Interface,
+                        b"struct" => Open::Struct,
+                        _ => Open::Other,
+                    });
+                }
+                (at_start, can_end) = (false, false);
+            }
+            b')' | b']' | b'}' => {
+                stack.pop();
+                (at_start, can_end) = (false, true);
+            }
+            b';' => {
+                end_stmt(&stack, &mut sig, &mut want_name);
+                (at_start, can_end) = (true, false);
+            }
+            _ => {
+                // `++` and `--` end a statement too.
+                let incdec = (b == b'+' || b == b'-') && i < n && src[i] == b && {
+                    i += 1;
+                    true
+                };
+                (at_start, can_end) = (false, incdec);
+            }
         }
     }
     false
 }
 
+#[cfg(test)]
 fn memfind(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || hay.len() < needle.len() {
         return None;
@@ -830,7 +1127,9 @@ impl LazyFlow {
         }
         let (file, lang) = &self.jobs[j];
         self.files[j] = match crate::parsed::get(file, lang) {
-            Some(p) => State::Loaded(Loaded::read(file, &p)),
+            Some(p) => {
+                State::Loaded(Loaded::read(file, &p))
+            }
             None => State::Skipped,
         };
         self.index = None;
@@ -1032,6 +1331,93 @@ mod tests {
         assert!(holds_bounded(b"a==b", "=="));
         assert!(holds_bounded(b"pkg.Fn()", "pkg.Fn"));
         assert!(!holds_bounded(b"mypkg.Fn()", "pkg.Fn"));
+    }
+
+    #[test]
+    fn a_go_binding_is_read_only_where_a_package_level_declaration_sits() {
+        let yes = [
+            ("var X = 1\n", "X"),
+            ("var (\n\ta, X int\n)\n", "X"),
+            ("const (\n\tA = iota\n\tX\n)\n", "X"),
+            ("type (\n\tX struct{ a int }\n)\n", "X"),
+            ("type X[T any] struct{}\n", "X"),
+            ("func X() {}\n", "X"),
+            ("func (s *S[T]) X(a int) error { return nil }\n", "X"),
+            ("// c\nfunc X(\n\ta int,\n) (int, error)\n", "X"),
+            ("type I interface {\n\tA() int\n\tX(b int) error\n}\n", "X"),
+            ("type I interface{ X() }\n", "X"),
+            ("func F()\nvar X = 2\n", "X"),
+            ("func F() { s := \"}\"; r := '}' }\nvar X = 2\n", "X"),
+            ("func F() { s := `}\n` }\n/* } */ var X = 2\n", "X"),
+        ];
+        for (src, name) in yes {
+            assert!(go_could_bind(src.as_bytes(), name), "{:?}", src);
+        }
+        let no = [
+            ("func F() {\n\tX := 1\n\tvar X int\n}\n", "X"),
+            ("func F(X int) (err error) {}\n", "X"),
+            ("func F(\n\tX int,\n) {}\n", "X"),
+            ("func (X *S) F() {}\n", "X"),
+            ("type S struct {\n\tX int\n}\n", "X"),
+            ("var v = T{\n\tX: 1,\n}\n", "X"),
+            ("// X\nvar s = \"X\"\n", "X"),
+            ("func F() error\nfunc G() { X() }\n", "X"),
+            ("var f func(X int)\n", "X"),
+            ("type S struct{ i interface{ X() } }\n", "X"),
+        ];
+        for (src, name) in no {
+            assert!(!go_could_bind(src.as_bytes(), name), "{:?}", src);
+        }
+    }
+
+    #[test]
+    fn the_per_file_word_sets_agree_with_the_per_name_filters_on_the_go_fixtures() {
+        let path = format!("{}/fixtures", env!("CARGO_MANIFEST_DIR"));
+        let jobs: Vec<_> = crate::files::resolve_jobs(&path, None, false).into_iter().filter(|(_, l)| *l == "go").collect();
+        assert!(jobs.len() > 5);
+        for (file, _) in &jobs {
+            let src = std::fs::read(file).unwrap();
+            let mut ids: HashMap<String, u32> = HashMap::new();
+            let mut words: Vec<&str> = std::str::from_utf8(&src).unwrap_or("").split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).filter(|w| !w.is_empty()).collect();
+            words.sort();
+            words.dedup();
+            for (k, w) in words.iter().enumerate() {
+                ids.insert(w.to_string(), k as u32);
+            }
+            let d = GoDecls::of(&src, |w| ids.get(w).copied());
+            let has = |set: &Vec<u32>, w: &str| set.binary_search(&ids[w]).is_ok();
+            for w in words {
+                assert_eq!(has(&d.declare, w), go_could_declare(&src, w), "declare {} in {}", w, file);
+                assert_eq!(has(&d.named, w), go_could_name(&src, w), "name {} in {}", w, file);
+                assert_eq!(has(&d.typed, w), go_could_type(&src, w), "type {} in {}", w, file);
+                assert_eq!(has(&d.bind, w), go_could_bind(&src, w), "bind {} in {}", w, file);
+                assert_eq!(has(&d.field, w), go_could_field(&src, w), "field {} in {}", w, file);
+            }
+        }
+    }
+
+    #[test]
+    fn a_go_field_is_read_only_inside_a_package_level_struct() {
+        let yes = [
+            "type S struct {\n\tX int\n}\n",
+            "type (\n\tS struct{ a, X int }\n)\n",
+            "type S struct {\n\t*pkg.X\n}\n",
+            "type S[T any] struct {\n\tIn struct {\n\t\tX T\n\t}\n\tF func(struct{ X int })\n}\n",
+            "var v struct{ X int }\n",
+        ];
+        for src in yes {
+            assert!(go_could_field(src.as_bytes(), "X"), "{:?}", src);
+        }
+        let no = [
+            "func F() {\n\ttype S struct{ X int }\n\tv := T{X: 1}\n\t_ = v.X\n}\n",
+            "func F(s struct{ X int }) {}\n",
+            "type S struct {\n\tA int `json:\"X\"` // X\n}\n",
+            "var v = T{X: 1}\n",
+            "type I interface{ X() }\n",
+        ];
+        for src in no {
+            assert!(!go_could_field(src.as_bytes(), "X"), "{:?}", src);
+        }
     }
 
     #[test]

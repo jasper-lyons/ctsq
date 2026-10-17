@@ -105,8 +105,21 @@ pub struct LazyModule {
     /// Parses read here, kept so the walk that reads the file next finds it parsed.
     kept: RefCell<Vec<Rc<crate::parsed::ParsedFile>>>,
     readers: RefCell<HashMap<String, Vec<Reader>>>,
-    /// The files read for each (name, binding).
-    lists: RefCell<HashMap<(String, bool), Vec<(String, &'static str)>>>,
+    /// The files read for each (name, kind of read).
+    lists: RefCell<HashMap<(String, Reads), Vec<(String, &'static str)>>>,
+}
+
+/// Which files holding a name a `LazyModule` read takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Reads {
+    /// Every one.
+    All,
+    /// Those that can declare it at package level or as an interface
+    /// method (`scoped::go_could_bind`).
+    Binding,
+    /// Those that can declare a struct field of that name
+    /// (`scoped::go_could_field`).
+    Field,
 }
 
 impl std::fmt::Debug for LazyModule {
@@ -116,21 +129,24 @@ impl std::fmt::Debug for LazyModule {
 }
 
 impl LazyModule {
-    /// (path, declarations) of every Go file holding `name`, in store order,
-    /// or only of those that can declare it at package level or in a type
-    /// when `binding` (an embedded field does not put its name first).
-    fn holders(&self, name: &str, binding: bool) -> Vec<(String, Rc<Module>)> {
+    /// (path, declarations) of every Go file holding `name` that `reads`
+    /// takes, in store order.
+    fn holders(&self, name: &str, reads: Reads) -> Vec<(String, Rc<Module>)> {
         let mut out = vec![];
         // No declaration is named by nothing, and every file holds it.
         if name.is_empty() {
             return out;
         }
-        let key = (name.to_string(), binding);
+        let key = (name.to_string(), reads);
         let cached = self.lists.borrow().get(&key).cloned();
         let files = match cached {
             Some(f) => f,
             None => {
-                let f = if binding { self.finder.binders(name) } else { self.finder.holders(name) };
+                let f = match reads {
+                    Reads::All => self.finder.holders(name),
+                    Reads::Binding => self.finder.binders(name),
+                    Reads::Field => self.finder.fielders(name),
+                };
                 self.lists.borrow_mut().insert(key, f.clone());
                 f
             }
@@ -157,7 +173,7 @@ impl LazyModule {
 
     /// The last declaration of `key` in a file holding `name`.
     fn last<T: Clone>(&self, name: &str, get: impl Fn(&Module) -> Option<T>) -> Option<T> {
-        self.holders(name, true).iter().filter_map(|(_, m)| get(m)).last()
+        self.holders(name, Reads::Binding).iter().filter_map(|(_, m)| get(m)).last()
     }
 }
 
@@ -189,7 +205,7 @@ impl Module {
     pub fn has_type(&self, t: &str) -> bool {
         match &self.lazy {
             None => self.types.contains(t),
-            Some(l) => l.holders(t, true).iter().any(|(_, m)| m.types.contains(t)),
+            Some(l) => l.holders(t, Reads::Binding).iter().any(|(_, m)| m.types.contains(t)),
         }
     }
 
@@ -210,7 +226,7 @@ impl Module {
         }
         let mut out = vec![];
         if self.global(name).is_some() {
-            for (path, _) in l.holders(name, false) {
+            for (path, _) in l.holders(name, Reads::All) {
                 let Some(p) = crate::parsed::get(&path, "go") else { continue };
                 let Some(tree) = &p.tree else { continue };
                 let mut one = Module::default();
@@ -252,7 +268,8 @@ impl Module {
             return self.structs.values().filter(|fs| fs.iter().any(&keep)).cloned().collect();
         };
         let mut names: Vec<String> = vec![];
-        for (_, m) in l.holders(name, false) {
+        // `keep` takes only fields named `name`.
+        for (_, m) in l.holders(name, Reads::Field) {
             for (s, fs) in &m.structs {
                 if fs.iter().any(&keep) && !names.contains(s) {
                     names.push(s.clone());
