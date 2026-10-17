@@ -1,7 +1,8 @@
 """Shared cache of reference-binary output for the three check scripts.
 
 run_ref(binary, root, args, timeout) returns (exit code, stdout, stderr), read
-from CACHE_DIR when a record exists for sha256(binary bytes) + root + args,
+from CACHE_DIR when a record exists for sha256(binary bytes) + root + args +
+the run's environment (_env_key: its CTSQ_ variables, and what `env` changes),
 otherwise computed by running the binary and stored. Only the reference binary
 goes through this; the new binary always runs.
 
@@ -48,14 +49,35 @@ def _binary_digest(binary):
     return _digests[binary]
 
 
-def _path(binary, root, args):
-    key = json.dumps([_binary_digest(binary), root, _fingerprint(root), list(args)])
+def _env_key(env):
+    """The part of the run's environment that can change its output: every
+    CTSQ_ variable it runs with (from `env`, or inherited when `env` is None),
+    and any other variable `env` sets differently from, or drops from, this
+    process's environment."""
+    base = os.environ
+    eff = base if env is None else env
+    ctsq = sorted((k, v) for k, v in eff.items() if k.startswith("CTSQ_"))
+    if env is None:
+        return [ctsq, [], []]
+    diff = sorted((k, v) for k, v in env.items() if not k.startswith("CTSQ_") and base.get(k) != v)
+    gone = sorted(k for k in base if k not in env and not k.startswith("CTSQ_"))
+    return [ctsq, diff, gone]
+
+
+def _path(binary, root, args, env=None):
+    key = [_binary_digest(binary), root, _fingerprint(root), list(args)]
+    e = _env_key(env)
+    # A run in a plain environment keeps the key it had before the
+    # environment was part of it.
+    if e != [[], [], []]:
+        key.append(e)
+    key = json.dumps(key)
     return os.path.join(CACHE_DIR, hashlib.sha256(key.encode()).hexdigest() + ".json")
 
 
 def run_ref(binary, root, args, timeout=900, env=None):
     use = os.environ.get("REFCACHE", "1") != "0"
-    path = _path(binary, root, args) if use else None
+    path = _path(binary, root, args, env) if use else None
     if path and os.path.exists(path):
         try:
             with open(path) as f:
