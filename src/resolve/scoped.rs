@@ -512,8 +512,30 @@ pub(crate) fn go_could_declare(src: &[u8], name: &str) -> bool {
     if name.is_empty() || !name.bytes().all(word_byte) {
         return true;
     }
-    word_lines(src, name).any(|(ls, le, at)| declare_at(&src[ls..le], at, name.len()))
+    let semis = code_semis(src);
+    word_lines(src, name).any(|(ls, le, at)| on_line_or_stmt(src, &semis, ls, le, ls + at, |l, a| declare_at(l, a, name.len())))
         || go_scan_for(src, name, results_here)
+}
+
+/// Whether `rule` takes the word at byte `at` of `src`, read against its line
+/// (`ls..le`) or against the statement it sits in when a `;` in code (offsets
+/// past each in `semis`, sorted) starts that statement later on the line, as
+/// in `var x = 1; func F()`. The line rules only see a `func`, `type` or
+/// indentation at the start of a line.
+fn on_line_or_stmt(src: &[u8], semis: &[usize], ls: usize, le: usize, at: usize, rule: impl Fn(&[u8], usize) -> bool) -> bool {
+    if rule(&src[ls..le], at - ls) {
+        return true;
+    }
+    let k = semis.partition_point(|&p| p <= at);
+    k > 0 && semis[k - 1] > ls && rule(&src[semis[k - 1]..le], at - semis[k - 1])
+}
+
+/// The offsets just past each `;` in code of Go source `src`.
+#[cfg(test)]
+fn code_semis(src: &[u8]) -> Vec<usize> {
+    let mut semis = Vec::new();
+    go_scan(src, &mut semis, |_, _, _, _| false);
+    semis
 }
 
 /// `go_could_declare` for the word of `len` bytes at byte `at` of `line`.
@@ -550,7 +572,8 @@ pub(crate) fn go_could_name(src: &[u8], name: &str) -> bool {
     if name.is_empty() || !name.bytes().all(word_byte) {
         return true;
     }
-    word_lines(src, name).any(|(ls, le, at)| name_at(&src[ls..le], at))
+    let semis = code_semis(src);
+    word_lines(src, name).any(|(ls, le, at)| on_line_or_stmt(src, &semis, ls, le, ls + at, name_at))
 }
 
 /// `go_could_name` for the word at byte `at` of `line`.
@@ -567,7 +590,8 @@ pub(crate) fn go_could_type(src: &[u8], name: &str) -> bool {
     if name.is_empty() || !name.bytes().all(word_byte) {
         return true;
     }
-    word_lines(src, name).any(|(ls, le, at)| type_at(&src[ls..le], at))
+    let semis = code_semis(src);
+    word_lines(src, name).any(|(ls, le, at)| on_line_or_stmt(src, &semis, ls, le, ls + at, type_at))
 }
 
 /// `go_could_type` for the word at byte `at` of `line`.
@@ -629,7 +653,8 @@ pub(crate) struct GoDecls {
 impl GoDecls {
     fn of(src: &[u8], id_of: impl Fn(&str) -> Option<u32>) -> GoDecls {
         let mut d = GoDecls::default();
-        go_scan(src, |w, stack, sig, want_name| {
+        let mut semis = Vec::new();
+        go_scan(src, &mut semis, |w, stack, sig, want_name| {
             let (bind, field) = (binds_here(stack, sig, want_name), fields_here(stack, sig, want_name));
             let result = results_here(stack, sig, want_name);
             if !bind && !field && !result {
@@ -663,8 +688,10 @@ impl GoDecls {
             if s >= le {
                 le = src[i..].iter().position(|&c| c == b'\n').map(|p| i + p).unwrap_or(src.len());
             }
-            let (line, at, len) = (&src[ls..le], s - ls, i - s);
-            let (declare, named, typed) = (declare_at(line, at, len), name_at(line, at), type_at(line, at));
+            let len = i - s;
+            let declare = on_line_or_stmt(src, &semis, ls, le, s, |l, at| declare_at(l, at, len));
+            let named = on_line_or_stmt(src, &semis, ls, le, s, name_at);
+            let typed = on_line_or_stmt(src, &semis, ls, le, s, type_at);
             if !declare && !named && !typed {
                 continue;
             }
@@ -719,15 +746,16 @@ fn go_scan_for(src: &[u8], name: &str, accept: fn(&[Open], bool, bool) -> bool) 
     if name.is_empty() || !name.bytes().all(word_byte) {
         return true;
     }
-    go_scan(src, |w, stack, sig, want_name| w == name.as_bytes() && accept(stack, sig, want_name))
+    go_scan(src, &mut Vec::new(), |w, stack, sig, want_name| w == name.as_bytes() && accept(stack, sig, want_name))
 }
 
 /// Hand every identifier token in code of Go source `src` (not in a comment
 /// or a literal) to `visit`, with the brackets around it (outermost first),
 /// whether it is inside a top-level function signature, and whether that
 /// signature has not named its function yet. Stops, giving true, when
-/// `visit` does.
-fn go_scan(src: &[u8], mut visit: impl FnMut(&[u8], &[Open], bool, bool) -> bool) -> bool {
+/// `visit` does. Pushes onto `semis` the offset just past each `;` in code,
+/// where a statement starts that need not start its line.
+fn go_scan(src: &[u8], semis: &mut Vec<usize>, mut visit: impl FnMut(&[u8], &[Open], bool, bool) -> bool) -> bool {
     let ident = |b: u8| word_byte(b) || b >= 0x80;
     let n = src.len();
     let mut stack: Vec<Open> = Vec::new();
@@ -864,6 +892,7 @@ fn go_scan(src: &[u8], mut visit: impl FnMut(&[u8], &[Open], bool, bool) -> bool
                 (at_start, can_end) = (false, true);
             }
             b';' => {
+                semis.push(i);
                 end_stmt(&stack, &mut sig, &mut want_name);
                 (at_start, can_end) = (true, false);
             }
@@ -1602,6 +1631,24 @@ mod tests {
         }
         let (d, jobs) = go_jobs("named-result", &[("x.go", RUNNER), ("make.go", "package a\n\nfunc MakeLazy() (\n\tl *Lazy,\n) {\n\treturn\n}\n")]);
         agrees_with_whole(&jobs, &["Sink", "Run", "Disp"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_declaration_after_a_semicolon_is_seen() {
+        let y = "package a\n\nvar semi = 1; func OneLine(s string) string { return Sink(s) }\n\n\
+            type T struct{}; func (T) Run(v string) string { return Sink(v) }\n\nvar made = T{}\n";
+        assert!(go_could_name(y.as_bytes(), "OneLine"));
+        assert!(go_could_name(y.as_bytes(), "Run"));
+        assert!(go_could_declare(y.as_bytes(), "OneLine"));
+        assert!(go_could_type(b"var a = 1; type T int\n", "T"));
+        // A `;` in a literal or a comment starts no statement.
+        assert!(!go_could_name(b"var s = \"x; func F\"\n", "F"));
+        assert!(!go_could_name(b"var s = 1 // x; func F\n", "F"));
+        let x = "package a\n\nfunc Sink(v string) string { return v }\n\nfunc Entry(s string) string { return OneLine(s) }\n\n\
+            type R interface{ Run(v string) string }\n\nfunc Disp(r R, s string) string { return r.Run(s) }\n";
+        let (d, jobs) = go_jobs("semicolon", &[("x.go", x), ("y.go", y)]);
+        agrees_with_whole(&jobs, &["Sink", "Run", "Disp", "Entry", "OneLine"]);
         let _ = std::fs::remove_dir_all(&d);
     }
 
