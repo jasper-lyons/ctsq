@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Time the base binary against the new one over three repos.
+# Time the base binary against the new one over three repos, with peak RSS (MB).
 # BASE defaults to the build's base commit 5f867dc, built out of tree:
 #   git archive -o base.tar 5f867dc, untar into $BASE_DIR, cargo build --release there.
 # Usage: bash plans/agent-search/measure/bench.sh [RUNS]
