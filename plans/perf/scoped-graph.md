@@ -7,6 +7,8 @@
 - **Resolved files (R).** The files whose call sites are resolved into edges. The walk reads `rev[K]` (callers) or `fwd[K]` (callees) for each key it reaches.
   - `fwd[Def D]` holds only calls written inside D, so it needs D's own file.
   - `rev[Def D]` and `rev[External N]` hold calls that resolved to D, or stayed unresolved with display name N. Every resolution path ends in a name written in the calling file: the callee name, the inner callee of a Go or Rust function-value binding (`f := X`), a Rust `use` path or alias, or the method name in Go interface and Rust trait dispatch. So a call to a definition named N sits in a file whose bytes hold N, and those files are R for that key.
+- **Wanted calls.** In a resolved file only the calls a walk can read are resolved: every call inside a function whose callees are walked, and elsewhere the calls whose callee is a walked name, or a local holding a function value (Go, Rust), or an imported name (Rust), since only those can reach a definition of another name. Each (caller, callee, target) edge keeps all its sites or none, so the first-site rule picks the same line.
+- **Holding a name.** A file holds N when N occurs bounded by bytes that cannot continue an identifier (ASCII letters, digits, `_`). A lexer takes the longest identifier run, so every definition and call of N is such an occurrence. Names made only of those bytes are looked up in a per-run token index, others are searched in the text.
 - **Index files (P).** The files whose definitions are in the index the resolvers read. R is always inside P, so `def_at` (attributing a call to its enclosing function) and the fallback resolver's per-file definitions are whole.
 
 ## Depth
@@ -26,11 +28,13 @@ Every answer to a read of name N comes from files holding N. The build loops: re
 
 ## The definition index stays scoped
 
-A whole-folder index needs a parse of every file, which is the 60% the profile shows. The rule above makes the scoped index give the same answer to every read the resolution makes, so it is never built whole. `def A B C` builds one index from the files holding any of the names, once, and builds the whole index only when a name misses, since the miss report suggests from every name. `explain` reads its outline sites and its references only in files holding the bare name, since an outline entry or an `id#` match of a name holds its bytes.
+A whole-folder index needs a parse of every file, which is the 60% the profile shows. The rule above makes the scoped index give the same answer to every read the resolution makes, so it is never built whole. `def A B C` builds one index from the files holding any of the names, once, and builds the whole index only when a name misses, since the miss report suggests from every name. `explain` reads its outline sites and its references only in files holding the bare name, since an outline entry or an `id#` match of a name holds its bytes, and hands those same parses to the graph builder.
+
+Every loaded file is read for its definitions and its calls (a model with no tree) in the one parse, and the tree is dropped, so memory follows the files loaded, not the trees.
 
 ## callgraph
 
-Whole-folder by nature. It keeps one parse per file.
+Whole-folder by nature. One parse per file, read into definitions and a call model and dropped, so it no longer holds every tree.
 
 ## Fallback to the whole folder
 
