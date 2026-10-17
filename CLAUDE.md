@@ -30,6 +30,7 @@ src/
 │       ├── ruby.rs
 │       ├── rust.rs
 │       └── go.rs
+├── parsed.rs         Per-run cache: each file read once, parsed once per grammar (`parsed::get`); CTSQ_PARSE_STATS=1 prints counts at exit
 ├── runner.rs         Executes a CompiledQuery against source bytes; returns Match list
 ├── explain.rs        `explain` subcommand — composes def + body text + callers + callees + refs
 ├── tree.rs           `tree` subcommand — structural outline, with a size header and per-entry signatures
