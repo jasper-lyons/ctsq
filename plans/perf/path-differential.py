@@ -4,7 +4,8 @@ Runs call routes (`-->`, `->`, `<--`) and data-flow routes (`==>`, `=>`,
 `<==`, `<=`) with the reference binary and the new one, and compares stdout,
 stderr and the exit code. The inputs are routes on Mavexa backend, and every
 query string the tests/path*.rs suites hold, run against each directory under
-fixtures/flow plus fixtures/path. Prints one DIFF line per call that differs
+fixtures/flow plus fixtures/path, and the calls of the review repros under
+plans/perf/repros-89d3cf4 (some of them callers, callees and explain). Prints one DIFF line per call that differs
 and a total. Usage: path-differential.py REF NEW REPO [JOBS]
 """
 import concurrent.futures
@@ -65,6 +66,20 @@ MAVEXA_ROUTES = [
     ["function#decodeBody param#r ==>", "--max", "2"],
 ]
 
+# The 89d3cf4 review's repros (plans/perf/repros-89d3cf4/run.sh), each a
+# folder under that one with the calls that differed there.
+REPROS = [
+    ("named-result-line", ["path", "function#Disp param#s ==> function#Sink", "."]),
+    ("newt-convention", ["path", "function#Disp param#s ==> function#Sink", "."]),
+    ("newt-convention", ["path", "function#Disp --> function#Sink", "."]),
+    ("newt-convention", ["callers", "Sink", "."]),
+    ("newt-convention", ["callers", "Run", "."]),
+    ("newt-convention", ["callees", "Disp", "."]),
+    ("newt-convention", ["explain", "Disp", "."]),
+    ("semicolon-decl", ["path", "function#Entry param#s ==> function#Sink", "."]),
+    ("semicolon-decl", ["path", "function#Disp param#s ==> function#Sink", "."]),
+]
+
 
 def test_queries():
     """Every route string in tests/path*.rs, placeholders left out."""
@@ -88,6 +103,8 @@ def calls():
     for q in test_queries():
         for d in dirs:
             yield d, ["path", q, "."]
+    for name, args in REPROS:
+        yield os.path.join(REPO, "plans", "perf", "repros-89d3cf4", name), args
 
 
 def run(binary, root, args):
