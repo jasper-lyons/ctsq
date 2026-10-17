@@ -116,10 +116,6 @@ pub fn evaluate_flows(
     }
 
     // The end: tail rows by file, or every outside call.
-    let mut ptrs: HashMap<usize, String> = HashMap::new();
-    for (file, pf) in store.iter() {
-        ptrs.insert(pf.source.as_ptr() as usize, file.to_string());
-    }
     let mut ends: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
     if let Some(t) = tail {
         for (file, rows) in tail_rows(t, store)? {
@@ -127,16 +123,22 @@ pub fn evaluate_flows(
         }
     }
     let imports_cache: RefCell<HashMap<String, HashMap<String, String>>> = RefCell::new(HashMap::new());
-    let files: Vec<(&str, Node, &[u8])> = store
-        .iter()
-        .filter(|(_, pf)| pf.lang == "go")
-        .filter_map(|(f, pf)| pf.tree.as_ref().map(|t| (f, t.root_node(), pf.source.as_slice())))
-        .collect();
-    let module = Module::build(&files, &cfg.mechanics);
+    // A lazy store gives a module read one name at a time.
+    let module = match store.finder() {
+        Some(f) => Module::lazy(f, &cfg.mechanics),
+        None => {
+            let files: Vec<(&str, Node, &[u8])> = store
+                .iter()
+                .filter(|(_, pf)| pf.lang == "go")
+                .filter_map(|(f, pf)| pf.tree.as_ref().map(|t| (f, t.root_node(), pf.source.as_slice())))
+                .collect();
+            Module::build(&files, &cfg.mechanics)
+        }
+    };
     let modpath = cfg.module_path.clone();
     let has_end = tail.is_some();
     let is_end = |n: Node, src: &[u8]| -> bool {
-        let Some(file) = ptrs.get(&(src.as_ptr() as usize)) else { return false };
+        let Some(file) = store.file_of(src) else { return false };
         let Some(f) = n.child_by_field_name("function") else { return false };
         if has_end {
             let name = f.child_by_field_name("field").unwrap_or(f);
@@ -433,11 +435,11 @@ fn field_users(
 ) -> Vec<(String, usize)> {
     let m = &cfg.mechanics;
     let mut out = vec![];
-    for (file, pf) in store.iter() {
+    // A file without the name has no field called `name`.
+    for (file, pf) in store.holding(&[name]) {
         if pf.lang != "go" {
             continue;
         }
-        // A file without the name's bytes has no field called `name`.
         if !crate::needle::holds(&pf.source, name) {
             continue;
         }
@@ -535,7 +537,7 @@ fn is_outside_call(
     // package holds a value of that package (`c := ses.NewFromConfig(cfg)`).
     let path = path.or_else(|| {
         // A type the module declares is not outside.
-        if typed.as_deref().is_some_and(|t| t.contains('.') || cx.module.types.contains(flow::base_type(t).as_str())) {
+        if typed.as_deref().is_some_and(|t| t.contains('.') || cx.module.has_type(flow::base_type(t).as_str())) {
             return None;
         }
         flow::bound_from(cx.mech, src, operand)
@@ -978,8 +980,9 @@ impl<'a> Walk<'a> {
         let local = declares(outer, &pf.source, m, name);
         if local {
             fn_assignments(outer, &pf.source, m, name, Some(site.node.start_byte()), file, &mut assigns);
-        } else if self.module.globals.contains_key(name) {
-            for (f, fpf) in self.store.iter() {
+        } else if self.module.global(name).is_some() {
+            // An assignment to `name` is in a file holding it.
+            for (f, fpf) in self.store.holding(&[name]) {
                 if fpf.lang != "go" || f.ends_with("_test.go") {
                     continue;
                 }

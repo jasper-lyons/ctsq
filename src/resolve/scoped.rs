@@ -273,6 +273,7 @@ impl<'a> Scope<'a> {
 /// a name holds it bounded by bytes that cannot continue it.
 pub(crate) struct Words {
     sources: Vec<Option<crate::parsed::Source>>,
+    langs: Vec<&'static str>,
     tokens: HashMap<Box<str>, Vec<u32>>,
 }
 
@@ -314,12 +315,40 @@ impl Words {
             }
             sources.push(src);
         }
-        Words { sources, tokens }
+        Words { sources, tokens, langs: jobs.iter().map(|(_, l)| *l).collect() }
     }
 
     /// The text of job `j`, None when it could not be read.
     pub(crate) fn source(&self, j: usize) -> Option<&crate::parsed::Source> {
         self.sources.get(j).and_then(|s| s.as_ref())
+    }
+
+    /// The jobs of `holders(name)` that can give an index read of `name`
+    /// an answer: a Go file only when `go_could_declare` says so, a file of
+    /// any other language always.
+    pub(crate) fn declarers(&self, name: &str) -> Vec<usize> {
+        self.holders(name)
+            .into_iter()
+            .filter(|&j| self.langs[j] != "go" || self.sources[j].as_ref().is_some_and(|s| go_could_declare(s, name)))
+            .collect()
+    }
+
+    /// The jobs of `holders(name)` that `go_could_bind` keeps, any file of
+    /// another language kept.
+    pub(crate) fn binders(&self, name: &str) -> Vec<usize> {
+        self.holders(name)
+            .into_iter()
+            .filter(|&j| self.langs[j] != "go" || self.sources[j].as_ref().is_some_and(|s| go_could_bind(s, name)))
+            .collect()
+    }
+
+    /// The jobs of `holders(name)` that can define `name` (`go_could_name`),
+    /// any file of another language kept.
+    pub(crate) fn namers(&self, name: &str) -> Vec<usize> {
+        self.holders(name)
+            .into_iter()
+            .filter(|&j| self.langs[j] != "go" || self.sources[j].as_ref().is_some_and(|s| go_could_name(s, name)))
+            .collect()
     }
 
     /// Jobs whose file holds `name`, in job order.
@@ -331,6 +360,203 @@ impl Words {
             .filter(|&j| self.sources[j].as_ref().is_some_and(|s| holds_bounded(s, name)))
             .collect()
     }
+}
+
+/// Where on a line opening with `func` a name at byte `at` sits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FuncPart {
+    Receiver,
+    Name,
+    TypeParams,
+    Params,
+    /// The results, or anything after the parameters.
+    Rest,
+}
+
+/// The index past the bracket closing the one at `open`, or None when the
+/// line ends first.
+fn close_of(line: &[u8], open: usize) -> Option<usize> {
+    let (o, c) = (line[open], if line[open] == b'(' { b')' } else { b']' });
+    let mut depth = 0usize;
+    for (k, &b) in line.iter().enumerate().skip(open) {
+        if b == o {
+            depth += 1;
+        } else if b == c {
+            depth -= 1;
+            if depth == 0 {
+                return Some(k + 1);
+            }
+        }
+    }
+    None
+}
+
+fn skip_ws(line: &[u8], mut p: usize) -> usize {
+    while p < line.len() && (line[p] == b' ' || line[p] == b'\t') {
+        p += 1;
+    }
+    p
+}
+
+/// The part of `func [ (recv) ] name [ [T any] ] (params) results` holding
+/// byte `at` of `line`, which opens (after indentation) with `func`.
+fn func_part(line: &[u8], at: usize) -> FuncPart {
+    let mut p = skip_ws(line, 0) + 4;
+    p = skip_ws(line, p);
+    if p < line.len() && line[p] == b'(' {
+        match close_of(line, p) {
+            Some(e) if at < e => return FuncPart::Receiver,
+            Some(e) => p = skip_ws(line, e),
+            None => return FuncPart::Receiver,
+        }
+    }
+    let s = p;
+    while p < line.len() && word_byte(line[p]) {
+        p += 1;
+    }
+    if at >= s && at < p {
+        return FuncPart::Name;
+    }
+    p = skip_ws(line, p);
+    if p < line.len() && line[p] == b'[' {
+        match close_of(line, p) {
+            Some(e) if at < e => return FuncPart::TypeParams,
+            Some(e) => p = skip_ws(line, e),
+            None => return FuncPart::TypeParams,
+        }
+    }
+    if p < line.len() && line[p] == b'(' {
+        match close_of(line, p) {
+            Some(e) if at < e => return FuncPart::Params,
+            Some(_) => {}
+            None => return FuncPart::Params,
+        }
+    }
+    FuncPart::Rest
+}
+
+/// Whole-word occurrences of `name` in `src`, each as (line start, line
+/// end, offset in the line).
+fn word_lines<'s>(src: &'s [u8], name: &'s str) -> impl Iterator<Item = (usize, usize, usize)> + 's {
+    let n = name.as_bytes();
+    let mut from = 0;
+    std::iter::from_fn(move || {
+        while from + n.len() <= src.len() {
+            let i = from + memfind(&src[from..], n)?;
+            let end = i + n.len();
+            from = i + 1;
+            if (i > 0 && word_byte(src[i - 1])) || (end < src.len() && word_byte(src[end])) {
+                continue;
+            }
+            let ls = src[..i].iter().rposition(|&b| b == b'\n').map(|p| p + 1).unwrap_or(0);
+            let le = src[end..].iter().position(|&b| b == b'\n').map(|p| end + p).unwrap_or(src.len());
+            return Some((ls, le, i - ls));
+        }
+        None
+    })
+}
+
+/// Whether Go source `src` can answer an index read of `name` (see
+/// plans/perf/scoped-graph.md, section path). The Go definitions are
+/// top-level functions, methods and interface methods, and the other reads
+/// are interface `name`, a construction of `name` (`name{`, `pkg.name{`,
+/// `name[T]{`, `new(name)`) and a function returning `name`. Each puts a
+/// whole-word `name`:
+/// - first on its line (an interface method, a grouped type spec, a result
+///   on a line of its own),
+/// - on a line opening with `type`, or with `)` (the results after a
+///   parameter list that spans lines),
+/// - on a line opening with `func`, outside the parameter list,
+/// - right before `{` or `[`, not right after `]` (a slice or map literal
+///   constructs no named type),
+/// - right after `new(`, or `new(pkg.`.
+///
+/// A file with no such occurrence declares, constructs and returns nothing
+/// called `name`, so no read of `name` is answered from it.
+pub(crate) fn go_could_declare(src: &[u8], name: &str) -> bool {
+    if name.is_empty() || !name.bytes().all(word_byte) {
+        return true;
+    }
+    for (ls, le, at) in word_lines(src, name) {
+        let line = &src[ls..le];
+        let lead = line[..at].trim_ascii_start();
+        if lead.is_empty() || lead.starts_with(b"type") || lead.starts_with(b")") {
+            return true;
+        }
+        if lead.starts_with(b"func") && func_part(line, at) != FuncPart::Params {
+            return true;
+        }
+        let next = line[at + name.len()..].trim_ascii_start();
+        let prev_close = at > 0 && line[at - 1] == b']';
+        if (next.starts_with(b"{") && !prev_close) || next.starts_with(b"[") {
+            return true;
+        }
+        let before = &line[..at];
+        let before = match before.strip_suffix(b".") {
+            Some(b) => &b[..b.iter().rposition(|&c| !word_byte(c)).map(|p| p + 1).unwrap_or(0)],
+            None => before,
+        };
+        if before.ends_with(b"new(") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether Go source `src` can declare `name` the way `flow::Module` reads
+/// it: a type, struct, `var` or `const`, or the name of a function, method
+/// or interface method. Each puts `name` first on its line, on a line
+/// opening with `type`, `var` or `const`, or as the name on a `func` line.
+/// Whether Go source `src` can define something named `name`: a function
+/// or method (the name on a `func` line) or an interface method (first on
+/// its line).
+pub(crate) fn go_could_name(src: &[u8], name: &str) -> bool {
+    if name.is_empty() || !name.bytes().all(word_byte) {
+        return true;
+    }
+    word_lines(src, name).any(|(ls, le, at)| {
+        let line = &src[ls..le];
+        let lead = line[..at].trim_ascii_start();
+        lead.is_empty() || (lead.starts_with(b"func") && func_part(line, at) == FuncPart::Name)
+    })
+}
+
+pub(crate) fn go_could_bind(src: &[u8], name: &str) -> bool {
+    if name.is_empty() || !name.bytes().all(word_byte) {
+        return true;
+    }
+    for (ls, le, at) in word_lines(src, name) {
+        let line = &src[ls..le];
+        let lead = line[..at].trim_ascii_start();
+        if lead.is_empty() || lead.starts_with(b"type") || lead.starts_with(b"var") || lead.starts_with(b"const") {
+            return true;
+        }
+        if lead.starts_with(b"func") && func_part(line, at) == FuncPart::Name {
+            return true;
+        }
+    }
+    false
+}
+
+fn memfind(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    let first = needle[0];
+    let mut i = 0;
+    while i + needle.len() <= hay.len() {
+        match hay[i..hay.len() - needle.len() + 1].iter().position(|&b| b == first) {
+            None => return None,
+            Some(p) => {
+                i += p;
+                if &hay[i..i + needle.len()] == needle {
+                    return Some(i);
+                }
+                i += 1;
+            }
+        }
+    }
+    None
 }
 
 /// Whether `hay` holds `name` with no identifier byte touching an end of it
@@ -375,7 +601,6 @@ pub(crate) fn holds_any(hay: &[u8], names: &[&str]) -> bool {
 #[derive(Debug, Clone)]
 pub struct Site {
     pub file: String,
-    pub caller: usize,
     pub target: Option<usize>,
     pub start_byte: usize,
     pub end_byte: usize,
@@ -429,7 +654,10 @@ struct LazyFlow {
     words: Rc<Words>,
     job_of: HashMap<String, usize>,
     files: Vec<State>,
+    /// Names whose every file that can answer any read of them is loaded.
     covered: HashSet<String>,
+    /// Names whose every file that can define them is loaded.
+    named: HashSet<String>,
     /// The index over the loaded files with each entry's (job, position in
     /// its file), rebuilt when a file is loaded.
     index: Option<(super::DefIndex, Vec<(usize, usize)>)>,
@@ -455,7 +683,6 @@ impl FlowGraph {
             }
             sites.push(Rc::new(Site {
                 file: d.id.file.clone(),
-                caller: s.caller,
                 target: s.target.map(|(t, _)| t),
                 start_byte: s.start_byte,
                 end_byte: s.end_byte,
@@ -484,6 +711,7 @@ impl FlowGraph {
                 job_of,
                 files,
                 covered: HashSet::new(),
+                named: HashSet::new(),
                 index: None,
                 defs: Vec::new(),
                 key_of: HashMap::new(),
@@ -588,7 +816,18 @@ impl LazyFlow {
     fn cover(&mut self, names: &[String]) {
         for n in names {
             if self.covered.insert(n.clone()) {
-                for j in self.words.holders(n) {
+                for j in self.words.declarers(n) {
+                    self.load(j);
+                }
+            }
+        }
+    }
+
+    /// Load every file that can define one of `names`.
+    fn cover_named(&mut self, names: &[String]) {
+        for n in names {
+            if !self.covered.contains(n) && self.named.insert(n.clone()) {
+                for j in self.words.namers(n) {
                     self.load(j);
                 }
             }
@@ -608,7 +847,7 @@ impl LazyFlow {
     }
 
     fn by_name(&mut self, name: &str) -> Vec<usize> {
-        self.cover(&[name.to_string()]);
+        self.cover_named(&[name.to_string()]);
         let mut out = Vec::new();
         for j in self.words.holders(name) {
             let ks: Vec<usize> = match &self.files[j] {
@@ -656,12 +895,17 @@ impl LazyFlow {
             index.record();
             let want = Want { names: &names, lines: Some(&lines) };
             let (_, sites) = l.resolve(index, Some(&want));
-            let mut new: Vec<String> = index.take_asked().into_iter().filter(|n| !self.covered.contains(n)).collect();
-            if new.is_empty() {
+            let (named, other) = index.take_asked_split();
+            let mut new_named: Vec<String> =
+                named.into_iter().filter(|n| !self.covered.contains(n) && !self.named.contains(n)).collect();
+            let mut new: Vec<String> = other.into_iter().filter(|n| !self.covered.contains(n)).collect();
+            if new.is_empty() && new_named.is_empty() {
                 break sites;
             }
             new.sort();
+            new_named.sort();
             self.cover(&new);
+            self.cover_named(&new_named);
         };
         let positions = match &self.files[j] {
             State::Loaded(Loaded { model: super::FileModel::Go(scope), .. }) => scope.call_positions().1,
@@ -684,14 +928,11 @@ impl LazyFlow {
             if self.resolved[&j].sites.contains_key(&pos) {
                 continue;
             }
-            let owner = &self.index.as_ref().expect("built").1;
-            let (cj, ck) = owner[s.caller];
-            let caller = self.key(cj, ck);
             let target = s.target.map(|(t, _)| {
                 let (tj, tk) = self.index.as_ref().expect("built").1[t];
                 self.key(tj, tk)
             });
-            let site = Site { file: file.clone(), caller, target, start_byte: s.start_byte, end_byte: s.end_byte, args: s.args };
+            let site = Site { file: file.clone(), target, start_byte: s.start_byte, end_byte: s.end_byte, args: s.args };
             self.resolved.get_mut(&j).expect("entry").sites.insert(pos, Rc::new(site));
         }
     }
@@ -719,6 +960,8 @@ impl LazyFlow {
         let names = HashSet::from([name.clone()]);
         let mut out = Vec::new();
         for j in self.words.holders(&name) {
+            // A call to `name` is in any file holding it, declaring or not.
+            self.load(j);
             if !matches!(self.files[j], State::Loaded(_)) {
                 continue;
             }

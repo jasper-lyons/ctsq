@@ -194,7 +194,8 @@ impl<'a> Walk<'a> {
         if defs.is_empty() {
             // Package-level declarations in the other files of the package.
             let dir = Path::new(file).parent().map(|p| p.to_path_buf());
-            for (f, pf) in self.store.iter() {
+            // A declaration of `name` is in a file holding it.
+            for (f, pf) in self.store.holding(&[name]) {
                 if f == file || pf.lang != "go" || Path::new(f).parent().map(|p| p.to_path_buf()) != dir {
                     continue;
                 }

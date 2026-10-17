@@ -99,7 +99,7 @@ fn in_repo(cfg: &LangConfig, module: Option<&Module>, site: &CallSite) -> Option
     }
     if let (Some(t), None, Some(m)) = (&site.recv_type, &site.recv_path, &site.method) {
         let t = t.trim_start_matches('*');
-        let declared = module.is_none_or(|md| md.types.contains(t));
+        let declared = module.is_none_or(|md| md.has_type(t));
         if !t.is_empty() && !t.contains('.') && declared {
             return Some(format!("{}.{}", t, m));
         }

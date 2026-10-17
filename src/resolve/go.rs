@@ -817,8 +817,12 @@ fn interface_impls(iface: &str, name: &str, ctx: &Ctx) -> Vec<(usize, Confidence
 /// composite literal, `new(T)`, a function returning T, a function named
 /// `NewT`) holds T's name in its file.
 fn constructed(ty: &str, ctx: &Ctx) -> bool {
+    // More files only add constructed types, so a yes needs no more files.
+    if ctx.constructed.contains(ty) {
+        return true;
+    }
     ctx.index.ask(ty);
-    ctx.constructed.contains(ty)
+    false
 }
 
 /// Resolve `pkg.Fn` where `pkg` maps to import path segments: functions named

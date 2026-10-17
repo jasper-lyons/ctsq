@@ -179,7 +179,8 @@ impl<'a> Linker<'a> {
         let mut defs: Vec<(String, Def<'a>)> =
             reaching(root, src, name, id.start_byte()).into_iter().map(|d| (file.to_string(), d)).collect();
         if defs.is_empty() {
-            for (f, pf) in self.store.iter() {
+            // A declaration of `name` is in a file holding it.
+            for (f, pf) in self.store.holding(&[name]) {
                 if f == file || pf.lang != "go" || !same_dir(f, file) {
                     continue;
                 }
@@ -336,7 +337,7 @@ impl<'a> Linker<'a> {
         if arg.kind() != "identifier" {
             return None;
         }
-        for (f, pf) in self.store.iter() {
+        for (f, pf) in self.store.holding(&[name]) {
             if pf.lang != "go" || !same_dir(f, file) {
                 continue;
             }

@@ -1380,10 +1380,8 @@ impl<'a, 't> Walker<'a, 't> {
         }
         self.cx
             .module
-            .readers
-            .get(name)
+            .readers_of(name)
             .into_iter()
-            .flatten()
             .filter(|r| !(r.file == self.cx.file && r.func == self.func))
             .map(|r| Hop {
                 file: r.file.clone(),
@@ -1401,7 +1399,7 @@ impl<'a, 't> Walker<'a, 't> {
 
     /// Whether `name` is a package-level variable not shadowed in this function.
     fn is_global(&self, name: &str) -> bool {
-        self.cx.module.globals.contains_key(name) && !self.locals.contains(name)
+        self.cx.module.global(name).is_some() && !self.locals.contains(name)
     }
 
     /// The shared state a store through `l` (rooted at `obj`) reaches: a map
@@ -1418,7 +1416,7 @@ impl<'a, 't> Walker<'a, 't> {
         }
         let global = self.is_global(obj);
         let is_map = if global {
-            self.cx.module.globals.get(obj).copied().unwrap_or(false)
+            self.cx.module.global(obj).unwrap_or(false)
         } else {
             self.local_maps.contains(obj)
         };
@@ -1847,7 +1845,7 @@ impl<'a, 't> Walker<'a, 't> {
         let f = kids(n, &m.fields.function).first().copied()?;
         if self.is(&m.nodes.name, f) {
             // A function in the module.
-            return self.cx.module.results.get(self.t(f)).cloned();
+            return self.cx.module.result(self.t(f));
         }
         if !self.is(&m.nodes.field, f) {
             return None;
@@ -1863,7 +1861,7 @@ impl<'a, 't> Walker<'a, 't> {
         match self.expr_type(o, st, depth + 1)? {
             (_, Some(recv)) => result_type(None, Some(&recv), Some(meth)).and_then(from_path),
             // A method on a type the module declares.
-            (base, None) => self.cx.module.results.get(&format!("{}.{}", base, meth)).cloned(),
+            (base, None) => self.cx.module.result(&format!("{}.{}", base, meth)),
         }
     }
 

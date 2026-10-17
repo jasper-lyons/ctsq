@@ -67,6 +67,9 @@ pub struct DefIndex {
     /// Every name a resolver read the index by, while recording (see
     /// `scoped`). None when not recording.
     asked: RefCell<Option<HashSet<String>>>,
+    /// The names asked through `named`, and through `ask`, while recording.
+    asked_named: RefCell<Option<HashSet<String>>>,
+    asked_other: RefCell<Option<HashSet<String>>>,
     /// file -> indices into `defs`, in index order, built on first use.
     by_file: OnceCell<HashMap<String, Vec<usize>>>,
     /// The Go resolver's constructed types, built on first use.
@@ -83,13 +86,27 @@ impl DefIndex {
     /// through here (or note them with `ask`), so a scoped build learns
     /// which names its answers depend on.
     pub fn named(&self, name: &str) -> &[usize] {
-        self.ask(name);
+        self.note(name);
+        if let Some(s) = self.asked_named.borrow_mut().as_mut() {
+            if !s.contains(name) {
+                s.insert(name.to_string());
+            }
+        }
         self.by_name.get(name).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     /// Note that an answer depends on `name`: every definition, impl block
     /// or construction it reads holds that name in its file.
     pub fn ask(&self, name: &str) {
+        self.note(name);
+        if let Some(s) = self.asked_other.borrow_mut().as_mut() {
+            if !s.contains(name) {
+                s.insert(name.to_string());
+            }
+        }
+    }
+
+    fn note(&self, name: &str) {
         if let Some(s) = self.asked.borrow_mut().as_mut() {
             if !s.contains(name) {
                 s.insert(name.to_string());
@@ -100,6 +117,17 @@ impl DefIndex {
     /// Start recording the names asked, dropping any recorded before.
     pub fn record(&self) {
         *self.asked.borrow_mut() = Some(HashSet::new());
+        *self.asked_named.borrow_mut() = Some(HashSet::new());
+        *self.asked_other.borrow_mut() = Some(HashSet::new());
+    }
+
+    /// `take_asked`, split into the names only `named` read (the
+    /// definitions named so) and every other name.
+    pub fn take_asked_split(&self) -> (HashSet<String>, HashSet<String>) {
+        self.take_asked();
+        let other = self.asked_other.borrow_mut().take().unwrap_or_default();
+        let named = self.asked_named.borrow_mut().take().unwrap_or_default();
+        (named.into_iter().filter(|n| !other.contains(n)).collect(), other)
     }
 
     /// Stop recording and hand back what was asked.
@@ -253,6 +281,7 @@ impl StoreEntry {
 impl TreeStore {
     /// Every job from the cache, parsing the ones not yet parsed. Unreadable
     /// files are left out.
+    #[allow(dead_code)] // tests build whole stores
     pub fn build(jobs: &[(String, &'static str)]) -> TreeStore {
         let mut store = TreeStore::default();
         for (file, lang) in jobs {
@@ -354,6 +383,17 @@ impl TreeStore {
         idx.into_iter().filter_map(|i| self.files[i].parsed().map(|p| (self.files[i].path.as_str(), p))).collect()
     }
 
+    /// Finds the files of a lazy store holding a name, without the store.
+    /// None for a store built whole.
+    pub fn finder(&self) -> Option<NameFinder> {
+        let words = self.words.clone()?;
+        Some(NameFinder {
+            words,
+            entries: std::rc::Rc::new(self.files.iter().map(|e| (e.path.clone(), e.lang)).collect()),
+            entry_of_job: std::rc::Rc::new(self.entry_of_job.clone()),
+        })
+    }
+
     /// The path of the parsed file whose text is `src`, by address.
     pub fn file_of(&self, src: &[u8]) -> Option<&str> {
         let ptr = src.as_ptr();
@@ -363,8 +403,36 @@ impl TreeStore {
         })
     }
 
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.files.len()
+    }
+}
+
+/// The files of a lazy `TreeStore` holding a name as a whole word, as
+/// (path, grammar) in store order, for readers that outlive a borrow of it.
+#[derive(Clone)]
+pub struct NameFinder {
+    words: std::rc::Rc<scoped::Words>,
+    entries: std::rc::Rc<Vec<(String, &'static str)>>,
+    entry_of_job: std::rc::Rc<HashMap<usize, usize>>,
+}
+
+impl NameFinder {
+    pub fn holders(&self, name: &str) -> Vec<(String, &'static str)> {
+        self.entries_of(self.words.holders(name))
+    }
+
+    /// The holders of `name` that can declare it (`scoped::go_could_bind`).
+    pub fn binders(&self, name: &str) -> Vec<(String, &'static str)> {
+        self.entries_of(self.words.binders(name))
+    }
+
+    fn entries_of(&self, jobs: Vec<usize>) -> Vec<(String, &'static str)> {
+        let mut v: Vec<usize> = jobs.into_iter().filter_map(|j| self.entry_of_job.get(&j).copied()).collect();
+        v.sort();
+        v.dedup();
+        v.into_iter().map(|i| self.entries[i].clone()).collect()
     }
 }
 

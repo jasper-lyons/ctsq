@@ -22,7 +22,7 @@ use super::Hop;
 use crate::config::{LangConfig, Slot};
 use crate::resolve::go::{binding_type_qualified, go_imports};
 use crate::resolve::scoped::{FlowGraph, Site};
-use crate::resolve::{DefIndex, DefKind, TreeStore};
+use crate::resolve::{DefIndex, TreeStore};
 
 const FUNCTIONS: &[&str] = &["function_declaration", "method_declaration", "func_literal"];
 const LITERALS: &[&str] = &[
@@ -599,7 +599,8 @@ impl<'a> Up<'a> {
         }
         let dir = Path::new(file).parent().map(|p| p.to_path_buf());
         let mut out = vec![];
-        for (f, pf) in self.store.iter() {
+        // A declaration of `name` is in a file holding it.
+        for (f, pf) in self.store.holding(&[name]) {
             if f == file || pf.lang != "go" || Path::new(f).parent().map(|p| p.to_path_buf()) != dir {
                 continue;
             }

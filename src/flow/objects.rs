@@ -2,7 +2,9 @@
 //! (decision 12): struct fields with their tags and embedded structs, and
 //! package-level variables with the functions that read them.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use tree_sitter::Node;
 
@@ -85,6 +87,78 @@ pub struct Module {
     /// First result type of each function (`F`), method and interface
     /// method (`T.M`), as (base name, `path.T` when it has a package part).
     pub results: HashMap<String, (String, Option<String>)>,
+    /// Set when the maps above are empty and each answer is read from the
+    /// files holding the name asked (`Module::lazy`).
+    lazy: Option<Rc<LazyModule>>,
+}
+
+/// A module read one name at a time. Every map of `Module` is keyed by a
+/// name its declaring file holds: a type, struct, variable or function name,
+/// the method name of `T.M`, the name of a field, and a reader of a variable
+/// holds the variable. So an answer read from the files holding the name, in
+/// store order with the last declaration winning, equals the whole module's.
+pub struct LazyModule {
+    finder: crate::resolve::NameFinder,
+    mech: Mechanics,
+    /// Each file's own declarations, by path.
+    decls: RefCell<HashMap<String, Rc<Module>>>,
+    /// Parses read here, kept so the walk that reads the file next finds it parsed.
+    kept: RefCell<Vec<Rc<crate::parsed::ParsedFile>>>,
+    readers: RefCell<HashMap<String, Vec<Reader>>>,
+    /// The files read for each (name, binding).
+    lists: RefCell<HashMap<(String, bool), Vec<(String, &'static str)>>>,
+}
+
+impl std::fmt::Debug for LazyModule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LazyModule")
+    }
+}
+
+impl LazyModule {
+    /// (path, declarations) of every Go file holding `name`, in store order,
+    /// or only of those that can declare it at package level or in a type
+    /// when `binding` (an embedded field does not put its name first).
+    fn holders(&self, name: &str, binding: bool) -> Vec<(String, Rc<Module>)> {
+        let mut out = vec![];
+        // No declaration is named by nothing, and every file holds it.
+        if name.is_empty() {
+            return out;
+        }
+        let key = (name.to_string(), binding);
+        let cached = self.lists.borrow().get(&key).cloned();
+        let files = match cached {
+            Some(f) => f,
+            None => {
+                let f = if binding { self.finder.binders(name) } else { self.finder.holders(name) };
+                self.lists.borrow_mut().insert(key, f.clone());
+                f
+            }
+        };
+        for (path, lang) in files {
+            if lang != "go" {
+                continue;
+            }
+            if let Some(d) = self.decls.borrow().get(&path) {
+                out.push((path, d.clone()));
+                continue;
+            }
+            let Some(p) = crate::parsed::get(&path, lang) else { continue };
+            let Some(tree) = &p.tree else { continue };
+            let mut m = Module::default();
+            m.add_decls(tree.root_node(), &p.source, &self.mech);
+            let m = Rc::new(m);
+            self.decls.borrow_mut().insert(path.clone(), m.clone());
+            self.kept.borrow_mut().push(p.clone());
+            out.push((path, m));
+        }
+        out
+    }
+
+    /// The last declaration of `key` in a file holding `name`.
+    fn last<T: Clone>(&self, name: &str, get: impl Fn(&Module) -> Option<T>) -> Option<T> {
+        self.holders(name, true).iter().filter_map(|(_, m)| get(m)).last()
+    }
 }
 
 /// `*pkg.Name[T]` as `Name`.
@@ -95,6 +169,100 @@ pub fn base_type(ty: &str) -> String {
 }
 
 impl Module {
+    /// A module whose answers are read from the files `finder` gives for
+    /// each name asked.
+    pub fn lazy(finder: crate::resolve::NameFinder, mech: &Mechanics) -> Module {
+        Module {
+            lazy: Some(Rc::new(LazyModule {
+                finder,
+                mech: mech.clone(),
+                decls: RefCell::new(HashMap::new()),
+                kept: RefCell::new(vec![]),
+                readers: RefCell::new(HashMap::new()),
+                lists: RefCell::new(HashMap::new()),
+            })),
+            ..Module::default()
+        }
+    }
+
+    /// Whether the scanned files declare a type named `t`.
+    pub fn has_type(&self, t: &str) -> bool {
+        match &self.lazy {
+            None => self.types.contains(t),
+            Some(l) => l.holders(t, true).iter().any(|(_, m)| m.types.contains(t)),
+        }
+    }
+
+    /// Whether package-level variable `name` holds a map, None when there is
+    /// no such variable.
+    pub fn global(&self, name: &str) -> Option<bool> {
+        match &self.lazy {
+            None => self.globals.get(name).copied(),
+            Some(l) => l.last(name, |m| m.globals.get(name).copied()),
+        }
+    }
+
+    /// The functions that use package-level variable `name`, in file order.
+    pub fn readers_of(&self, name: &str) -> Vec<Reader> {
+        let Some(l) = &self.lazy else { return self.readers.get(name).cloned().unwrap_or_default() };
+        if let Some(r) = l.readers.borrow().get(name) {
+            return r.clone();
+        }
+        let mut out = vec![];
+        if self.global(name).is_some() {
+            for (path, _) in l.holders(name, false) {
+                let Some(p) = crate::parsed::get(&path, "go") else { continue };
+                let Some(tree) = &p.tree else { continue };
+                let mut one = Module::default();
+                one.globals.insert(name.to_string(), false);
+                one.add_readers(&path, tree.root_node(), &p.source, &l.mech);
+                out.extend(one.readers.remove(name).unwrap_or_default());
+            }
+        }
+        l.readers.borrow_mut().insert(name.to_string(), out.clone());
+        out
+    }
+
+    /// The first result type recorded under `key` (`F` or `T.M`).
+    pub fn result(&self, key: &str) -> Option<(String, Option<String>)> {
+        match &self.lazy {
+            None => self.results.get(key).cloned(),
+            Some(l) => {
+                let name = key.rsplit('.').next().unwrap_or(key);
+                if name.is_empty() {
+                    return None;
+                }
+                l.last(name, |m| m.results.get(key).cloned())
+            }
+        }
+    }
+
+    /// The fields of struct `ty`.
+    fn struct_fields(&self, ty: &str) -> Option<Vec<FieldInfo>> {
+        match &self.lazy {
+            None => self.structs.get(ty).cloned(),
+            Some(l) => l.last(ty, |m| m.structs.get(ty).cloned()),
+        }
+    }
+
+    /// Struct names declared in the files holding `name` with a field that
+    /// `keep` accepts, whose winning declaration has such a field too.
+    fn structs_with(&self, name: &str, keep: impl Fn(&FieldInfo) -> bool) -> Vec<Vec<FieldInfo>> {
+        let Some(l) = &self.lazy else {
+            return self.structs.values().filter(|fs| fs.iter().any(&keep)).cloned().collect();
+        };
+        let mut names: Vec<String> = vec![];
+        for (_, m) in l.holders(name, false) {
+            for (s, fs) in &m.structs {
+                if fs.iter().any(&keep) && !names.contains(s) {
+                    names.push(s.clone());
+                }
+            }
+        }
+        names.sort();
+        names.into_iter().filter_map(|s| self.struct_fields(&s)).filter(|fs| fs.iter().any(&keep)).collect()
+    }
+
     /// Index every file: (path, root node, source).
     pub fn build(files: &[(&str, Node, &[u8])], m: &Mechanics) -> Module {
         let mut out = Module::default();
@@ -213,14 +381,14 @@ impl Module {
 
     /// The field `name` of struct `ty`, directly or promoted through embedded
     /// structs, with the embedded names passed on the way.
-    pub fn field(&self, ty: &str, name: &str) -> Option<(Vec<String>, &FieldInfo)> {
+    pub fn field(&self, ty: &str, name: &str) -> Option<(Vec<String>, FieldInfo)> {
         self.field_at(&base_type(ty), name, 0)
     }
 
-    fn field_at(&self, ty: &str, name: &str, depth: usize) -> Option<(Vec<String>, &FieldInfo)> {
-        let fields = self.structs.get(ty)?;
+    fn field_at(&self, ty: &str, name: &str, depth: usize) -> Option<(Vec<String>, FieldInfo)> {
+        let fields = self.struct_fields(ty)?;
         if let Some(f) = fields.iter().find(|f| f.name == name) {
-            return Some((vec![], f));
+            return Some((vec![], f.clone()));
         }
         if depth > 4 {
             return None;
@@ -242,7 +410,7 @@ impl Module {
         }
         let mut stack = vec![(t, 0)];
         while let Some((t, d)) = stack.pop() {
-            for e in self.structs.get(&t).into_iter().flatten().filter(|f| f.embedded) {
+            for e in self.struct_fields(&t).into_iter().flatten().filter(|f| f.embedded) {
                 if e.ty == o {
                     return true;
                 }
@@ -256,20 +424,21 @@ impl Module {
 
     /// Whether `name` is an embedded field of some struct.
     pub fn is_embedded(&self, name: &str) -> bool {
-        self.structs.values().flatten().any(|f| f.embedded && f.name == name)
+        !self.structs_with(name, |f| f.embedded && f.name == name).is_empty()
     }
 
     /// The name of the `i`th field of struct `ty`, for a positional literal.
     pub fn positional(&self, ty: &str, i: usize) -> Option<String> {
-        self.structs.get(&base_type(ty))?.get(i).map(|f| f.name.clone())
+        self.struct_fields(&base_type(ty))?.get(i).map(|f| f.name.clone())
     }
 
     /// The field called `name` when the owner type is not known: the one
     /// struct that declares it, or the tag every declaring struct agrees on.
-    pub fn any_field(&self, name: &str) -> Option<&FieldInfo> {
-        let all: Vec<&FieldInfo> = self.structs.values().flatten().filter(|f| f.name == name && !f.embedded).collect();
-        let first = *all.first()?;
-        all.iter().all(|f| f.tag == first.tag).then_some(first)
+    pub fn any_field(&self, name: &str) -> Option<FieldInfo> {
+        let keep = |f: &FieldInfo| f.name == name && !f.embedded;
+        let all: Vec<FieldInfo> = self.structs_with(name, keep).into_iter().flatten().filter(|f| keep(f)).collect();
+        let first = all.first()?;
+        all.iter().all(|f| f.tag == first.tag).then(|| first.clone())
     }
 
     /// The struct tag of field `name` on type `ty` (or any type when unknown),
