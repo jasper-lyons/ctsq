@@ -93,3 +93,11 @@ An Opus reviewer that edits nothing tries to break Decisions 01 to 04. It checks
 - skipped files that could have matched
 
 Then it re-runs `plans/perf/profile.sh` on all 52 calls and writes `plans/perf/RESULTS-<sha>.md`, with peak RSS.
+
+## Follow-ups for path data flow
+
+From the path-setup continuation handoff. `path field#signupRequest.Email ==>` on Mavexa backend takes 1.76s with 648 parses, under the 2s goal. The files it parses first come from `widen::outside_impls_for` (about 165), `LazyFlow::cover_named` (about 150) and the walk itself (about 125).
+
+1. `widen::outside_impls_for`: give it a Go filter (files that can declare a method of that name: `name_at` / func Name position) instead of `store.holding`.
+2. `LazyFlow::cover_named` asks many names. List them with declarer counts (debug print in `cover_named`) and look for names a tighter kind could serve, as `ask_interface` did.
+3. `from_utf8` still shows up in the profile (~60 samples). It comes from `holds_any` validating whole files. Check its callers.
