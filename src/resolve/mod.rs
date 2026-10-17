@@ -346,16 +346,14 @@ pub fn def_report(
     let mut printer = scope.map(|o| crate::scope::Printer::new(o, jobs));
     let mut shown = 0usize;
     let mut missing: Vec<String> = Vec::new();
-    // Held to the end, so every stage reads one parse per file.
-    let store = TreeStore::build(jobs);
     for expr in names {
         let mut all_names: Vec<String> = Vec::new();
-        let mut rows = def_rows(expr, jobs, &store, &mut all_names);
+        let mut rows = def_rows(expr, jobs, &mut all_names);
         // A name that is a glossary term is also searched as each name it maps to.
         let mut notes: Vec<String> = Vec::new();
         if let Some(g) = glossary {
             for entry in g.lookup(expr, true) {
-                for r in mapped_rows(&entry.names, jobs, &store) {
+                for r in mapped_rows(&entry.names, jobs) {
                     if !rows.iter().any(|(f, l, _)| *f == r.0 && *l == r.1) {
                         rows.push(r);
                     }
@@ -428,16 +426,16 @@ pub fn def_report(
 /// the index cannot hold. `names_seen` collects every outline name met on the
 /// way, which is the pool the miss report suggests from.
 ///
-/// `store` holds every job's parse and the caller keeps it alive, so the index,
-/// the outline, the nested search and the hider's test check read one parse.
+/// Each file is parsed, read and dropped in turn (the cache keeps a small recent
+/// window), so no run holds every tree at once.
 pub fn def_rows(
     expr: &str,
     jobs: &[(String, &'static str)],
-    store: &TreeStore,
     names_seen: &mut Vec<String>,
 ) -> Vec<(String, usize, Confidence)> {
     let mut index = DefIndex::default();
-    for (file, p) in store.iter() {
+    for (file, lang) in jobs {
+        let Some(p) = crate::parsed::get(file, lang) else { continue };
         for def in resolver_for(p.lang).collect_defs_tree(file, &p.source, p.tree.as_ref()) {
             index.push(def);
         }
@@ -574,13 +572,12 @@ impl DefLookup {
 pub fn mapped_rows(
     names: &[crate::config::glossary::Name],
     jobs: &[(String, &'static str)],
-    store: &TreeStore,
 ) -> Vec<(String, usize, Confidence)> {
     use crate::config::glossary::Name;
     let mut out: Vec<(String, usize, Confidence)> = Vec::new();
     for n in names {
         match n {
-            Name::Exact(name) => out.extend(def_rows(name, jobs, store, &mut Vec::new())),
+            Name::Exact(name) => out.extend(def_rows(name, jobs, &mut Vec::new())),
             Name::Re(re) => {
                 for (file, lang) in jobs {
                     for (_, name, line) in crate::tree::collect_def_locs(file, lang) {
@@ -782,7 +779,7 @@ mod tests {
     }
 
     fn rows_for(expr: &str, jobs: &[(String, &'static str)], names: &mut Vec<String>) -> Vec<(String, usize, Confidence)> {
-        def_rows(expr, jobs, &TreeStore::build(jobs), names)
+        def_rows(expr, jobs, names)
     }
 
     #[test]
