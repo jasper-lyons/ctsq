@@ -501,7 +501,9 @@ fn word_lines<'s>(src: &'s [u8], name: &'s str) -> impl Iterator<Item = (usize, 
 /// - on a line opening with `func`, outside the parameter list,
 /// - right before `{` or `[`, not right after `]` (a slice or map literal
 ///   constructs no named type),
-/// - right after `new(`, or `new(pkg.`.
+/// - right after `new(`, or `new(pkg.`,
+/// - in code inside the result parentheses of a top-level function
+///   signature (`results_here`), for results on lines of their own.
 ///
 /// A file with no such occurrence declares, constructs and returns nothing
 /// called `name`, so no read of `name` is answered from it.
@@ -511,6 +513,7 @@ pub(crate) fn go_could_declare(src: &[u8], name: &str) -> bool {
         return true;
     }
     word_lines(src, name).any(|(ls, le, at)| declare_at(&src[ls..le], at, name.len()))
+        || go_scan_for(src, name, results_here)
 }
 
 /// `go_could_declare` for the word of `len` bytes at byte `at` of `line`.
@@ -600,6 +603,13 @@ fn binds_here(stack: &[Open], sig: bool, want_name: bool) -> bool {
     top || iface || (sig && want_name && stack.is_empty())
 }
 
+/// Inside the result parentheses of a top-level function signature, where a
+/// result list spanning lines puts a result type (`l *Lazy,`) that no line
+/// rule of `declare_at` sees.
+fn results_here(stack: &[Open], sig: bool, _: bool) -> bool {
+    sig && stack.first() == Some(&Open::Results)
+}
+
 fn fields_here(stack: &[Open], sig: bool, _: bool) -> bool {
     !sig && stack.iter().find(|&&o| o != Open::Group) == Some(&Open::Struct)
 }
@@ -621,16 +631,16 @@ impl GoDecls {
         let mut d = GoDecls::default();
         go_scan(src, |w, stack, sig, want_name| {
             let (bind, field) = (binds_here(stack, sig, want_name), fields_here(stack, sig, want_name));
-            if !bind && !field {
+            let result = results_here(stack, sig, want_name);
+            if !bind && !field && !result {
                 return false;
             }
             // A word with no id is held nowhere, so never asked.
             let Some(id) = std::str::from_utf8(w).ok().and_then(&id_of) else { return false };
-            if bind {
-                d.bind.push(id);
-            }
-            if field {
-                d.field.push(id);
+            for (on, set) in [(bind, &mut d.bind), (field, &mut d.field), (result, &mut d.declare)] {
+                if on {
+                    set.push(id);
+                }
             }
             false
         });
@@ -696,6 +706,8 @@ enum Open {
     Interface,
     /// The brace after `struct`.
     Struct,
+    /// The parenthesis of a top-level function signature's results.
+    Results,
     Other,
 }
 
@@ -720,6 +732,8 @@ fn go_scan(src: &[u8], mut visit: impl FnMut(&[u8], &[Open], bool, bool) -> bool
     let n = src.len();
     let mut stack: Vec<Open> = Vec::new();
     let (mut sig, mut want_name) = (false, false);
+    // Whether the signature's parameter list has opened.
+    let mut params = false;
     // At the start of a statement, and whether the last token can end one.
     let (mut at_start, mut can_end) = (true, false);
     let mut prev_word: &[u8] = b"";
@@ -801,6 +815,7 @@ fn go_scan(src: &[u8], mut visit: impl FnMut(&[u8], &[Open], bool, bool) -> bool
             if stack.is_empty() && at_start && w == b"func" {
                 sig = true;
                 want_name = true;
+                params = false;
             } else if sig && want_name && stack.is_empty() {
                 want_name = false;
             }
@@ -814,7 +829,16 @@ fn go_scan(src: &[u8], mut visit: impl FnMut(&[u8], &[Open], bool, bool) -> bool
             b'(' => {
                 let group = matches!(word, b"var" | b"const" | b"type" | b"import")
                     && stack.iter().all(|&o| o == Open::Group);
-                stack.push(if group { Open::Group } else { Open::Other });
+                // In a signature the parentheses before the name are the
+                // receiver, then come the parameters, then the results.
+                let results = sig && stack.is_empty() && !want_name && std::mem::replace(&mut params, true);
+                stack.push(if group {
+                    Open::Group
+                } else if results {
+                    Open::Results
+                } else {
+                    Open::Other
+                });
                 (at_start, can_end) = (false, false);
             }
             b'[' => {
@@ -1559,6 +1583,24 @@ mod tests {
     fn a_type_constructed_only_through_a_new_function_keeps_its_dispatch() {
         // mk.go never holds the word Lazy, only NewLazy.
         let (d, jobs) = go_jobs("newt", &[("x.go", RUNNER), ("mk.go", "package a\n\nfunc NewLazy() any { return nil }\n")]);
+        agrees_with_whole(&jobs, &["Sink", "Run", "Disp"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_named_result_on_its_own_line_declares_its_type() {
+        for src in [
+            "func MakeLazy() (\n\tl *Lazy,\n) {\n\treturn\n}\n",
+            "func MakeLazy() (n int,\n\tl pkg.Lazy) { return }\n",
+            "func (s S) M(a int) (\n\t*Lazy,\n\terror,\n)\n",
+        ] {
+            assert!(go_could_declare(src.as_bytes(), "Lazy"), "{:?}", src);
+        }
+        // Parameters, and results of a function value type, declare nothing.
+        for src in ["func F(\n\tl *Lazy,\n) {}\n", "var f func() (\n\tl *Lazy,\n)\n", "func F() {\n\tg(a, (\n\tl *Lazy))\n}\n"] {
+            assert!(!go_could_declare(src.as_bytes(), "Lazy"), "{:?}", src);
+        }
+        let (d, jobs) = go_jobs("named-result", &[("x.go", RUNNER), ("make.go", "package a\n\nfunc MakeLazy() (\n\tl *Lazy,\n) {\n\treturn\n}\n")]);
         agrees_with_whole(&jobs, &["Sink", "Run", "Disp"]);
         let _ = std::fs::remove_dir_all(&d);
     }
