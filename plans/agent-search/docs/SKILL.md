@@ -231,11 +231,11 @@ fixtures/scope/Asset.tsx:11: const saveAssetNow = () => props.asset  ?
 
 ```
 ctsq -q 'id#hide_rows' --scope src/
-src/main.rs:1028: hide_rows(&mut hider, file, source, fetched.tree(), rows, true, &mut hidden)
-  in src/main.rs:661-1107  fn main() {
-src/main.rs:1158: fn hide_rows(
-src/main.rs:1457: for r in &hide_rows(&mut hider, file, source, fetched.tree(), rows, false, &mut name_hidden) {
-  in src/main.rs:1415-1493  fn run_refs(
+src/main.rs:1036: hide_rows(&mut hider, file, source, fetched.tree(), rows, true, &mut hidden)
+  in src/main.rs:662-1115  fn main() {
+src/main.rs:1179: fn hide_rows(
+src/main.rs:1482: for r in &hide_rows(&mut hider, file, source, fetched.tree(), rows, false, &mut name_hidden) {
+  in src/main.rs:1436-1518  fn run_refs(
 3 matches
 ```
 

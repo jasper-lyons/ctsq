@@ -12,6 +12,7 @@
 
 use crate::compiler::{self, lang};
 use crate::query::ast::*;
+use crate::needle::Needles;
 use crate::runner;
 use std::collections::HashSet;
 
@@ -260,9 +261,9 @@ fn kind_query(sigil: Option<Sigil>, kind: &str, nm: NameMatch) -> Query {
 /// Rows of `ast` over every readable job, as `path:line: source line`. A job whose
 /// language has no such kind, or whose pattern tree-sitter rejects, contributes none.
 ///
-/// `needle`, when given, is text every match holds (an exact name), so a file
+/// `needles` are the texts every match holds (the name filter's), so a file
 /// without those bytes is neither parsed nor searched.
-fn rows_over(ast: &Query, jobs: &[(String, &'static str)], needle: Option<&str>) -> Vec<(String, usize, String)> {
+fn rows_over(ast: &Query, jobs: &[(String, &'static str)], needles: &Needles) -> Vec<(String, usize, String)> {
     let mut out = Vec::new();
     let mut cache: std::collections::HashMap<&'static str, Option<(Box<dyn lang::Lang>, compiler::CompiledQuery)>> =
         std::collections::HashMap::new();
@@ -283,7 +284,7 @@ fn rows_over(ast: &Query, jobs: &[(String, &'static str)], needle: Option<&str>)
         });
         let Some((l, c)) = slot else { continue };
         let Ok(source) = std::fs::read(file) else { continue };
-        if needle.is_some_and(|n| !crate::resolve::holds(&source, n)) {
+        if !needles.holds(&source) {
             continue;
         }
         let Ok(rows) = runner::run_rows(c, l.as_ref(), &source, false) else { continue };
@@ -304,12 +305,8 @@ pub fn id_fallback(ast: &Query, jobs: &[(String, &'static str)]) -> Vec<FoundBlo
     for (label, kind) in [("string literal", "string"), ("JSX text", "jsx_text"), ("comment", "comment")] {
         let q = kind_query(None, kind, NameMatch::Regex(pattern.clone()));
         let mut seen = HashSet::new();
-        // A case-sensitive match of the escaped name holds the name's bytes.
-        let exact = match nm {
-            NameMatch::Exact(s) => Some(s.as_str()),
-            NameMatch::Regex(_) => None,
-        };
-        let hits = rows_over(&q, jobs, exact);
+        // A case-sensitive match of the name holds its literal bytes.
+        let hits = rows_over(&q, jobs, &Needles::from_name(nm));
         // jsx_text is a kind of the javascript and tsx grammars only, so its
         // try line selects the grammar the hits came from.
         let mut langs: Vec<&'static str> = Vec::new();
@@ -361,11 +358,8 @@ pub fn definition_fallback(ast: &Query, jobs: &[(String, &'static str)]) -> Vec<
     for kind in DEFINITION_KINDS.iter().copied().filter(|k| *k != asked) {
         let q = kind_query(Some(Sigil::Def), kind, nm.clone());
         let mut hits = Vec::new();
-        let exact = match nm {
-            NameMatch::Exact(s) => Some(s.as_str()),
-            NameMatch::Regex(_) => None,
-        };
-        for (f, line, _) in rows_over(&q, jobs, exact) {
+        let needles = Needles::from_name(&nm);
+        for (f, line, _) in rows_over(&q, jobs, &needles) {
             let hit = format!("{}:{}", f, line);
             if reported.insert(hit.clone()) {
                 hits.push(hit);
@@ -420,7 +414,7 @@ pub fn report_for_glossary(
             };
             let q = kind_query(atom.sigil.clone(), kind, nm.clone());
             let mut seen = HashSet::new();
-            let rows: Vec<String> = rows_over(&q, jobs, None)
+            let rows: Vec<String> = rows_over(&q, jobs, &Needles::from_name(&nm))
                 .into_iter()
                 .map(|(f, line, text)| format!("{}:{}: {}", f, line, text))
                 .filter(|r| seen.insert(r.clone()))

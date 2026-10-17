@@ -261,16 +261,30 @@ pub fn merge_hidden(into: &mut crate::footer::Hidden, more: &crate::footer::Hidd
 
 /// The nearest name to `name` among the definitions in `jobs`, as
 /// `x in path:line`, or None when nothing is close.
+#[cfg(test)]
 pub fn similar_hint(name: &str, jobs: &[(String, &'static str)]) -> Option<String> {
-    let mut pool: Vec<(String, String, usize)> = Vec::new();
+    similar_hint_from(name, &outline_of(jobs))
+}
+
+/// (file, kind, name, line) of every outline entry in `jobs`.
+fn outline_of(jobs: &[(String, &'static str)]) -> Vec<(String, &'static str, String, usize)> {
+    let mut v = Vec::new();
     for (file, lang) in jobs {
-        for (kind, n, line) in crate::tree::collect_def_locs(file, lang) {
-            // A `mod x;` or an import line names a file, not something defined.
-            if !matches!(kind, "mod" | "import" | "use") {
-                pool.push((n, file.clone(), line));
-            }
+        for (kind, name, line) in crate::tree::collect_def_locs(file, lang) {
+            v.push((file.clone(), kind, name, line));
         }
     }
+    v
+}
+
+/// `similar_hint` over an outline already collected.
+fn similar_hint_from(name: &str, outline: &[(String, &'static str, String, usize)]) -> Option<String> {
+    // A `mod x;` or an import line names a file, not something defined.
+    let pool: Vec<(String, String, usize)> = outline
+        .iter()
+        .filter(|(_, kind, ..)| !matches!(*kind, "mod" | "import" | "use"))
+        .map(|(file, _, n, line)| (n.clone(), file.clone(), *line))
+        .collect();
     let names: Vec<String> = pool.iter().map(|p| p.0.clone()).collect();
     let near = similar_names(crate::explain::bare_name(name), &names);
     let first = near.first()?;
@@ -285,9 +299,14 @@ pub fn not_found_line(missing: &[String], jobs: &[(String, &'static str)]) -> St
     if missing.is_empty() {
         return String::new();
     }
+    not_found_from(missing, &outline_of(jobs))
+}
+
+/// `not_found_line` over an outline already collected.
+fn not_found_from(missing: &[String], outline: &[(String, &'static str, String, usize)]) -> String {
     let parts: Vec<String> = missing
         .iter()
-        .map(|m| match similar_hint(m, jobs) {
+        .map(|m| match similar_hint_from(m, outline) {
             Some(h) => format!("{} (similar: {})", m, h),
             None => m.clone(),
         })
@@ -346,14 +365,17 @@ pub fn def_report(
     let mut printer = scope.map(|o| crate::scope::Printer::new(o, jobs));
     let mut shown = 0usize;
     let mut missing: Vec<String> = Vec::new();
+    // The index is built once for all the names, from files parsed and dropped
+    // in turn. It holds definitions, not trees.
+    let mut scan = DefScan::new(jobs);
     for expr in names {
         let mut all_names: Vec<String> = Vec::new();
-        let mut rows = def_rows(expr, jobs, &mut all_names);
+        let mut rows = def_rows(expr, jobs, &mut scan, &mut all_names);
         // A name that is a glossary term is also searched as each name it maps to.
         let mut notes: Vec<String> = Vec::new();
         if let Some(g) = glossary {
             for entry in g.lookup(expr, true) {
-                for r in mapped_rows(&entry.names, jobs) {
+                for r in mapped_rows(&entry.names, jobs, &mut scan) {
                     if !rows.iter().any(|(f, l, _)| *f == r.0 && *l == r.1) {
                         rows.push(r);
                     }
@@ -417,7 +439,11 @@ pub fn def_report(
     } else if shown > 0 {
         out.push_str(&crate::footer::tail(shown, "definition", &hidden, scope.is_some()));
     }
-    err.push_str(&not_found_line(&missing, jobs));
+    if !missing.is_empty() {
+        // A miss already read the outline for its report, so it is reused.
+        let outline = scan.outline.get_or_insert_with(|| outline_of(jobs));
+        err.push_str(&not_found_from(&missing, outline));
+    }
     NamesOut { out, err, code: if shown == 0 { 1 } else { 0 } }
 }
 
@@ -426,22 +452,16 @@ pub fn def_report(
 /// the index cannot hold. `names_seen` collects every outline name met on the
 /// way, which is the pool the miss report suggests from.
 ///
-/// Each file is parsed, read and dropped in turn (the cache keeps a small recent
-/// window), so no run holds every tree at once.
+/// `scan` holds what the files gave up, never their trees: each file is parsed,
+/// read and dropped in turn, so no run holds every tree at once.
 pub fn def_rows(
     expr: &str,
     jobs: &[(String, &'static str)],
+    scan: &mut DefScan,
     names_seen: &mut Vec<String>,
 ) -> Vec<(String, usize, Confidence)> {
-    let mut index = DefIndex::default();
-    for (file, lang) in jobs {
-        let Some(p) = crate::parsed::get(file, lang) else { continue };
-        for def in resolver_for(p.lang).collect_defs_tree(file, &p.source, p.tree.as_ref()) {
-            index.push(def);
-        }
-    }
-
-    let rows: Vec<(String, usize, Confidence)> = resolve_def_query(expr, &index)
+    let index = &scan.index;
+    let rows: Vec<(String, usize, Confidence)> = resolve_def_query(expr, index)
         .into_iter()
         .map(|(i, conf)| {
             let d = &index.defs[i];
@@ -456,15 +476,14 @@ pub fn def_rows(
     // index never held it. This is the step `explain` takes next.
     let bare = crate::explain::bare_name(expr);
     let mut found: Vec<(String, usize)> = Vec::new();
-    for (file, lang) in jobs {
-        for (_kind, name, line) in crate::tree::collect_def_locs(file, lang) {
-            if name == bare {
-                found.push((file.clone(), line));
-            }
-            names_seen.push(name);
+    let outline = scan.outline.get_or_insert_with(|| outline_of(jobs));
+    for (file, _kind, name, line) in outline.iter() {
+        if name == bare {
+            found.push((file.clone(), *line));
         }
+        names_seen.push(name.clone());
     }
-    names_seen.extend(index.by_name.keys().cloned());
+    names_seen.extend(scan.index.by_name.keys().cloned());
     found.sort();
     found.dedup();
     if found.is_empty() {
@@ -472,6 +491,33 @@ pub fn def_rows(
     }
     let conf = if found.len() == 1 { Confidence::Exact } else { Confidence::Guess };
     found.into_iter().map(|(f, l)| (f, l, conf)).collect()
+}
+
+/// What `def` learns from the files, shared by every name asked: the call-graph
+/// definition index, and the outline names once a miss needed them.
+pub struct DefScan {
+    index: DefIndex,
+    /// (file, kind, name, line) of every outline entry, built on the first miss.
+    outline: Option<Vec<(String, &'static str, String, usize)>>,
+}
+
+impl DefScan {
+    /// Index every job, parsing and dropping one file at a time.
+    pub fn new(jobs: &[(String, &'static str)]) -> DefScan {
+        let mut index = DefIndex::default();
+        let mut outline = Vec::new();
+        for (file, lang) in jobs {
+            let Some(p) = crate::parsed::get(file, lang) else { continue };
+            for def in resolver_for(p.lang).collect_defs_tree(file, &p.source, p.tree.as_ref()) {
+                index.push(def);
+            }
+            // Read while the parse is held, so a miss needs no second parse.
+            for (kind, name, line) in crate::tree::collect_def_locs(file, lang) {
+                outline.push((file.clone(), kind, name, line));
+            }
+        }
+        DefScan { index, outline: Some(outline) }
+    }
 }
 
 /// The last step of `def_rows`: a name defined below the top level, such as a
@@ -496,18 +542,7 @@ pub struct DefLookup {
     answers: HashMap<String, Vec<(String, usize, Confidence)>>,
 }
 
-/// Whether `hay` holds the bytes of `needle`. Valid UTF-8, which source nearly
-/// always is, goes through the standard library's substring search, which is
-/// far faster than comparing a window at every offset.
-pub fn holds(hay: &[u8], needle: &str) -> bool {
-    match std::str::from_utf8(hay) {
-        Ok(s) => s.contains(needle),
-        Err(_) => {
-            let n = needle.as_bytes();
-            n.is_empty() || hay.windows(n.len()).any(|w| w == n)
-        }
-    }
-}
+pub use crate::needle::holds;
 
 impl DefLookup {
     pub fn new(jobs: &[(String, &'static str)]) -> DefLookup {
@@ -572,12 +607,13 @@ impl DefLookup {
 pub fn mapped_rows(
     names: &[crate::config::glossary::Name],
     jobs: &[(String, &'static str)],
+    scan: &mut DefScan,
 ) -> Vec<(String, usize, Confidence)> {
     use crate::config::glossary::Name;
     let mut out: Vec<(String, usize, Confidence)> = Vec::new();
     for n in names {
         match n {
-            Name::Exact(name) => out.extend(def_rows(name, jobs, &mut Vec::new())),
+            Name::Exact(name) => out.extend(def_rows(name, jobs, scan, &mut Vec::new())),
             Name::Re(re) => {
                 for (file, lang) in jobs {
                     for (_, name, line) in crate::tree::collect_def_locs(file, lang) {
@@ -599,13 +635,14 @@ fn nested_def_sites(name: &str, jobs: &[(String, &'static str)]) -> Vec<(String,
         .iter()
         .filter_map(|k| crate::query::parse(&format!("*{}#\"{}\"", k, name)).ok())
         .collect();
+    let needles = crate::needle::Needles::exact(name);
     let mut found: Vec<(String, usize)> = Vec::new();
     // Compiled queries per language, built once.
     let mut compiled_by_lang: HashMap<&'static str, Vec<crate::compiler::CompiledQuery>> = HashMap::new();
     for (file, lang_name) in jobs {
         let Some(source) = crate::parsed::source(file) else { continue };
         // A definition of the name has the name's bytes in its file.
-        if !holds(&source, name) {
+        if !needles.holds(&source) {
             continue;
         }
         let Some(lang) = crate::compiler::lang::for_name(lang_name) else { continue };
@@ -779,7 +816,7 @@ mod tests {
     }
 
     fn rows_for(expr: &str, jobs: &[(String, &'static str)], names: &mut Vec<String>) -> Vec<(String, usize, Confidence)> {
-        def_rows(expr, jobs, names)
+        def_rows(expr, jobs, &mut DefScan::new(jobs), names)
     }
 
     #[test]

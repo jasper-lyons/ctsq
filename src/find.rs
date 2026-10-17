@@ -14,6 +14,7 @@ use crate::config::glossary::{Glossary, Name};
 use crate::config::queries::{self, Detect, NamedQuery, Target};
 use crate::files;
 use crate::footer;
+use crate::needle::Needles;
 use crate::resolve::DefLookup;
 use crate::runner;
 use std::collections::{HashMap, HashSet};
@@ -341,64 +342,13 @@ fn config_error(q: &NamedQuery, m: &str, why: &str) -> Report {
 /// Compile each of `q`'s selectors for each language its files are in. A
 /// selector whose node kinds one grammar lacks is skipped for that grammar,
 /// but it has to compile for at least one of the query's languages.
-type Compiled = Vec<(&'static str, Box<dyn lang::Lang>, compiler::CompiledQuery, Vec<Vec<String>>)>;
-
-/// The literal texts a regex name filter cannot match without: one of them
-/// has to occur in the node's text. Only the plain shapes give any, a literal
-/// or an alternation of literals, optionally anchored and grouped
-/// (`Error$`, `^(Get|Post)$`). Anything else (classes, repeats, flags) gives
-/// None and the filter is not used to skip files.
-fn regex_literals(src: &str) -> Option<Vec<String>> {
-    let s = src.strip_prefix('^').unwrap_or(src);
-    let s = s.strip_suffix('$').unwrap_or(s);
-    let s = match s.strip_prefix('(') {
-        Some(inner) => inner.strip_prefix("?:").unwrap_or(inner).strip_suffix(')')?,
-        None => s,
-    };
-    let alts: Vec<String> = s.split('|').map(str::to_string).collect();
-    let plain = |a: &String| !a.is_empty() && a.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | ' ' | ':'));
-    alts.iter().all(plain).then_some(alts)
-}
-
-/// The name filters in the query that name literal text. Each group is the
-/// alternatives of one filter, and a file has to hold one of each group's
-/// texts, so a file that fails any group cannot match and is never parsed. An
-/// exact name is a group of one. Most files in a repo fall out here.
-fn needles(q: &crate::query::ast::Query, out: &mut Vec<Vec<String>>) {
-    use crate::query::ast::{NameMatch, Selector, SelectorNode};
-    fn sel(s: &Selector, out: &mut Vec<Vec<String>>) {
-        match &s.node {
-            SelectorNode::Bare(a) => match &a.name_match {
-                Some(NameMatch::Exact(n)) if !n.is_empty() => out.push(vec![n.clone()]),
-                Some(NameMatch::Regex(r)) => {
-                    if let Some(alts) = regex_literals(r) {
-                        out.push(alts);
-                    }
-                }
-                _ => {}
-            },
-            SelectorNode::Group { query, .. } => needles(query, out),
-        }
-        for f in &s.fields {
-            if let Some(inner) = &f.inner {
-                needles(inner, out);
-            }
-        }
-    }
-    sel(&q.head, out);
-    for (_, s) in &q.tail {
-        sel(s, out);
-    }
-}
-
-use crate::resolve::holds;
+type Compiled = Vec<(&'static str, Box<dyn lang::Lang>, compiler::CompiledQuery, Needles)>;
 
 fn compile_all(q: &NamedQuery) -> Result<Compiled, Report> {
     let mut out: Compiled = Vec::new();
     for m in &q.matches {
         let ast = crate::query::parse(m).map_err(|e| config_error(q, m, &e.to_string()))?;
-        let mut must = Vec::new();
-        needles(&ast, &mut must);
+        let must = Needles::from_query(&ast);
         let mut first_err = None;
         let mut any = false;
         let mut langs: Vec<Box<dyn lang::Lang>> = Vec::new();
@@ -475,7 +425,7 @@ fn run_query(
         let Ok(source) = std::fs::read(file) else { continue };
         let mine: Vec<_> = compiled
             .iter()
-            .filter(|(l, _, _, must)| l == lang_name && must.iter().all(|alts| alts.iter().any(|n| holds(&source, n))))
+            .filter(|(l, _, _, must)| l == lang_name && must.holds(&source))
             .collect();
         if mine.is_empty() {
             continue;
@@ -1351,24 +1301,9 @@ mod tests {
     #[test]
     fn a_file_without_the_exact_names_is_never_parsed() {
         let ast = crate::query::parse("(pair.key(property_identifier#path).value(string @key)) ~ (id#/x.y/ @t)").unwrap();
-        let mut n = Vec::new();
-        needles(&ast, &mut n);
-        assert_eq!(n, vec![vec!["path".to_string()]], "a regex that is not plain literals gives no needle");
-    }
-
-    #[test]
-    fn a_regex_of_plain_literals_gives_alternatives_and_others_give_none() {
-        let lits = |s: &str| regex_literals(s);
-        assert_eq!(lits("Error$"), Some(vec!["Error".to_string()]));
-        assert_eq!(lits("^(Get|Post)$"), Some(vec!["Get".to_string(), "Post".to_string()]));
-        assert_eq!(lits("^(?:aria-label|title)$"), Some(vec!["aria-label".to_string(), "title".to_string()]));
-        for none in ["^[A-Z]", "\\S", "a.b", "(?i)foo", "a*", "", "(a)(b)"] {
-            assert_eq!(lits(none), None, "{}", none);
-        }
-        let ast = crate::query::parse("(call_expression.function(selector_expression.field(field_identifier#/^(Get|Post)$/)))").unwrap();
-        let mut n = Vec::new();
-        needles(&ast, &mut n);
-        assert_eq!(n, vec![vec!["Get".to_string(), "Post".to_string()]]);
+        let n = Needles::from_query(&ast);
+        assert_eq!(n.groups().to_vec(), vec![vec!["path".to_string()]], "a regex that is not plain literals gives no needle");
+        assert!(n.holds(b"x path y") && !n.holds(b"nothing"));
     }
 
     #[test]

@@ -6,6 +6,7 @@ mod files;
 mod find;
 mod footer;
 mod miss;
+mod needle;
 mod parsed;
 mod query;
 mod runner;
@@ -982,7 +983,14 @@ fn main() {
     let mut compiled_cache: HashMap<&'static str, (Box<dyn lang::Lang>, compiler::CompiledQuery)> =
         HashMap::new();
 
+    // A file without the query's names cannot match, so it is never parsed.
+    // --show-query prints per file, so it keeps every file.
+    let needles = if cli.show_query { needle::Needles::none() } else { needle::Needles::from_query(&ast) };
+
     for (file, lang_name) in &jobs {
+        if lacks_needles(&needles, file) {
+            continue;
+        }
         let (lang_box, compiled) = compiled_cache.entry(lang_name).or_insert_with(|| {
             let l = lang::for_name(lang_name).expect("lang_name always valid here");
             let c = compiler::compile(&ast, l.as_ref());
@@ -1104,6 +1112,19 @@ fn main() {
         std::process::exit(1);
     }
     print!("{}", footer::tail(total_matches, "match", &hidden, scope_opts.is_some()));
+}
+
+/// Whether `file` is readable and lacks the bytes of `needles`, so a query
+/// cannot match in it. Stdin and unreadable files are not skipped, the loop
+/// reports the unreadable ones.
+fn lacks_needles(needles: &needle::Needles, file: &str) -> bool {
+    if needles.is_none() || file == "-" {
+        return false;
+    }
+    match parsed::try_source(file) {
+        Ok(src) => !needles.holds(&src),
+        Err(_) => false,
+    }
 }
 
 /// A file's text and, when the query has patterns, its tree: from the run's
@@ -1441,7 +1462,11 @@ fn run_refs(
         let shown_before = shown;
         let mut compiled_cache: HashMap<&'static str, (Box<dyn lang::Lang>, compiler::CompiledQuery)> =
             HashMap::new();
+        let needles = needle::Needles::from_query(ast);
         for (file, lang_name) in jobs {
+            if lacks_needles(&needles, file) {
+                continue;
+            }
             let (lang_box, compiled) = compiled_cache.entry(lang_name).or_insert_with(|| {
                 let l = lang::for_name(lang_name).expect("lang_name always valid here");
                 let c = compiler::compile(ast, l.as_ref());

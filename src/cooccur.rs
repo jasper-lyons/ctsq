@@ -36,6 +36,9 @@ pub fn matching_files_hiding(
         asts.push(query::parse(q).map_err(|e| format!("Parse error in '{}': {}", q, e))?);
     }
 
+    // Every query must match in a file, so a file without all their names is skipped.
+    let needles = crate::needle::Needles::from_queries(&asts);
+
     // (lang, query index) -> compiled. Compiling is the expensive part and a
     // directory usually holds many files of the same language.
     let mut cache: HashMap<(&'static str, usize), compiler::CompiledQuery> = HashMap::new();
@@ -47,6 +50,9 @@ pub fn matching_files_hiding(
             .entry(lang_name)
             .or_insert_with(|| lang::for_name(lang_name).expect("lang_name always valid here"));
         let Ok(source) = std::fs::read(file) else { continue };
+        if !needles.holds(&source) {
+            continue;
+        }
         let whole = hider.file(file);
         let mut scopes: Option<Vec<(usize, usize)>> = None;
 
