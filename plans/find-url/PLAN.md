@@ -101,3 +101,10 @@ Read-only Opus reviewer tries to break Decisions 01 to 07: regex injection throu
 ## Package: mavexa
 
 After merge and `make install`: run `ctsq find route` from Mavexa's root with real URLs for each frontend route in `frontend/src/routesConfig.ts` and a sample of backend routes in `backend/internal/api/handler.go`. Anything the built-in packs miss gets a repo query in Mavexa's `.ctsq/queries/`, on a branch in a Mavexa worktree, never on Mavexa's working copy.
+
+## Results (2026-10-18)
+
+- Mavexa: `python3 plans/find-url/mavexa-urls.py` pastes a full URL (host, filled params, `?ref=x`, the method for Go routes) for each of its 336 routes (288 Go, 48 Solid; the `*404` catch-all skipped) and checks the first row is that route: 336 of 336. The built-in packs cover Mavexa, so it needs no `.ctsq/queries/` file.
+- `plans/parse-cache/same-output.sh` now reports 4 differences, all `find route` (with and without `--tests`, ctsq root and Mavexa), and all only nested keys gaining their parent prefix (Decision 09). Its reference binary predates this plan; the differences are intended.
+- Wall time: `find route` with a pasted URL on Mavexa root about 0.8s (0.24s before, when the key-text file skip applied).
+- Long keys still print cut to 40 characters in the listing (`/w/:workspaceID/campaigns/:id/events/...`); the params column shows the values.
