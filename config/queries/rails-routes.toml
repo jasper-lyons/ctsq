@@ -17,3 +17,21 @@ match = [
 target      = "def"
 rewrite     = ["^:?(\\w+)(?:#(\\w+))?$", "${1:pascal}Controller#$2"]
 key_rewrite = ["^:(\\w+)$", "/$1"]
+
+# A pasted URL finds its route: key_input drops the scheme and host, the query
+# and fragment, and a trailing slash. Each route's path becomes a pattern.
+key_input = [
+  ['^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*', ''],  # scheme and host
+  ['[?#].*$', ''],                           # query and fragment
+  ['(.)/$', '$1'],                           # a trailing slash, not a lone one
+  ['^$', '/'],
+]
+key_pattern = [
+  ['^(\w)', '/?$1'],              # a path written without its leading /
+  ['\(', '(?:'],                  # (.:format) and other (...) are optional
+  ['\)', ')?'],
+  [':(\w+)', '(?P<$1>[^/.]+)'],   # :name one segment
+  ['\*(\w+)', '(?P<$1>.+)'],      # *name the rest
+  ['/', '/'],                            # a slash is not a literal character
+]
+key_min_literal = 1                      # so a catch-all (*, /*, /) is not tested

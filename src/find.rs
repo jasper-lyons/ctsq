@@ -11,7 +11,7 @@
 
 use crate::compiler::{self, lang};
 use crate::config::glossary::{Glossary, Name};
-use crate::config::queries::{self, Detect, NamedQuery, Target};
+use crate::config::queries::{self, Detect, KeyMatch, NamedQuery, Target};
 use crate::files;
 use crate::footer;
 use crate::needle::Needles;
@@ -256,13 +256,14 @@ impl KeyFilter {
     /// a run of letters and digits of the key occurs in the file unbroken. A
     /// substring key is case-insensitive, so its longest such run is searched
     /// ignoring ASCII case. A regex key counts only when it is a literal or an
-    /// alternation of literals without spaces. An error key is not used: it
-    /// also matches through the format string's placeholders, so the user's
-    /// text need not occur in the file.
-    fn file_needle(&self, errors: bool) -> Option<KeyNeedle> {
+    /// alternation of literals without spaces. `loose` (the query has
+    /// `key_pattern` or `key_text`) gives none for a substring key: a row also
+    /// matches by pattern, or by a key the text rules changed, so the user's
+    /// text need not occur in the file (a pasted URL never does).
+    fn file_needle(&self, loose: bool) -> Option<KeyNeedle> {
         match self {
             KeyFilter::Any => None,
-            KeyFilter::Sub(_) if errors => None,
+            KeyFilter::Sub(_) if loose => None,
             KeyFilter::Sub(s) => {
                 let run = s.split(|c: char| !c.is_ascii_alphanumeric()).max_by_key(|r| r.len())?;
                 (!run.is_empty()).then(|| KeyNeedle::Fold(run.to_string()))
@@ -271,53 +272,103 @@ impl KeyFilter {
         }
     }
 
-    /// `errors` makes a substring key match an error's format string through
-    /// its placeholders as well (`error_key_matches`).
-    fn matches(&self, key: &str, errors: bool) -> bool {
+    /// The text test. `text` is the row key after `key_text`, `printed` the
+    /// key as printed, which a `/regex/` key sees.
+    fn matches(&self, text: &str, printed: &str) -> bool {
         match self {
             KeyFilter::Any => true,
-            KeyFilter::Sub(s) if errors => error_key_matches(s, key),
-            KeyFilter::Sub(s) => key.to_lowercase().contains(s),
-            KeyFilter::Re(r) => r.is_match(key),
+            KeyFilter::Sub(s) => text.to_lowercase().contains(s),
+            KeyFilter::Re(r) => r.is_match(printed),
         }
     }
 }
 
-/// The verbs and interpolations of a format string: `%s %v %d %w %q %x %f %T
-/// %+v` and friends, `${...}` in a JS template and `#{...}` in a Ruby string.
-fn placeholders() -> &'static regex::Regex {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| {
-        regex::Regex::new(r"%[+#\-]?\d*(?:\.\d+)?[svdwqxfTtgep]|\$\{[^}]*\}|#\{[^}]*\}").unwrap()
-    })
+/// A row that matched by its key's pattern.
+#[derive(Debug, Clone, PartialEq)]
+struct PatternHit {
+    /// Literal characters in the pattern: more is more specific.
+    literal: usize,
+    /// `name=value` for each named group that took part, space-separated.
+    params: String,
 }
 
-/// Whether a message typed by the user finds an error whose key is the format
-/// string `fmt`. It does when the user's text is a case-insensitive substring
-/// of the format string, or when the format string with every placeholder
-/// turned into a wildcard matches somewhere in the user's text (a message
-/// copied from a log has the verbs filled in). Concatenation is not followed.
-/// A format string with under four literal characters is too loose for the
-/// second rule.
-fn error_key_matches(user: &str, fmt: &str) -> bool {
-    let fmt = fmt.replace("\\\"", "\"");
-    if fmt.to_lowercase().contains(&user.to_lowercase()) {
-        return true;
+/// One query's key test: the text filter, and the pattern `key_pattern`
+/// builds from each row's key (see `config::queries`).
+struct KeyMatcher<'a> {
+    filter: &'a KeyFilter,
+    key_text: &'a [(String, String)],
+    scanner: Option<queries::KeyScanner>,
+    /// The user's key after `key_input`. None: no pattern is tested (no
+    /// `key_pattern`, no key, or a `/regex/` key).
+    input: Option<String>,
+    mode: KeyMatch,
+    min_literal: usize,
+    /// Each row key's compiled pattern, None when it has none.
+    cache: HashMap<String, Option<(regex::Regex, usize)>>,
+}
+
+impl<'a> KeyMatcher<'a> {
+    fn new(q: &'a NamedQuery, filter: &'a KeyFilter, key: Option<&str>) -> KeyMatcher<'a> {
+        let scanner = queries::KeyScanner::new(&q.key_pattern);
+        let input = match (filter, key, &scanner) {
+            (KeyFilter::Sub(_), Some(k), Some(_)) => Some(queries::apply_all(&q.key_input, k)),
+            _ => None,
+        };
+        KeyMatcher {
+            filter,
+            key_text: &q.key_text,
+            scanner,
+            input,
+            mode: q.key_match,
+            min_literal: q.key_min_literal,
+            cache: HashMap::new(),
+        }
     }
-    let mut pattern = String::new();
-    let mut literal = 0;
-    let mut at = 0;
-    for m in placeholders().find_iter(&fmt) {
-        let lit = &fmt[at..m.start()];
-        literal += lit.chars().filter(|c| !c.is_whitespace()).count();
-        pattern.push_str(&regex::escape(lit));
-        pattern.push_str(".*?");
-        at = m.end();
+
+    /// Whether a row key passes, and how when by pattern.
+    fn test(&mut self, key: &str) -> (bool, Option<PatternHit>) {
+        let text = if self.key_text.is_empty() { key.to_string() } else { queries::apply_all(self.key_text, key) };
+        let by_text = self.filter.matches(&text, key);
+        let (Some(input), Some(scanner)) = (&self.input, &self.scanner) else { return (by_text, None) };
+        let (mode, min) = (self.mode, self.min_literal);
+        let compiled = self.cache.entry(text.clone()).or_insert_with(|| {
+            let k = scanner.scan(&text);
+            if k.literal < min {
+                return None;
+            }
+            let src = match mode {
+                KeyMatch::Whole => format!("(?is)^(?:{})$", k.source),
+                KeyMatch::Within => format!("(?is){}", k.source),
+            };
+            regex::Regex::new(&src).ok().map(|r| (r, k.literal))
+        });
+        let Some((re, literal)) = compiled else { return (by_text, None) };
+        let Some(caps) = re.captures(input) else { return (by_text, None) };
+        // A key that also matched as text filled in nothing (it holds the
+        // route's own `{id}`), so only a pattern-only match shows values.
+        let params: Vec<String> = if by_text {
+            Vec::new()
+        } else {
+            re.capture_names()
+                .flatten()
+                .filter_map(|n| caps.name(n).map(|m| format!("{}={}", n, m.as_str())))
+                .collect()
+        };
+        (true, Some(PatternHit { literal: *literal, params: params.join(" ") }))
     }
-    let lit = &fmt[at..];
-    literal += lit.chars().filter(|c| !c.is_whitespace()).count();
-    pattern.push_str(&regex::escape(lit));
-    literal >= 4 && regex::Regex::new(&format!("(?is){}", pattern)).is_ok_and(|r| r.is_match(user))
+}
+
+/// Pattern matches first, the most literal characters first, the order
+/// otherwise kept. Only for a `whole` query with `key_pattern`: a `within`
+/// query keeps the source order.
+fn order_by_pattern(q: &NamedQuery, hits: &mut [Hit]) {
+    if q.key_pattern.is_empty() || q.key_match != KeyMatch::Whole {
+        return;
+    }
+    hits.sort_by_key(|h| match &h.pattern {
+        Some(p) => (0, std::cmp::Reverse(p.literal)),
+        None => (1, std::cmp::Reverse(0)),
+    });
 }
 
 /// A key as printed: its quotes dropped, a message over several lines on one.
@@ -369,6 +420,8 @@ struct Hit {
     key: String,
     target: String,
     target_loc: String,
+    /// Set when the row matched by its key's pattern.
+    pattern: Option<PatternHit>,
 }
 
 /// A named query that does not compile is the query file's fault: name the
@@ -426,12 +479,14 @@ fn compile_all(q: &NamedQuery) -> Result<Compiled, Report> {
 /// of the added names.
 struct Ask<'a> {
     filter: &'a KeyFilter,
+    /// The key as the user typed it.
+    key: Option<&'a str>,
     extra: &'a [Name],
 }
 
 impl Ask<'_> {
-    fn key_ok(&self, q: &NamedQuery, key: &str) -> bool {
-        self.filter.matches(key, q.name == "error")
+    fn matcher<'b>(&'b self, q: &'b NamedQuery) -> KeyMatcher<'b> {
+        KeyMatcher::new(q, self.filter, self.key)
     }
 
     /// Whether a row the key filter dropped is kept by the glossary.
@@ -462,10 +517,11 @@ fn run_query(
     // A file lacking the key's text has no row that passes the key filter, and
     // nothing else keeps a row: not the glossary, not a rewritten key.
     let key_needle = if ask.extra.is_empty() && q.key_rewrite.is_none() {
-        ask.filter.file_needle(q.name == "error")
+        ask.filter.file_needle(!q.key_pattern.is_empty() || !q.key_text.is_empty())
     } else {
         None
     };
+    let mut km = ask.matcher(q);
     for (file, lang_name) in &jobs {
         if !compiled.iter().any(|(l, ..)| l == lang_name) {
             continue;
@@ -500,7 +556,7 @@ fn run_query(
                     Some(rw) => queries::apply_rewrite(rw, &key),
                     None => key,
                 };
-                let key_ok = ask.key_ok(q, &key);
+                let (key_ok, pattern) = km.test(&key);
                 if !key_ok && ask.extra.is_empty() {
                     continue;
                 }
@@ -572,12 +628,13 @@ fn run_query(
                     }
                 }
                 if seen.insert((file.clone(), line, key.clone(), target.clone())) {
-                    hits.push(Hit { file: file.clone(), line, key, target, target_loc });
+                    hits.push(Hit { file: file.clone(), line, key, target, target_loc, pattern });
                 }
             }
         }
     }
     hits.sort_by(|a, b| (&a.file, a.line, &a.key).cmp(&(&b.file, b.line, &b.key)));
+    order_by_pattern(q, &mut hits);
     Ok(hits)
 }
 
@@ -718,6 +775,7 @@ fn run_paths(
     let jobs = scan.jobs_for(&q.langs);
     let prefix = scan.prefix.clone();
     let mut hits = Vec::new();
+    let mut km = ask.matcher(q);
     for (file, _) in &jobs {
         let rel = shown(&prefix, file);
         if !ov.matched(rel, false).is_whitelist() {
@@ -730,7 +788,7 @@ fn run_paths(
         if let Some(rw) = &q.key_rewrite {
             key = queries::apply_rewrite(rw, &key);
         }
-        let key_ok = ask.key_ok(q, &key);
+        let (key_ok, pattern) = km.test(&key);
         if !key_ok && ask.extra.is_empty() {
             continue;
         }
@@ -751,9 +809,10 @@ fn run_paths(
                 continue;
             }
         }
-        hits.push(Hit { file: file.clone(), line: 1, key, target, target_loc });
+        hits.push(Hit { file: file.clone(), line: 1, key, target, target_loc, pattern });
     }
     hits.sort_by(|a, b| (&a.key, &a.file).cmp(&(&b.key, &b.file)));
+    order_by_pattern(q, &mut hits);
     Ok(hits)
 }
 
@@ -799,7 +858,7 @@ pub fn report_with(
             }
         }
     }
-    let ask = Ask { filter: &filter, extra: &extra };
+    let ask = Ask { filter: &filter, key, extra: &extra };
     let owned: Vec<NamedQuery> = mine.iter().map(|q| (*q).clone()).collect();
     let why = verdicts(&owned, scan);
     let mut hider = files::Hider::new(hide);
@@ -837,7 +896,11 @@ pub fn report_with(
             if !footer::take(&h.file) {
                 continue;
             }
-            rows.push(vec![format!("{}:{}", shown(&scan.prefix, &h.file), h.line), cap_key(&h.key), h.target, h.target_loc]);
+            let mut row = vec![format!("{}:{}", shown(&scan.prefix, &h.file), h.line), cap_key(&h.key), h.target, h.target_loc];
+            if let Some(p) = h.pattern.filter(|p| !p.params.is_empty()) {
+                row.push(p.params);
+            }
+            rows.push(row);
         }
         let n = rows.len() - before;
         counts.push((n, format!(
@@ -1231,18 +1294,28 @@ mod tests {
         assert_eq!(all.out.lines().filter(|l| l.contains(" errors (") || l.contains(" error (")).count(), 3, "{}", all.out);
     }
 
+    /// Whether `user` finds the error whose key is `fmt`, through the rules of
+    /// the built-in Go error pack.
+    fn error_matches(user: &str, fmt: &str) -> bool {
+        let text = std::fs::read_to_string(format!("{}/config/queries/error-go.toml", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let q = queries::parse_file("g", &text).unwrap().remove(0);
+        let f = KeyFilter::new(Some(user)).unwrap();
+        let (ok, _) = KeyMatcher::new(&q, &f, Some(user)).test(fmt);
+        ok
+    }
+
     #[test]
     fn error_key_matching_rules() {
-        assert!(error_key_matches("failed to load pipeline 7: boom", "failed to load pipeline %s: %w"));
-        assert!(error_key_matches("render 3 blocks (&{a})", "render %d blocks (%+v)"));
-        assert!(error_key_matches("bad field 9", "Bad field ${text}"));
-        assert!(error_key_matches("got \"x\" here", "got %q here"));
-        assert!(error_key_matches("pipeline is empty (id=3)", "pipeline is empty"), "the format string anywhere in the log line");
-        assert!(error_key_matches("load pipeline", "failed to load pipeline %s"), "a substring of the literal text");
-        assert!(!error_key_matches("totally different", "failed to load pipeline %s"));
-        assert!(!error_key_matches("anything at all", "%w"), "all placeholder, too loose");
-        assert!(!error_key_matches("a b", "x: %s"), "under four literal characters");
-        assert!(!error_key_matches("failed to load pipeline abc", "\"failed to load \" + name"), "concatenation is not followed");
+        assert!(error_matches("failed to load pipeline 7: boom", "failed to load pipeline %s: %w"));
+        assert!(error_matches("render 3 blocks (&{a})", "render %d blocks (%+v)"));
+        assert!(error_matches("bad field 9", "Bad field ${text}"));
+        assert!(error_matches("got \"x\" here", "got %q here"));
+        assert!(error_matches("pipeline is empty (id=3)", "pipeline is empty"), "the format string anywhere in the log line");
+        assert!(error_matches("load pipeline", "failed to load pipeline %s"), "a substring of the literal text");
+        assert!(!error_matches("totally different", "failed to load pipeline %s"));
+        assert!(!error_matches("anything at all", "%w"), "all placeholder, too loose");
+        assert!(!error_matches("a b", "x: %s"), "under four literal characters");
+        assert!(!error_matches("failed to load pipeline abc", "\"failed to load \" + name"), "concatenation is not followed");
     }
 
     #[test]

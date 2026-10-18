@@ -10,3 +10,19 @@ detect    = { file = ["app/layout.tsx", "app/layout.jsx", "app/layout.ts", "app/
 paths         = "app/**/page.{tsx,jsx,ts,js}"
 key_from_path = "^app(/.*)?/page\\.\\w+$"
 target        = "default-export"
+
+# A pasted URL finds its route: key_input drops the scheme and host, the query
+# and fragment, and a trailing slash. Each route's path becomes a pattern.
+key_input = [
+  ['^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*', ''],  # scheme and host
+  ['[?#].*$', ''],                           # query and fragment
+  ['(.)/$', '$1'],                           # a trailing slash, not a lone one
+  ['^$', '/'],
+]
+key_pattern = [
+  ['/\[\[\.\.\.(\w+)\]\]', '(?:/(?P<$1>.+))?'],  # [[...name]] an optional rest
+  ['\[\.\.\.(\w+)\]', '(?P<$1>.+)'],             # [...name] the rest
+  ['\[(\w+)\]', '(?P<$1>[^/]+)'],                # [name] one segment
+  ['/', '/'],                            # a slash is not a literal character
+]
+key_min_literal = 1                      # so a catch-all (*, /*, /) is not tested

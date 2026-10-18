@@ -231,11 +231,11 @@ fixtures/scope/Asset.tsx:11: const saveAssetNow = () => props.asset  ?
 
 ```
 ctsq -q 'id#hide_rows' --scope src/
-src/main.rs:1036: hide_rows(&mut hider, file, source, fetched.tree(), rows, true, &mut hidden)
-  in src/main.rs:662-1115  fn main() {
-src/main.rs:1179: fn hide_rows(
-src/main.rs:1482: for r in &hide_rows(&mut hider, file, source, fetched.tree(), rows, false, &mut name_hidden) {
-  in src/main.rs:1436-1518  fn run_refs(
+src/main.rs:1040: hide_rows(&mut hider, file, source, fetched.tree(), rows, true, &mut hidden)
+  in src/main.rs:666-1119  fn main() {
+src/main.rs:1183: fn hide_rows(
+src/main.rs:1486: for r in &hide_rows(&mut hider, file, source, fetched.tree(), rows, false, &mut name_hidden) {
+  in src/main.rs:1440-1522  fn run_refs(
 3 matches
 ```
 
@@ -565,6 +565,8 @@ ctsq find error 'failed to load pipeline 12: open x'
   Rails), `text`, `label`, `component` (TSX and JSX), `error` (Go, TS/JS, Ruby)
 - an error key matches through printf placeholders (`%s`, `%v`, `%w`, `${...}`),
   so a message copied from a log finds its source
+- a route key can be a pasted URL (`ctsq find route 'https://app/x/42?y=1'`):
+  the most specific route prints first, with the values it took (`id=42`)
 - query files live in `.ctsq/queries/`, then `$XDG_CONFIG_HOME/ctsq/queries`,
   then `$XDG_CACHE_HOME/ctsq/queries`, then built-in (`ctsq config path`)
 - `.ctsq/glossary.toml` maps product words to code names, used by `find`, `def`

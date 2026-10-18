@@ -10,3 +10,17 @@ match = [
   "(call.method(identifier#raise) > (argument_list > (string @key)))",
 ]
 target = "enclosing"
+
+# How a message the user pasted finds this error. The substring test sees the
+# key with \" as ", and each placeholder below becomes a wildcard, so a message
+# copied from a log (verbs filled in) finds its format string anywhere in the
+# pasted line. All three placeholder forms apply in every language, as before.
+# A key with under four literal characters is too loose for the pattern test.
+key_text        = [['\\"', '"']]
+key_pattern     = [
+  ['%[+#\-]?\d*(?:\.\d+)?[svdwqxfTtgep]', '.*?'],  # Go and printf verbs: %s %w %+v %.2f
+  ['\$\{[^}]*\}', '.*?'],                         # JS template: ${name}
+  ['#\{[^}]*\}', '.*?'],                          # Ruby interpolation: #{name}
+]
+key_match       = "within"
+key_min_literal = 4

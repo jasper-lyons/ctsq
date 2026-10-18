@@ -17,3 +17,24 @@ match = [
   "(call_expression.function(selector_expression.field(field_identifier#/^(HandleFunc|Handle)$/)) > (argument_list > (interpreted_string_literal @key) + (call_expression > (argument_list > (selector_expression.field(@target))))))",
 ]
 target = "def"
+
+# A pasted URL finds its route, with or without a method in front: key_input
+# drops the scheme and host (keeping a leading METHOD), the query and fragment,
+# and a trailing slash. A pasted method must equal the route's, a route with no
+# method takes any. A pattern ending in / takes everything below it.
+key_input = [
+  ['^([A-Z]+ )?[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*', '$1'],  # scheme and host
+  ['[?#].*$', ''],                                       # query and fragment
+  ['(.)/$', '$1'],                                       # a trailing slash, not a lone one
+  ['^([A-Z]+ )?$', '${1}/'],
+]
+key_pattern = [
+  ['^(GET|HEAD|POST|PUT|PATCH|DELETE|CONNECT|OPTIONS|TRACE) ', '(?:$1 )?'],  # METHOD, optional when pasted
+  ['^/', '(?:[A-Z]+ )?/'],               # no method: any method
+  ['/\{\$\}$', '/?'],                    # {$} the path ends here
+  ['\{(\w+)\.\.\.\}', '(?P<$1>.*)'],     # {name...} the rest
+  ['\{(\w+)\}', '(?P<$1>[^/]+)'],        # {name} one segment
+  ['/$', '(?:/.*)?'],                    # a trailing / takes the subtree
+  ['/', '/'],                            # a slash is not a literal character
+]
+key_min_literal = 1                      # so a catch-all (*, /*, /) is not tested

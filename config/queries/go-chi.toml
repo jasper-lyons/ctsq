@@ -15,3 +15,19 @@ match = [
   "(call_expression.function(selector_expression.field(field_identifier#/^(Get|Post|Put|Patch|Delete|Head|Options|Handle|HandleFunc|Route|Mount)$/)) > (argument_list > (interpreted_string_literal @key) + (identifier @target)))",
 ]
 target = "def"
+
+# A pasted URL finds its route: key_input drops the scheme and host, the query
+# and fragment, and a trailing slash. Each route's path becomes a pattern.
+key_input = [
+  ['^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*', ''],  # scheme and host
+  ['[?#].*$', ''],                           # query and fragment
+  ['(.)/$', '$1'],                           # a trailing slash, not a lone one
+  ['^$', '/'],
+]
+key_pattern = [
+  ['\{(\w+):((?:[^{}]|\{[^{}]*\})*)\}', '(?P<$1>$2)'],  # {name:regex} keeps its regex
+  ['\{(\w+)\}', '(?P<$1>[^/]+)'],                       # {name} one segment
+  ['\*', '.*'],                                         # * the rest
+  ['/', '/'],                            # a slash is not a literal character
+]
+key_min_literal = 1                      # so a catch-all (*, /*, /) is not tested

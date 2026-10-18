@@ -467,12 +467,16 @@ query that applies in the current directory and why:
   ctsq find route
   ctsq find route /library
   ctsq find route '/^/w/'
+  ctsq find route 'https://app.example.com/library/42?tab=x'
 
   ctsq find text 'Welcome back'
   ctsq find error 'failed to load pipeline 12: open x: no such file'
 
-An error key is a format string, so %s %v %d %w %q %x %f %T %+v and ${...} match
-any text and a message copied from a log finds it. A repo glossary,
+A route key can be a pasted URL: each route's path is also turned into a pattern
+(:id, {id}, [id], *rest per framework), the best match prints first and the
+values the URL filled in follow the row, as id=42. An error key is a format
+string, so %s %v %d %w %q %x %f %T %+v and ${...} match any text and a message
+copied from a log finds it. Both come from key_pattern in the query file. A repo glossary,
 .ctsq/glossary.toml at the repo root, maps product words to code names. A key
 holding one of its terms also finds rows by those names, and a last line says so.
 

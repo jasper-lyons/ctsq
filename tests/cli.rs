@@ -885,6 +885,64 @@ fn find_text_and_error_name_the_function_that_renders_or_emits_them() {
 }
 
 #[test]
+fn find_route_takes_a_pasted_url_and_shows_the_parameters() {
+    let out = ctsq_in(&fixture("queries/solid-url"), &["find", "route", "https://app.example.com/api/org/mavexa/team/hr?x=1"]);
+    assert_eq!(
+        stdout(&out),
+        "src/routes.ts:7  /api/org/:org_id/team/:team_id  Team  src/pages.tsx:9  org_id=mavexa team_id=hr\n\
+         1 route (solid-routes, from built-in queries/solid-routes.toml)\n"
+    );
+    let out = ctsq_in(&fixture("queries/solid-url"), &["find", "route", "https://app.example.com/docs/a/b/"]);
+    assert!(stdout(&out).starts_with("src/routes.ts:8  /docs/*rest  Docs  src/pages.tsx:13  rest=a/b\n"), "{}", stdout(&out));
+    let out = ctsq_in(&fixture("queries/solid-url"), &["find", "route", "https://app.example.com/settings"]);
+    assert!(stdout(&out).starts_with("src/routes.ts:9  /settings/:tab?  Settings  src/pages.tsx:17\n1 route"), "{}", stdout(&out));
+}
+
+#[test]
+fn find_route_puts_the_most_specific_pattern_first() {
+    let out = ctsq_in(&fixture("queries/solid-url"), &["find", "route", "https://app.example.com/events/new"]);
+    assert_eq!(
+        stdout(&out),
+        "src/routes.ts:6  /events/new  NewEvent   src/pages.tsx:5\n\
+         src/routes.ts:5  /events/:id  EventPage  src/pages.tsx:1  id=new\n\
+         2 routes (solid-routes, from built-in queries/solid-routes.toml)\n"
+    );
+}
+
+#[test]
+fn find_route_still_finds_rows_by_text_and_skips_catch_alls() {
+    let out = ctsq_in(&fixture("queries/solid-url"), &["find", "route", "events"]);
+    assert_eq!(
+        stdout(&out),
+        "src/routes.ts:5  /events/:id  EventPage  src/pages.tsx:1\n\
+         src/routes.ts:6  /events/new  NewEvent   src/pages.tsx:5\n\
+         2 routes (solid-routes, from built-in queries/solid-routes.toml)\n"
+    );
+    // `*` has no literal character, so it never matches by pattern.
+    let out = ctsq_in(&fixture("queries/solid-url"), &["find", "route", "https://app.example.com/unknown/page"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+}
+
+#[test]
+fn find_route_takes_a_pasted_url_in_every_route_pack() {
+    let cases: &[(&str, &str, &str)] = &[
+        ("queries/react-router", "https://example.com/about/", "src/main.tsx:6  /about  About  src/pages.tsx:5\n"),
+        ("queries/go-http", "https://example.com/api/auth/login?next=/", "main.go:21  POST /api/auth/login  login  main.go:11\n"),
+        ("queries/go-http", "POST https://example.com/api/auth/login", "main.go:21  POST /api/auth/login  login  main.go:11\n"),
+        ("queries/go-chi", "http://localhost:8080/users/42", "main.go:22  /users/{id}  Show        main.go:15  id=42\n"),
+        ("queries/next-app", "https://example.com/blog/hello-world", "app/blog/[slug]/page.tsx:1  /blog/[slug]  BlogPost  app/blog/[slug]/page.tsx:1  slug=hello-world\n"),
+        ("queries/rails", "https://example.com/contact#form", "config/routes.rb:3  /contact  StaticController#contact  app/controllers/static_controller.rb:5\n"),
+    ];
+    for (dir, url, first) in cases {
+        let out = ctsq_in(&fixture(dir), &["find", "route", url]);
+        assert!(stdout(&out).starts_with(first), "{} {}: {}", dir, url, stdout(&out));
+    }
+    // A pasted method must be the route's.
+    let out = ctsq_in(&fixture("queries/go-http"), &["find", "route", "GET https://example.com/api/auth/login"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+}
+
+#[test]
 fn the_glossary_is_used_by_find_def_and_a_miss_and_each_says_so_last() {
     let dir = fixture("glossary");
     let note = ".ctsq/glossary.toml:2: \"pipeline page\" also searched as Pipeline\n";

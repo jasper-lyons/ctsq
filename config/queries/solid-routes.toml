@@ -17,3 +17,20 @@ match = [
   "(pair.key(property_identifier#path).value(string @key)) ~ (pair.key(property_identifier#component).value(call_expression.arguments(arguments > (arrow_function > call_expression.arguments(arguments > (string @target))))))",
 ]
 target = "def"
+
+# A pasted URL finds its route: key_input drops the scheme and host, the query
+# and fragment, and a trailing slash. Each route's path becomes a pattern.
+key_input = [
+  ['^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*', ''],  # scheme and host
+  ['[?#].*$', ''],                           # query and fragment
+  ['(.)/$', '$1'],                           # a trailing slash, not a lone one
+  ['^$', '/'],
+]
+key_pattern = [
+  ['/:(\w+)\?', '(?:/(?P<$1>[^/]+))?'],  # /:name? an optional segment
+  [':(\w+)', '(?P<$1>[^/]+)'],           # :name one segment
+  ['\*(\w+)', '(?P<$1>.*)'],             # *name the rest
+  ['\*', '.*'],                          # * the rest
+  ['/', '/'],                            # a slash is not a literal character
+]
+key_min_literal = 1                      # so a catch-all (*, /*, /) is not tested

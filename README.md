@@ -507,19 +507,30 @@ main.go:24  /users/{id}  createUser  main.go:11
 
 Each row is the file and line of the match, the key, the target, and the target's definition (`?` when `def` finds none). A count line per framework names the file the query came from. Exit 0 when anything matched, 1 when nothing did, 2 for an unknown query or a query file that does not compile.
 
+A route key can also be a URL pasted from the address bar or a log. The scheme, host, query and a trailing slash are dropped, each route's path is read as a pattern in its framework's syntax (`:id`, `{id}`, `[id]`, `*rest`), the most specific match prints first, and the values the URL filled in follow the row:
+
+```sh
+cd fixtures/queries/solid-url
+ctsq find route 'https://app.example.com/events/new?ref=mail'
+src/routes.ts:6  /events/new  NewEvent   src/pages.tsx:5
+src/routes.ts:5  /events/:id  EventPage  src/pages.tsx:1  id=new
+2 routes (solid-routes, from built-in queries/solid-routes.toml)
+```
+
 Built-in packs, in `config/queries/`:
 
 | Query | Frameworks and languages |
 |-------|--------------------------|
 | `route` | Solid, React Router, Next.js app router, Go `net/http` and chi, Rails |
 | `text`, `label`, `component` | JSX and TSX: the component rendering some text between tags, the component rendering a label, title, placeholder or alt prop, and the components themselves |
-| `error` | Go, TypeScript and JavaScript, Ruby: the function emitting an error message. The key is matched as a format string, so `%s`, `%v`, `%d`, `%w` and `${…}` match any text and a message copied from a log finds its source |
+| `error` | Go, TypeScript and JavaScript, Ruby: the function emitting an error message. The key is matched as a format string, so `%s`, `%v`, `%d`, `%w`, `${…}` and `#{…}` match any text and a message copied from a log finds its source |
 
 Queries are TOML files looked up in `.ctsq/queries/` in the repo, then `$XDG_CONFIG_HOME/ctsq/queries`, then `$XDG_CACHE_HOME/ctsq/queries`, then the built-in packs. `ctsq config path` lists the directories. A repo file with the same framework and query name replaces the built-in one. Each file has these fields:
 
 - `framework`, `langs`: the name shown in output and the languages it applies to
 - `detect`: when it applies, by `import`, `file` or `dependency`
 - `[query]` table, named for the query (such as `[route]`): `match` is a selector or a list of them with `@key` and `@target` captures, `target` is `def`, `enclosing`, `self` or `default-export`, and the optional `rewrite`, `key_rewrite`, `paths` and `key_from_path` shape the key and target
+- `key_pattern = [["<regex>", "<fragment>"], ...]` turns each row's key into a pattern: the key is scanned left to right, at each position the first rule matching there emits its fragment (`$1` and `$name` expand), and any other character is matched literally. `key_input` (same shape) cleans the user's key first, `key_text` cleans the row key for the substring test, `key_match = "within"` finds the pattern anywhere in the user's key (a log line) instead of the whole of it, and `key_min_literal` skips patterns with too few literal characters. The built-in route and error packs show each in use
 
 An example, saved as `.ctsq/queries/handlers.toml` in a Go repo:
 

@@ -23,9 +23,41 @@
 //! key_from_path = "^app(/.*)?/page\\.\\w+$"          # the key is group 1, or / when empty
 //! target        = "default-export"                # the module's default export
 //! ```
+//!
+//! Keys that turn each row's key into a pattern the user's key is tested
+//! against, so a pasted URL or a log line finds the row that produced it:
+//!
+//! ```toml
+//! key_pattern     = [["/:(\\w+)\\?", "(?:/(?P<$1>[^/]+))?"], [":(\\w+)", "(?P<$1>[^/]+)"]]
+//! key_input       = [["^[a-z]+://[^/]+", ""], ["[?#].*$", ""], ["(.)/$", "$1"]]
+//! key_text        = [["\\\\\"", "\""]]   # the row key as the substring test sees it
+//! key_match       = "whole"              # or "within": the pattern anywhere in the user's key
+//! key_min_literal = 4                    # fewer literal characters: no pattern for that row
+//! ```
+//!
+//! `key_pattern` is scanned over a row's key left to right. At each position
+//! the rules are tried in order and the first whose regex matches there (a
+//! non-empty match starting exactly at that position) emits its fragment, with
+//! `$1`, `${1}`, `$name` and `$0` expanded from that rule's match, and the scan
+//! resumes after the match. `^` and `$` in a rule mean the start and end of the
+//! whole key. A character no rule matches is emitted regex-escaped and counts
+//! as one literal character (whitespace does not count). A named group that
+//! occurs twice gets `_2`, `_3` on the later ones. The pattern is compiled
+//! case-insensitively (`(?is)`), anchored `^...$` for `whole`.
+//!
+//! `key_input` is applied to the user's key, in order, every match replaced
+//! (`$1` expands), before it is tested against the patterns. `key_text` is
+//! applied the same way to each row's key before the substring test and before
+//! the pattern is built. A `/regex/` key sees the key as printed and is never
+//! tested against patterns.
+//!
+//! With `key_pattern` and `whole`, rows whose pattern matched print first, the
+//! most literal characters first, and a pattern's named groups print as
+//! `name=value` after the row when the row did not also match as text. With
+//! `within`, rows keep the source order.
 
 use super::{ConfigError, Roots, BUILTIN_QUERIES};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 /// What a match points at.
@@ -40,6 +72,16 @@ pub enum Target {
     /// Resolve the `@target` (a module specifier, or the file itself for a
     /// `paths` query) to a file and name that file's default export.
     DefaultExport,
+}
+
+/// How a row's pattern meets the user's key.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum KeyMatch {
+    /// The whole key, anchored `^...$`.
+    #[default]
+    Whole,
+    /// Anywhere in the key, as a log line holds a message.
+    Within,
 }
 
 /// When a framework's queries apply. Empty lists mean no rule of that kind.
@@ -73,6 +115,18 @@ pub struct NamedQuery {
     pub paths: Option<String>,
     /// With `paths`: a regex over the relative path, the key is group 1.
     pub key_from_path: Option<String>,
+    /// `[[regex, fragment], ...]`: how a row's key becomes a pattern. Empty:
+    /// rows match by text only.
+    pub key_pattern: Vec<(String, String)>,
+    /// `[[regex, replacement], ...]` applied to the user's key before it is
+    /// tested against the patterns.
+    pub key_input: Vec<(String, String)>,
+    /// `[[regex, replacement], ...]` applied to a row's key before the
+    /// substring test and the pattern build. The printed key is unchanged.
+    pub key_text: Vec<(String, String)>,
+    pub key_match: KeyMatch,
+    /// A row whose pattern has fewer literal characters gets no pattern.
+    pub key_min_literal: usize,
     /// The file as printed: a path for a file on disk, or
     /// `built-in queries/<file>.toml`.
     pub source: String,
@@ -115,6 +169,30 @@ fn table_line(text: &str, name: &str) -> usize {
 
 fn single(label: &str, line: usize, name: &str, key: &str, v: &toml::Value) -> Result<String, ConfigError> {
     v.as_str().map(str::to_string).ok_or_else(|| err(label, Some(line), Some(name), &format!("`{}` is a string", key)))
+}
+
+/// A `[[regex, text], ...]` list, each regex compiled to check it.
+fn rule_list(label: &str, line: usize, name: &str, key: &str, v: &toml::Value) -> Result<Vec<(String, String)>, ConfigError> {
+    let shape = || err(label, Some(line), Some(name), &format!("`{}` is [[\"<regex>\", \"<text>\"], ...]", key));
+    let toml::Value::Array(items) = v else { return Err(shape()) };
+    let mut out = Vec::new();
+    for item in items {
+        let toml::Value::Array(pair) = item else { return Err(shape()) };
+        let (Some(re), Some(text), 2) = (pair.first().and_then(|x| x.as_str()), pair.get(1).and_then(|x| x.as_str()), pair.len())
+        else {
+            return Err(shape());
+        };
+        if let Err(e) = regex::Regex::new(re) {
+            return Err(err(
+                label,
+                Some(line),
+                Some(name),
+                &format!("`{}` regex `{}` does not compile: {}", key, re, e.to_string().lines().last().unwrap_or("").trim()),
+            ));
+        }
+        out.push((re.to_string(), text.to_string()));
+    }
+    Ok(out)
 }
 
 fn canonical_lang(name: &str) -> Option<&'static str> {
@@ -195,6 +273,11 @@ pub fn parse_file(label: &str, text: &str) -> Result<Vec<NamedQuery>, ConfigErro
         let mut key_rewrite = None;
         let mut paths = None;
         let mut key_from_path = None;
+        let mut key_pattern = Vec::new();
+        let mut key_input = Vec::new();
+        let mut key_text = Vec::new();
+        let mut key_match = KeyMatch::Whole;
+        let mut key_min_literal = 0;
         for (k, v) in q {
             match k.as_str() {
                 "match" => matches = strings(label, name, v)?,
@@ -249,6 +332,22 @@ pub fn parse_file(label: &str, text: &str) -> Result<Vec<NamedQuery>, ConfigErro
                     }
                     key_from_path = Some(re);
                 }
+                "key_pattern" => key_pattern = rule_list(label, line, name, k, v)?,
+                "key_input" => key_input = rule_list(label, line, name, k, v)?,
+                "key_text" => key_text = rule_list(label, line, name, k, v)?,
+                "key_match" => {
+                    key_match = match v.as_str() {
+                        Some("whole") => KeyMatch::Whole,
+                        Some("within") => KeyMatch::Within,
+                        _ => return Err(err(label, Some(line), Some(name), "key_match must be \"whole\" or \"within\"")),
+                    }
+                }
+                "key_min_literal" => {
+                    key_min_literal = match v.as_integer() {
+                        Some(n) if n >= 0 => n as usize,
+                        _ => return Err(err(label, Some(line), Some(name), "key_min_literal is a whole number")),
+                    }
+                }
                 other => {
                     return Err(err(
                         label,
@@ -284,6 +383,11 @@ pub fn parse_file(label: &str, text: &str) -> Result<Vec<NamedQuery>, ConfigErro
             key_rewrite,
             paths,
             key_from_path,
+            key_pattern,
+            key_input,
+            key_text,
+            key_match,
+            key_min_literal,
             source: label.to_string(),
             line,
         });
@@ -367,6 +471,136 @@ pub fn apply_rewrite(rw: &(String, String), text: &str) -> String {
         }
         None => text.to_string(),
     }
+}
+
+/// Apply each `[regex, replacement]` in order, every match replaced. A rule
+/// whose regex does not compile (parse_file rejects those) is skipped.
+pub fn apply_all(rules: &[(String, String)], text: &str) -> String {
+    let mut out = text.to_string();
+    for (re, repl) in rules {
+        if let Ok(r) = regex::Regex::new(re) {
+            out = r.replace_all(&out, repl.as_str()).into_owned();
+        }
+    }
+    out
+}
+
+/// A row key turned into a regex by `KeyScanner::scan`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyRegex {
+    /// The regex source, not anchored, without flags.
+    pub source: String,
+    /// Characters no rule matched, emitted escaped, whitespace not counted.
+    pub literal: usize,
+}
+
+/// A query's compiled `key_pattern` rules.
+pub struct KeyScanner {
+    rules: Vec<(regex::Regex, String)>,
+}
+
+impl KeyScanner {
+    /// None when there are no rules.
+    pub fn new(rules: &[(String, String)]) -> Option<KeyScanner> {
+        let rules: Vec<(regex::Regex, String)> =
+            rules.iter().filter_map(|(re, f)| regex::Regex::new(re).ok().map(|r| (r, f.clone()))).collect();
+        (!rules.is_empty()).then_some(KeyScanner { rules })
+    }
+
+    /// Scan `key` left to right: at each position the first rule matching
+    /// there emits its expanded fragment, any other character is emitted
+    /// escaped. Repeated group names get a suffix.
+    pub fn scan(&self, key: &str) -> KeyRegex {
+        let mut out = String::new();
+        let mut literal = 0;
+        // The earliest position each rule can next match at, None for never:
+        // a search from one position finds the leftmost match, so no rule is
+        // searched again before the match it already found.
+        let mut next: Vec<Option<usize>> = vec![Some(0); self.rules.len()];
+        let mut pos = 0;
+        while pos < key.len() {
+            let mut hit: Option<(usize, String)> = None;
+            for (i, (re, frag)) in self.rules.iter().enumerate() {
+                match next[i] {
+                    None => continue,
+                    Some(s) if s > pos => continue,
+                    _ => {}
+                }
+                let Some(c) = re.captures_at(key, pos) else {
+                    next[i] = None;
+                    continue;
+                };
+                let m = c.get(0).unwrap();
+                if m.start() > pos {
+                    next[i] = Some(m.start());
+                    continue;
+                }
+                if m.end() == pos {
+                    // An empty match emits nothing and would never advance.
+                    next[i] = Some(pos + 1);
+                    continue;
+                }
+                let mut f = String::new();
+                c.expand(frag, &mut f);
+                hit = Some((m.end(), f));
+                break;
+            }
+            match hit {
+                Some((end, f)) => {
+                    out.push_str(&f);
+                    pos = end;
+                }
+                None => {
+                    let ch = key[pos..].chars().next().unwrap();
+                    let mut buf = [0u8; 4];
+                    out.push_str(&regex::escape(ch.encode_utf8(&mut buf)));
+                    if !ch.is_whitespace() {
+                        literal += 1;
+                    }
+                    pos += ch.len_utf8();
+                }
+            }
+        }
+        KeyRegex { source: dedupe_groups(&out), literal }
+    }
+}
+
+/// Rename the second and later named groups of one name to `name_2`,
+/// `name_3`, so the regex compiles. Escaped parentheses are not groups.
+fn dedupe_groups(src: &str) -> String {
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < src.len() {
+        let rest = &src[i..];
+        let escaped = i > 0 && src[..i].bytes().rev().take_while(|&c| c == b'\\').count() % 2 == 1;
+        let open = if rest.starts_with("(?P<") {
+            4
+        } else if rest.starts_with("(?<") && !rest.starts_with("(?<=") && !rest.starts_with("(?<!") {
+            3
+        } else {
+            0
+        };
+        if open > 0 && !escaped {
+            let name: String = rest[open..].chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            if !name.is_empty() && rest[open + name.len()..].starts_with('>') {
+                let n = seen.entry(name.clone()).or_insert(0);
+                *n += 1;
+                out.push_str(&rest[..open]);
+                if *n == 1 {
+                    out.push_str(&name);
+                } else {
+                    out.push_str(&format!("{}_{}", name, n));
+                }
+                i += open + name.len();
+                continue;
+            }
+        }
+        let ch = rest.chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 /// The `queries/` directory of each on-disk layer, highest priority first.
@@ -478,6 +712,85 @@ mod tests {
         assert_eq!(apply_rewrite(&rw("^(\\w+)$", "${1:camel}!"), "User_profiles"), "userProfiles!");
         assert_eq!(apply_rewrite(&rw("a(b)", "<$1${1}>"), "xabz"), "x<bb>z");
         assert_eq!(apply_rewrite(&rw("^q$", "r"), "other"), "other", "no match leaves the text");
+    }
+
+    fn scanner(rules: &[(&str, &str)]) -> KeyScanner {
+        let owned: Vec<(String, String)> = rules.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+        KeyScanner::new(&owned).unwrap()
+    }
+
+    const COLON: &[(&str, &str)] = &[(r"/:(\w+)\?", r"(?:/(?P<$1>[^/]+))?"), (r":(\w+)", r"(?P<$1>[^/]+)"), (r"\*", ".*")];
+
+    #[test]
+    fn a_character_no_rule_matches_is_escaped_and_counted() {
+        let s = scanner(COLON);
+        let k = s.scan("a.b(c){d}");
+        assert_eq!(k.source, r"a\.b\(c\)\{d\}");
+        assert_eq!(k.literal, 9);
+        let k = s.scan("x y");
+        assert_eq!((k.source.as_str(), k.literal), ("x y", 2), "whitespace is not a literal character");
+    }
+
+    #[test]
+    fn every_occurrence_is_replaced_and_named_groups_expand() {
+        let s = scanner(COLON);
+        let k = s.scan("/api/org/:org_id/team/:team_id");
+        assert_eq!(k.source, r"/api/org/(?P<org_id>[^/]+)/team/(?P<team_id>[^/]+)");
+        assert_eq!(k.literal, "/api/org//team/".len(), "rule matches do not count");
+        let re = regex::Regex::new(&format!("^(?:{})$", k.source)).unwrap();
+        let c = re.captures("/api/org/mavexa/team/hr").unwrap();
+        assert_eq!((&c["org_id"], &c["team_id"]), ("mavexa", "hr"));
+        let k = s.scan("/settings/:tab?");
+        assert_eq!(k.source, r"/settings(?:/(?P<tab>[^/]+))?", "the first rule matching at a position wins");
+        assert_eq!(s.scan("*").literal, 0);
+    }
+
+    #[test]
+    fn caret_and_dollar_in_a_rule_mean_the_ends_of_the_whole_key() {
+        let s = scanner(&[("^/", "(?:[A-Z]+ )?/"), ("/$", "(?:/.*)?")]);
+        assert_eq!(s.scan("/a/b/").source, r"(?:[A-Z]+ )?/a/b(?:/.*)?");
+    }
+
+    #[test]
+    fn specificity_counts_only_the_escaped_characters() {
+        let s = scanner(COLON);
+        assert!(s.scan("/events/new").literal > s.scan("/events/:id").literal);
+    }
+
+    #[test]
+    fn a_repeated_group_name_gets_a_suffix_so_the_regex_compiles() {
+        let s = scanner(COLON);
+        let k = s.scan("/a/:id/b/:id/c/:id");
+        assert_eq!(k.source, r"/a/(?P<id>[^/]+)/b/(?P<id_2>[^/]+)/c/(?P<id_3>[^/]+)");
+        assert!(regex::Regex::new(&k.source).is_ok());
+        assert_eq!(dedupe_groups(r"\(?P<x>y\)(?P<x>z)"), r"\(?P<x>y\)(?P<x>z)", "an escaped paren is no group");
+    }
+
+    #[test]
+    fn apply_all_replaces_every_match_of_each_rule_in_order() {
+        let rules = vec![("^[a-z]+://[^/]*".to_string(), String::new()), ("[?#].*$".to_string(), String::new()), ("(.)/$".to_string(), "$1".to_string())];
+        assert_eq!(apply_all(&rules, "https://x.com/a/b/?q=1"), "/a/b");
+        assert_eq!(apply_all(&rules, "/"), "/", "a lone slash stays");
+        assert_eq!(apply_all(&[("o".to_string(), "0".to_string())], "foo"), "f00");
+    }
+
+    #[test]
+    fn key_rules_parse_and_bad_ones_are_errors() {
+        let base = "framework = \"f\"\nlangs = [\"ts\"]\n[route]\nmatch = \"(id @key)\"\ntarget = \"def\"\n";
+        let ok = format!("{}key_pattern = [[':(\\w+)', '(?P<$1>[^/]+)']]\nkey_input = [['/$', '']]\nkey_text = [['a', 'b']]\nkey_match = \"within\"\nkey_min_literal = 4\n", base);
+        let q = parse_file("f.toml", &ok).unwrap().remove(0);
+        assert_eq!(q.key_pattern, vec![(r":(\w+)".to_string(), "(?P<$1>[^/]+)".to_string())]);
+        assert_eq!((q.key_match, q.key_min_literal, q.key_input.len(), q.key_text.len()), (KeyMatch::Within, 4, 1, 1));
+        for (extra, want) in [
+            ("key_pattern = ['a', 'b']", "key_pattern"),
+            ("key_pattern = [['a']]", "key_pattern"),
+            ("key_input = [['(', 'b']]", "does not compile"),
+            ("key_match = \"part\"", "key_match"),
+            ("key_min_literal = -1", "key_min_literal"),
+        ] {
+            let e = parse_file("f.toml", &format!("{}{}\n", base, extra)).unwrap_err();
+            assert!(e.message.contains(want), "{}: {}", extra, e);
+        }
     }
 
     #[test]

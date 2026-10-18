@@ -47,7 +47,19 @@ Check whether the Solid and React Router packs join a parent route's path onto a
 
 ## Open questions
 
-None yet.
+### Nested routes are not joined (Decision 08, checked 2026-10-18)
+
+Neither the Solid nor the React Router pack joins a parent route's path onto a child's: each selector captures one `path` string, so a child row's key is its own segment only and a pasted URL that spans parent and child finds neither.
+
+Repro, Solid (in the repo): `cd fixtures/queries/solid-url && ctsq find route https://app.example.com/nested/acme/child/7` exits 1. `ctsq find route` there lists `/nested/:org` (line 12) and `/child/:id` (line 14, inside the parent's `children`) as two separate rows.
+
+Repro, React Router (a scratch dir): `createBrowserRouter([{ path: "/org/:org", element: <Org />, children: [{ path: "team/:team", element: <Team /> }] }])`, then `ctsq find route https://x/org/acme/team/hr` exits 1, and `ctsq find route` lists `/org/:org` and `team/:team`. The relative child path also never matches a pasted URL, since the URL starts with `/`.
+
+Building it needs the selector language to reach the ancestor routes' `path` (an ancestor capture or a key built from several captures), a separate step. The same holds for chi's `r.Route("/a", ...)` prefixes, already noted in go-chi.toml.
+
+### Catch-all routes are not tested as patterns
+
+The route packs set `key_min_literal = 1` and treat `/` as a rule match, so a route with no literal characters (`*`, `/*`, Go's `/`) is never a pattern match. Without that, every pasted URL listed the catch-all, and existing text keys such as `find route workspaces` gained catch-all rows from test files (`*` in Mavexa's frontend tests). A pasted URL that only a catch-all serves is a miss. Whether to show the catch-all as a last resort is open.
 
 ## Conventions
 
