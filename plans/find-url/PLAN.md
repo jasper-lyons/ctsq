@@ -45,6 +45,10 @@ Today a file whose bytes lack the key is skipped before parsing. For a query wit
 
 Check whether the Solid and React Router packs join a parent route's path onto a child's. If they do not, record it under `## Open questions` with a repro; do not build it here. Why: it needs the selector language, a separate step.
 
+### 09. Nested routes join their ancestors' keys (amends 08, 2026-10-18)
+
+A query file may set `key_nest = true`. Then a row whose matched node lies inside the matched node of another row of the same query (in the same file) takes the keys of all such enclosing rows, outermost first, joined in front of its own key. Joining puts exactly one `/` between parts (a relative child `team/:team` under `/org/:org` gives `/org/:org/team/:team`; `/w/:id` + `/start` gives `/w/:id/start`). An enclosing node that is not itself a row (Mavexa's `{ component: RequireAuth, children: [...] }`, no path) adds nothing. The joined key is the row's key everywhere: printed, text-matched and pattern-built. The solid-routes and react-router packs (object configs and JSX `<Route>` forms both) set it; chi, rails and next do not change here. Why: Mavexa's real app URLs are `/w/<id>/campaigns/<id>/...`, all under one parent route, so without this the feature does not work on the project it was asked for. Containment of the same query's matches needs no new selector syntax, which beat an ancestor capture in the selector language. The printed key changing from `/start` to `/w/:workspaceID/start` is intended: it is the URL the router serves. Identity scripts keep 0 differences for non-nested rows; nested rows' new keys are listed in the package report.
+
 ## Open questions
 
 ### Nested routes are not joined (Decision 08, checked 2026-10-18)
@@ -75,7 +79,12 @@ The route packs set `key_min_literal = 1` and treat `/` as a rule match, so a ro
 |---|---|---|
 | 1 | key-pattern | Opus |
 | 2 | review | Opus, read-only |
-| 3 | mavexa (orchestrator) | after install |
+| 3 | nest-and-fixes | Opus |
+| 4 | mavexa (orchestrator) | after install |
+
+## Package: nest-and-fixes
+
+Decision 09, plus the review findings the orchestrator accepts (listed in the brief). Files: the key-pattern package's files. Acceptance: CLI tests for a Solid object-config nest three deep with a pathless middle layer, a Solid JSX `<Route>` nest, and a React Router relative child, each matched by a pasted full URL with all params shown; identity.sh 0 differences except rows whose key gained a parent prefix, which the script must now expect (update its expectations, list the changed rows in the report); same-output 0 differences; the Mavexa URL `https://app.mavexa.com/w/abc/campaigns/12/events/9` gives `EventRoute` with `workspaceID=abc id=12 eventId=9`.
 
 ## Package: key-pattern
 
