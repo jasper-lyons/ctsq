@@ -566,7 +566,9 @@ ctsq find error 'failed to load pipeline 12: open x'
 - an error key matches through printf placeholders (`%s`, `%v`, `%w`, `${...}`),
   so a message copied from a log finds its source
 - a route key can be a pasted URL (`ctsq find route 'https://app/x/42?y=1'`):
-  the most specific route prints first, with the values it took (`id=42`)
+  the most specific route prints first, with the values it took (`id=42`).
+  A nested Solid or React Router route prints with its parents' paths joined on
+  (`/w/:id/start`)
 - query files live in `.ctsq/queries/`, then `$XDG_CONFIG_HOME/ctsq/queries`,
   then `$XDG_CACHE_HOME/ctsq/queries`, then built-in (`ctsq config path`)
 - `.ctsq/glossary.toml` maps product words to code names, used by `find`, `def`

@@ -21,15 +21,19 @@ target = "def"
 # A pasted URL finds its route, with or without a method in front: key_input
 # drops the scheme and host (keeping a leading METHOD), the query and fragment,
 # and a trailing slash. A pasted method must equal the route's, a route with no
-# method takes any. A pattern ending in / takes everything below it.
+# method takes any, a GET route also takes HEAD, and a pasted method may be
+# lower case (patterns ignore case). A pattern ending in / takes everything
+# below it, except the root / itself, which matches only the root.
 key_input = [
-  ['^([A-Z]+ )?[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*', '$1'],  # scheme and host
+  ['^([A-Za-z]+ )?[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*', '$1'],  # scheme and host
   ['[?#].*$', ''],                                       # query and fragment
   ['(.)/$', '$1'],                                       # a trailing slash, not a lone one
-  ['^([A-Z]+ )?$', '${1}/'],
+  ['^([A-Za-z]+ )?$', '${1}/'],
 ]
 key_pattern = [
-  ['^(GET|HEAD|POST|PUT|PATCH|DELETE|CONNECT|OPTIONS|TRACE) ', '(?:$1 )?'],  # METHOD, optional when pasted
+  ['^GET ', '(?:(?:GET|HEAD) )?'],       # GET also serves HEAD
+  ['^(HEAD|POST|PUT|PATCH|DELETE|CONNECT|OPTIONS|TRACE) ', '(?:$1 )?'],  # METHOD, optional when pasted
+  ['^/\{\$\}$', '(?:[A-Z]+ )?/'],         # /{$} alone: the root only
   ['^/', '(?:[A-Z]+ )?/'],               # no method: any method
   ['/\{\$\}$', '/?'],                    # {$} the path ends here
   ['\{(\w+)\.\.\.\}', '(?P<$1>.*)'],     # {name...} the rest
@@ -37,4 +41,4 @@ key_pattern = [
   ['/$', '(?:/.*)?'],                    # a trailing / takes the subtree
   ['/', '/'],                            # a slash is not a literal character
 ]
-key_min_literal = 1                      # so a catch-all (*, /*, /) is not tested
+key_min_literal = 1                      # a pattern with a parameter needs a literal character

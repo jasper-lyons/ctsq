@@ -33,6 +33,7 @@
 //! key_text        = [["\\\\\"", "\""]]   # the row key as the substring test sees it
 //! key_match       = "whole"              # or "within": the pattern anywhere in the user's key
 //! key_min_literal = 4                    # fewer literal characters: no pattern for that row
+//! key_nest        = true                 # a row inside another takes its key in front
 //! ```
 //!
 //! `key_pattern` is scanned over a row's key left to right. At each position
@@ -42,14 +43,32 @@
 //! resumes after the match. `^` and `$` in a rule mean the start and end of the
 //! whole key. A character no rule matches is emitted regex-escaped and counts
 //! as one literal character (whitespace does not count). A named group that
-//! occurs twice gets `_2`, `_3` on the later ones. The pattern is compiled
-//! case-insensitively (`(?is)`), anchored `^...$` for `whole`.
+//! occurs twice gets the first of `_2`, `_3`, ... no other group uses, a name
+//! that is no valid group name (`user-id`, `1`) is sanitised, and the values
+//! print under the name as written. The pattern is compiled case-insensitively
+//! (`(?is)`), anchored `^...$` for `whole`. A pattern that does not compile
+//! leaves its row to the text test, with one warning per query file on stderr.
+//! `key_min_literal` does not apply to a `whole` pattern in which no rule
+//! emitted a named group, `.*` or `.+`: such a pattern matches one key only
+//! (the root route `/`).
 //!
 //! `key_input` is applied to the user's key, in order, every match replaced
 //! (`$1` expands), before it is tested against the patterns. `key_text` is
 //! applied the same way to each row's key before the substring test and before
-//! the pattern is built. A `/regex/` key sees the key as printed and is never
-//! tested against patterns.
+//! the pattern is built. A `/regex/` key's text test sees the key as printed.
+//! On a `whole` query the `/regex/` key is also tested against the patterns as
+//! a pasted path (after `key_input`), so `/events/7/` finds `/events/:id`.
+//!
+//! With `key_nest = true`, a row whose `@key` lies inside the span of another
+//! row of the same query in the same file (the smallest node holding that
+//! row's captures, widened from a JSX opening tag to its element) takes the
+//! keys of every such row, outermost first, joined with one `/`. The joined
+//! key is printed, text-matched and pattern-built.
+//!
+//! On a layer merge, a table that replaces another of the same framework and
+//! name takes each of `key_pattern`, `key_input`, `key_text`, `key_match`,
+//! `key_min_literal` and `key_nest` it leaves out from the table it replaces.
+//! A framework no lower layer has inherits nothing and must declare them.
 //!
 //! With `key_pattern` and `whole`, rows whose pattern matched print first, the
 //! most literal characters first, and a pattern's named groups print as
@@ -57,7 +76,7 @@
 //! `within`, rows keep the source order.
 
 use super::{ConfigError, Roots, BUILTIN_QUERIES};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// What a match points at.
@@ -125,8 +144,16 @@ pub struct NamedQuery {
     /// substring test and the pattern build. The printed key is unchanged.
     pub key_text: Vec<(String, String)>,
     pub key_match: KeyMatch,
-    /// A row whose pattern has fewer literal characters gets no pattern.
+    /// A row whose pattern has fewer literal characters gets no pattern,
+    /// unless the pattern has no parameter or splat and `key_match` is whole.
     pub key_min_literal: usize,
+    /// A row inside another row's node takes that row's key in front of its
+    /// own (nested routes).
+    pub key_nest: bool,
+    /// The `key_*` fields the table wrote. On a layer merge, a table that
+    /// replaces another of the same framework and name takes each one it
+    /// left out from the table it replaces.
+    pub declared: Vec<String>,
     /// The file as printed: a path for a file on disk, or
     /// `built-in queries/<file>.toml`.
     pub source: String,
@@ -193,6 +220,30 @@ fn rule_list(label: &str, line: usize, name: &str, key: &str, v: &toml::Value) -
         out.push((re.to_string(), text.to_string()));
     }
     Ok(out)
+}
+
+/// The fields a replacing table inherits when it leaves them out.
+const KEY_FIELDS: &[&str] = &["key_pattern", "key_input", "key_text", "key_match", "key_min_literal", "key_nest"];
+
+/// Give `q` each key field it did not write from `under`, the table of the
+/// same framework and name it replaces.
+fn inherit(q: &mut NamedQuery, under: &NamedQuery) {
+    for f in KEY_FIELDS {
+        if q.declared.iter().any(|d| d == f) {
+            continue;
+        }
+        match *f {
+            "key_pattern" => q.key_pattern = under.key_pattern.clone(),
+            "key_input" => q.key_input = under.key_input.clone(),
+            "key_text" => q.key_text = under.key_text.clone(),
+            "key_match" => q.key_match = under.key_match,
+            "key_min_literal" => q.key_min_literal = under.key_min_literal,
+            _ => q.key_nest = under.key_nest,
+        }
+        if under.declared.iter().any(|d| d == f) {
+            q.declared.push(f.to_string());
+        }
+    }
 }
 
 fn canonical_lang(name: &str) -> Option<&'static str> {
@@ -278,7 +329,12 @@ pub fn parse_file(label: &str, text: &str) -> Result<Vec<NamedQuery>, ConfigErro
         let mut key_text = Vec::new();
         let mut key_match = KeyMatch::Whole;
         let mut key_min_literal = 0;
+        let mut key_nest = false;
+        let mut declared = Vec::new();
         for (k, v) in q {
+            if KEY_FIELDS.contains(&k.as_str()) {
+                declared.push(k.clone());
+            }
             match k.as_str() {
                 "match" => matches = strings(label, name, v)?,
                 "target" => {
@@ -348,6 +404,12 @@ pub fn parse_file(label: &str, text: &str) -> Result<Vec<NamedQuery>, ConfigErro
                         _ => return Err(err(label, Some(line), Some(name), "key_min_literal is a whole number")),
                     }
                 }
+                "key_nest" => {
+                    key_nest = match v.as_bool() {
+                        Some(b) => b,
+                        None => return Err(err(label, Some(line), Some(name), "key_nest is true or false")),
+                    }
+                }
                 other => {
                     return Err(err(
                         label,
@@ -388,6 +450,8 @@ pub fn parse_file(label: &str, text: &str) -> Result<Vec<NamedQuery>, ConfigErro
             key_text,
             key_match,
             key_min_literal,
+            key_nest,
+            declared,
             source: label.to_string(),
             line,
         });
@@ -492,6 +556,11 @@ pub struct KeyRegex {
     pub source: String,
     /// Characters no rule matched, emitted escaped, whitespace not counted.
     pub literal: usize,
+    /// A rule emitted a parameter (a named group) or a splat (`.*`, `.+`).
+    pub wild: bool,
+    /// Each named group as it is in `source`, with the name to print for it:
+    /// the name the key wrote, which may not be a valid group name.
+    pub names: Vec<(String, String)>,
 }
 
 /// A query's compiled `key_pattern` rules.
@@ -513,6 +582,7 @@ impl KeyScanner {
     pub fn scan(&self, key: &str) -> KeyRegex {
         let mut out = String::new();
         let mut literal = 0;
+        let mut wild = false;
         // The earliest position each rule can next match at, None for never:
         // a search from one position finds the leftmost match, so no rule is
         // searched again before the match it already found.
@@ -542,6 +612,9 @@ impl KeyScanner {
                 }
                 let mut f = String::new();
                 c.expand(frag, &mut f);
+                if f.contains("(?P<") || f.contains("(?<") || f.contains(".*") || f.contains(".+") {
+                    wild = true;
+                }
                 hit = Some((m.end(), f));
                 break;
             }
@@ -561,15 +634,16 @@ impl KeyScanner {
                 }
             }
         }
-        KeyRegex { source: dedupe_groups(&out), literal }
+        let (source, names) = name_groups(&out);
+        KeyRegex { source, literal, wild, names }
     }
 }
 
-/// Rename the second and later named groups of one name to `name_2`,
-/// `name_3`, so the regex compiles. Escaped parentheses are not groups.
-fn dedupe_groups(src: &str) -> String {
-    let mut seen: HashMap<String, usize> = HashMap::new();
-    let mut out = String::new();
+/// Each named group's opening `(?P<` or `(?<` in `src`: the byte offset of
+/// the name, the name and the offset just past the `>`. Escaped parentheses
+/// are not groups.
+fn group_names(src: &str) -> Vec<(usize, String, usize)> {
+    let mut out = Vec::new();
     let mut i = 0;
     while i < src.len() {
         let rest = &src[i..];
@@ -582,25 +656,61 @@ fn dedupe_groups(src: &str) -> String {
             0
         };
         if open > 0 && !escaped {
-            let name: String = rest[open..].chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
-            if !name.is_empty() && rest[open + name.len()..].starts_with('>') {
-                let n = seen.entry(name.clone()).or_insert(0);
-                *n += 1;
-                out.push_str(&rest[..open]);
-                if *n == 1 {
-                    out.push_str(&name);
-                } else {
-                    out.push_str(&format!("{}_{}", name, n));
-                }
-                i += open + name.len();
+            if let Some(end) = rest[open..].find(['>', '(', ')']).filter(|&e| e > 0 && rest[open + e..].starts_with('>')) {
+                out.push((i + open, rest[open..open + end].to_string(), i + open + end + 1));
+                i += open + end + 1;
                 continue;
             }
         }
-        let ch = rest.chars().next().unwrap();
-        out.push(ch);
-        i += ch.len_utf8();
+        i += rest.chars().next().unwrap().len_utf8();
     }
     out
+}
+
+/// `name` as a valid group name: anything but ASCII letters, digits and `_`
+/// becomes `_`, and a leading digit gets a `_` in front.
+fn sanitise(name: &str) -> String {
+    let mut s: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect();
+    if s.starts_with(|c: char| c.is_ascii_digit()) {
+        s.insert(0, '_');
+    }
+    s
+}
+
+/// Make every named group of `src` a valid, distinct name so the regex
+/// compiles: a name is sanitised, and the second and later groups of one name
+/// get `_2`, `_3`, the first suffix no other group uses. Returns the new
+/// source and each group's new name with the name to print (the name as
+/// written, with the same suffix).
+fn name_groups(src: &str) -> (String, Vec<(String, String)>) {
+    let groups = group_names(src);
+    let mut used: HashSet<String> = groups.iter().map(|(_, n, _)| sanitise(n)).collect();
+    let mut taken: HashSet<String> = HashSet::new();
+    let mut names = Vec::new();
+    let mut out = String::new();
+    let mut at = 0;
+    for (start, name, end) in groups {
+        let base = sanitise(&name);
+        let (new, shown) = if taken.insert(base.clone()) {
+            (base, name.clone())
+        } else {
+            let mut n = 2;
+            while used.contains(&format!("{}_{}", base, n)) {
+                n += 1;
+            }
+            let new = format!("{}_{}", base, n);
+            used.insert(new.clone());
+            taken.insert(new.clone());
+            (new, format!("{}_{}", name, n))
+        };
+        out.push_str(&src[at..start]);
+        out.push_str(&new);
+        out.push('>');
+        at = end;
+        names.push((new, shown));
+    }
+    out.push_str(&src[at..]);
+    (out, names)
 }
 
 /// The `queries/` directory of each on-disk layer, highest priority first.
@@ -618,8 +728,12 @@ fn shown(p: &Path, cwd: &Path) -> String {
 pub fn load_with(roots: &Roots, cwd: &Path) -> Result<Vec<NamedQuery>, ConfigError> {
     let mut merged: BTreeMap<(String, String), NamedQuery> = BTreeMap::new();
     let mut absorb = |qs: Vec<NamedQuery>| {
-        for q in qs {
-            merged.insert((q.name.clone(), q.framework.clone()), q);
+        for mut q in qs {
+            let at = (q.name.clone(), q.framework.clone());
+            if let Some(under) = merged.get(&at) {
+                inherit(&mut q, under);
+            }
+            merged.insert(at, q);
         }
     };
     for (file, text) in BUILTIN_QUERIES {
@@ -763,7 +877,7 @@ mod tests {
         let k = s.scan("/a/:id/b/:id/c/:id");
         assert_eq!(k.source, r"/a/(?P<id>[^/]+)/b/(?P<id_2>[^/]+)/c/(?P<id_3>[^/]+)");
         assert!(regex::Regex::new(&k.source).is_ok());
-        assert_eq!(dedupe_groups(r"\(?P<x>y\)(?P<x>z)"), r"\(?P<x>y\)(?P<x>z)", "an escaped paren is no group");
+        assert_eq!(name_groups(r"\(?P<x>y\)(?P<x>z)").0, r"\(?P<x>y\)(?P<x>z)", "an escaped paren is no group");
     }
 
     #[test]
@@ -847,6 +961,55 @@ mod tests {
         let label = demo.iter().find(|q| q.name == "label").unwrap();
         assert!(label.source.ends_with("queries/demo.toml"), "the lower layer keeps its other query: {}", label.source);
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_replacing_table_inherits_the_key_fields_it_leaves_out_and_a_new_framework_inherits_nothing() {
+        let d = tmp();
+        let roots = Roots::from_vars(&d, Some(d.join("home").to_str().unwrap()), None, None);
+        write(
+            &d.join(".ctsq/queries/mine.toml"),
+            "framework = \"solid-routes\"\nlangs = [\"ts\"]\n[route]\nmatch = \"(pair.value(string @key))\"\ntarget = \"self\"\nkey_min_literal = 3\n",
+        );
+        write(&d.join(".ctsq/queries/new.toml"), "framework = \"brand-new\"\nlangs = [\"ts\"]\n[route]\nmatch = \"(string @key)\"\ntarget = \"self\"\n");
+        let qs = load_with(&roots, &d).unwrap();
+        let solid = qs.iter().find(|q| q.framework == "solid-routes").unwrap();
+        assert_eq!(solid.source, ".ctsq/queries/mine.toml");
+        assert_eq!(solid.key_min_literal, 3, "a field it wrote stays");
+        assert!(solid.key_nest && !solid.key_pattern.is_empty() && !solid.key_input.is_empty(), "{:?}", solid);
+        let fresh = qs.iter().find(|q| q.framework == "brand-new").unwrap();
+        assert!(fresh.key_pattern.is_empty() && !fresh.key_nest && fresh.key_min_literal == 0);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn key_nest_parses_and_is_a_boolean() {
+        let base = "framework = \"f\"\nlangs = [\"ts\"]\n[route]\nmatch = \"(id @key)\"\ntarget = \"def\"\n";
+        assert!(parse_file("f.toml", &format!("{}key_nest = true\n", base)).unwrap()[0].key_nest);
+        assert!(!parse_file("f.toml", base).unwrap()[0].key_nest);
+        let e = parse_file("f.toml", &format!("{}key_nest = 1\n", base)).unwrap_err();
+        assert!(e.message.contains("key_nest"), "{}", e);
+    }
+
+    #[test]
+    fn group_names_are_made_valid_and_print_as_written() {
+        let (src, names) = name_groups(r"/(?P<user-id>[^/]+)/(?P<1>.*)");
+        assert_eq!(src, r"/(?P<user_id>[^/]+)/(?P<_1>.*)");
+        assert_eq!(names, vec![("user_id".to_string(), "user-id".to_string()), ("_1".to_string(), "1".to_string())]);
+        assert!(regex::Regex::new(&src).is_ok());
+        // A repeat takes the first suffix no other group uses.
+        let (src, names) = name_groups(r"(?P<id>a)(?P<id>b)(?P<id_2>c)");
+        assert_eq!(src, r"(?P<id>a)(?P<id_3>b)(?P<id_2>c)");
+        assert_eq!(names.iter().map(|(_, p)| p.as_str()).collect::<Vec<_>>(), vec!["id", "id_3", "id_2"]);
+        assert!(regex::Regex::new(&src).is_ok());
+    }
+
+    #[test]
+    fn a_rule_emitting_a_group_or_a_splat_marks_the_pattern_wild() {
+        let s = scanner(COLON);
+        assert!(!s.scan("/about").wild);
+        assert!(s.scan("/a/:id").wild);
+        assert!(s.scan("*").wild);
     }
 
     #[test]

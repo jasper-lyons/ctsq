@@ -32,8 +32,15 @@ key_input = [
 key_pattern = [
   ['/:(\w+)\?', '(?:/(?P<$1>[^/]+))?'],  # /:name? an optional segment
   [':(\w+)', '(?P<$1>[^/]+)'],           # :name one segment
+  ['/\*(\w+)', '(?:/(?P<$1>.*))?'],      # /*name the rest, or nothing
+  ['/\*', '(?:/.*)?'],                   # /* the rest, or nothing
   ['\*(\w+)', '(?P<$1>.*)'],             # *name the rest
   ['\*', '.*'],                          # * the rest
   ['/', '/'],                            # a slash is not a literal character
 ]
-key_min_literal = 1                      # so a catch-all (*, /*, /) is not tested
+key_min_literal = 1                      # so a catch-all (*, /*) is not tested
+# A route inside another route's object or <Route> element takes the
+# enclosing routes' paths in front of its own: children of { path: "/w/:id" }
+# print and match as /w/:id/<child>. An enclosing object with no path adds
+# nothing.
+key_nest = true

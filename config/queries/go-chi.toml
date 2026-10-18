@@ -24,10 +24,11 @@ key_input = [
   ['(.)/$', '$1'],                           # a trailing slash, not a lone one
   ['^$', '/'],
 ]
+key_text = [['\\(.)', '$1']]            # the Go string unescaped: {id:\\d+} is {id:\d+}
 key_pattern = [
   ['\{(\w+):((?:[^{}]|\{[^{}]*\})*)\}', '(?P<$1>$2)'],  # {name:regex} keeps its regex
   ['\{(\w+)\}', '(?P<$1>[^/]+)'],                       # {name} one segment
   ['\*', '.*'],                                         # * the rest
   ['/', '/'],                            # a slash is not a literal character
 ]
-key_min_literal = 1                      # so a catch-all (*, /*, /) is not tested
+key_min_literal = 1                      # so a catch-all (*, /*) is not tested

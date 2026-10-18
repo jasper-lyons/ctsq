@@ -943,6 +943,103 @@ fn find_route_takes_a_pasted_url_in_every_route_pack() {
 }
 
 #[test]
+fn find_route_joins_nested_route_paths_and_shows_every_parameter() {
+    // Solid object config, three deep with a pathless { component, children } between.
+    let dir = fixture("queries/solid-url");
+    let out = ctsq_in(&dir, &["find", "route", "https://app.example.com/nested/acme/squad/a/member/7"]);
+    assert_eq!(
+        stdout(&out),
+        "src/routes.ts:22  /nested/:org/squad/:squad/member/:member  Member  src/pages.tsx:32  org=acme squad=a member=7\n\
+         1 route (solid-routes, from built-in queries/solid-routes.toml)\n"
+    );
+    // Decision 08's repro, which missed before key_nest.
+    let out = ctsq_in(&dir, &["find", "route", "https://app.example.com/nested/acme/child/7"]);
+    assert!(stdout(&out).starts_with("src/routes.ts:15  /nested/:org/child/:id  Child  src/pages.tsx:25  org=acme id=7\n1 route"), "{}", stdout(&out));
+    // Solid JSX <Route> inside <Route>, the innermost one a `/` child.
+    let out = ctsq_in(&dir, &["find", "route", "https://x/jsx/acme/project/p1/"]);
+    assert_eq!(
+        stdout(&out),
+        "src/App.tsx:7  /jsx/:org/project/:project  Project  src/pages.tsx:36  org=acme project=p1\n\
+         src/App.tsx:8  /jsx/:org/project/:project  Member   src/pages.tsx:32  org=acme project=p1\n\
+         2 routes (solid-routes, from built-in queries/solid-routes.toml)\n"
+    );
+    // React Router: relative children of an object route and of a JSX <Route>.
+    let dir = fixture("queries/router-nest");
+    let out = ctsq_in(&dir, &["find", "route", "https://x/org/acme/team/hr"]);
+    assert_eq!(
+        stdout(&out),
+        "src/main.tsx:10  /org/:org/team/:team  Team  src/pages.tsx:2  org=acme team=hr\n\
+         1 route (react-router, from built-in queries/react-router.toml)\n"
+    );
+    let out = ctsq_in(&dir, &["find", "route", "https://x/admin/users/5"]);
+    assert!(stdout(&out).starts_with("src/main.tsx:19  /admin/users/:userId  User  src/pages.tsx:6  userId=5\n"), "{}", stdout(&out));
+    let out = ctsq_in(&dir, &["find", "route"]);
+    assert!(stdout(&out).contains("src/main.tsx:11  /org/:org/files/*     Files  "), "the listing prints the joined key: {}", stdout(&out));
+}
+
+#[test]
+fn find_route_root_routes_match_a_pasted_root_url() {
+    let cases: &[(&str, &str, &str)] = &[
+        ("queries/solid", "https://app.example.com/", "src/App.tsx:7  /  Home  src/pages/Home.tsx:1\n"),
+        ("queries/solid", "https://app.example.com", "src/App.tsx:7  /  Home  src/pages/Home.tsx:1\n"),
+        ("queries/url-next", "https://x/", "app/page.tsx:1  /  Home  app/page.tsx:1\n1 route"),
+        ("queries/url-go-http", "https://x/", "main.go:15  /{$}  home  main.go:5\n1 route"),
+        ("queries/url-go-http", "GET https://x/", "main.go:15  /{$}  home  main.go:5\n1 route"),
+        ("queries/go-http", "https://x/", "main.go:30  /  index  main.go:17\n1 route"),
+    ];
+    for (dir, url, first) in cases {
+        let out = ctsq_in(&fixture(dir), &["find", "route", url]);
+        assert!(stdout(&out).starts_with(first), "{} {}: {}{}", dir, url, stdout(&out), stderr(&out));
+    }
+    // `/about/{$}` is not the root, and `/{$}` takes nothing below it.
+    let out = ctsq_in(&fixture("queries/url-go-http"), &["find", "route", "https://x/about/"]);
+    assert!(stdout(&out).starts_with("main.go:16  /about/{$}  about  main.go:6\n1 route"), "{}", stdout(&out));
+    let out = ctsq_in(&fixture("queries/url-go-http"), &["find", "route", "https://x/nothing"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+}
+
+#[test]
+fn find_route_review_cases() {
+    let first = |dir: &str, key: &str| stdout(&ctsq_in(&fixture(dir), &["find", "route", key])).lines().next().unwrap_or("").to_string();
+    // A /.../ key is also a pasted path.
+    assert_eq!(first("queries/solid-url", "/events/7/"), "src/routes.ts:5  /events/:id  EventPage  src/pages.tsx:1  id=7");
+    // `/docs/*rest` also serves `/docs`.
+    assert_eq!(first("queries/solid-url", "https://x/docs"), "src/routes.ts:8  /docs/*rest  Docs  src/pages.tsx:13");
+    // The Go string is unescaped before the pattern is built.
+    assert_eq!(first("queries/url-chi", "https://x/q/12"), "main.go:10  /q/{id:\\\\d+}  digits  main.go:5  id=12");
+    // A parameter name that is no valid group name prints as written.
+    assert_eq!(first("queries/url-next", "https://x/u/bob"), "app/u/[user-id]/page.tsx:1  /u/[user-id]  User  app/u/[user-id]/page.tsx:1  user-id=bob");
+    assert_eq!(first("queries/url-next", "https://x/x/9"), "app/x/[1]/page.tsx:1  /x/[1]  Digit  app/x/[1]/page.tsx:1  1=9");
+    assert_eq!(first("queries/url-go-http", "https://x/x/5"), "main.go:19  GET /x/{1}  digit  main.go:9  1=5");
+    assert_eq!(first("queries/url-go-http", "https://x/a/1/b/2"), "main.go:20  GET /a/{id}/b/{id}  dup  main.go:10  id=1 id_2=2");
+    // A lower-case method compares as upper case, and HEAD finds a GET route.
+    assert_eq!(first("queries/url-go-http", "get https://x/events/7"), "main.go:17  GET /events/{id}  getEv  main.go:7  id=7");
+    let out = ctsq_in(&fixture("queries/url-go-http"), &["find", "route", "HEAD /events/7"]);
+    assert_eq!(stdout(&out), "main.go:17  GET /events/{id}  getEv  main.go:7  id=7\n1 route (net-http, from built-in queries/go-http.toml)\n");
+}
+
+#[test]
+fn find_warns_once_per_query_file_about_a_pattern_that_does_not_compile() {
+    let dir = std::env::temp_dir().join(format!("ctsq-cli-badfrag-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".ctsq/queries")).unwrap();
+    std::fs::write(dir.join("a.ts"), "const r = [{ path: \"/q\" }, { path: \"/qq\" }];\n").unwrap();
+    std::fs::write(
+        dir.join(".ctsq/queries/c.toml"),
+        "framework = \"cu\"\nlangs = [\"ts\"]\n\n[thing]\nmatch = [\"(pair.key(property_identifier#path).value(string @key))\"]\ntarget = \"self\"\nkey_pattern = [['q', '(']]\n",
+    )
+    .unwrap();
+    let out = ctsq_in(dir.to_str().unwrap(), &["find", "thing", "/q"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stderr(&out),
+        "warning: .ctsq/queries/c.toml:4: [thing] the key `/q` gives a pattern that does not compile, the key is matched as text only: error: unclosed group\n"
+    );
+    assert_eq!(stdout(&out).lines().filter(|l| l.starts_with("a.ts:1")).count(), 2, "{}", stdout(&out));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn the_glossary_is_used_by_find_def_and_a_miss_and_each_says_so_last() {
     let dir = fixture("glossary");
     let note = ".ctsq/glossary.toml:2: \"pipeline page\" also searched as Pipeline\n";

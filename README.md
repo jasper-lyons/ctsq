@@ -507,7 +507,7 @@ main.go:24  /users/{id}  createUser  main.go:11
 
 Each row is the file and line of the match, the key, the target, and the target's definition (`?` when `def` finds none). A count line per framework names the file the query came from. Exit 0 when anything matched, 1 when nothing did, 2 for an unknown query or a query file that does not compile.
 
-A route key can also be a URL pasted from the address bar or a log. The scheme, host, query and a trailing slash are dropped, each route's path is read as a pattern in its framework's syntax (`:id`, `{id}`, `[id]`, `*rest`), the most specific match prints first, and the values the URL filled in follow the row:
+A route key can also be a URL pasted from the address bar or a log. The scheme, host, query and a trailing slash are dropped, each route's path is read as a pattern in its framework's syntax (`:id`, `{id}`, `[id]`, `*rest`), the most specific match prints first, and the values the URL filled in follow the row. A Solid or React Router route nested inside another (a `children` array, or `<Route>` inside `<Route>`) is keyed by the joined path, so `/w/:id` with a child `/start` prints and matches as `/w/:id/start`:
 
 ```sh
 cd fixtures/queries/solid-url
@@ -530,7 +530,7 @@ Queries are TOML files looked up in `.ctsq/queries/` in the repo, then `$XDG_CON
 - `framework`, `langs`: the name shown in output and the languages it applies to
 - `detect`: when it applies, by `import`, `file` or `dependency`
 - `[query]` table, named for the query (such as `[route]`): `match` is a selector or a list of them with `@key` and `@target` captures, `target` is `def`, `enclosing`, `self` or `default-export`, and the optional `rewrite`, `key_rewrite`, `paths` and `key_from_path` shape the key and target
-- `key_pattern = [["<regex>", "<fragment>"], ...]` turns each row's key into a pattern: the key is scanned left to right, at each position the first rule matching there emits its fragment (`$1` and `$name` expand), and any other character is matched literally. `key_input` (same shape) cleans the user's key first, `key_text` cleans the row key for the substring test, `key_match = "within"` finds the pattern anywhere in the user's key (a log line) instead of the whole of it, and `key_min_literal` skips patterns with too few literal characters. The built-in route and error packs show each in use
+- `key_pattern = [["<regex>", "<fragment>"], ...]` turns each row's key into a pattern: the key is scanned left to right, at each position the first rule matching there emits its fragment (`$1` and `$name` expand), and any other character is matched literally. `key_input` (same shape) cleans the user's key first, `key_text` cleans the row key for the substring test, `key_match = "within"` finds the pattern anywhere in the user's key (a log line) instead of the whole of it, `key_min_literal` skips patterns with too few literal characters (a whole-key pattern with no parameter or splat, such as the root `/`, is exempt), and `key_nest = true` gives a row nested inside another row of the same query the outer rows' keys in front of its own. A file that replaces a built-in table of the same framework and query name inherits each of these six fields it leaves out. A new framework inherits nothing, so it must declare them. The built-in route and error packs show each in use
 
 An example, saved as `.ctsq/queries/handlers.toml` in a Go repo:
 

@@ -299,19 +299,27 @@ struct KeyMatcher<'a> {
     key_text: &'a [(String, String)],
     scanner: Option<queries::KeyScanner>,
     /// The user's key after `key_input`. None: no pattern is tested (no
-    /// `key_pattern`, no key, or a `/regex/` key).
+    /// `key_pattern`, no key, or a `/regex/` key on a `within` query).
     input: Option<String>,
     mode: KeyMatch,
     min_literal: usize,
-    /// Each row key's compiled pattern, None when it has none.
-    cache: HashMap<String, Option<(regex::Regex, usize)>>,
+    /// Each row key's compiled pattern with its literal count and the name to
+    /// print for each group, None when it has none.
+    cache: HashMap<String, Option<(regex::Regex, usize, HashMap<String, String>)>>,
+    /// `path:line: [name]` of the query, for the warning about a pattern that
+    /// does not compile.
+    label: String,
+    warned: bool,
 }
 
 impl<'a> KeyMatcher<'a> {
     fn new(q: &'a NamedQuery, filter: &'a KeyFilter, key: Option<&str>) -> KeyMatcher<'a> {
         let scanner = queries::KeyScanner::new(&q.key_pattern);
+        // A `/regex/` key on a whole-key query is also a pasted path: `/events/7/`
+        // finds `/events/:id`.
         let input = match (filter, key, &scanner) {
             (KeyFilter::Sub(_), Some(k), Some(_)) => Some(queries::apply_all(&q.key_input, k)),
+            (KeyFilter::Re(_), Some(k), Some(_)) if q.key_match == KeyMatch::Whole => Some(queries::apply_all(&q.key_input, k)),
             _ => None,
         };
         KeyMatcher {
@@ -322,6 +330,8 @@ impl<'a> KeyMatcher<'a> {
             mode: q.key_match,
             min_literal: q.key_min_literal,
             cache: HashMap::new(),
+            label: format!("{}:{}: [{}]", q.source, q.line, q.name),
+            warned: false,
         }
     }
 
@@ -331,18 +341,35 @@ impl<'a> KeyMatcher<'a> {
         let by_text = self.filter.matches(&text, key);
         let (Some(input), Some(scanner)) = (&self.input, &self.scanner) else { return (by_text, None) };
         let (mode, min) = (self.mode, self.min_literal);
+        let (label, warned) = (&self.label, &mut self.warned);
         let compiled = self.cache.entry(text.clone()).or_insert_with(|| {
             let k = scanner.scan(&text);
-            if k.literal < min {
+            // A whole-key pattern with no parameter or splat matches one URL
+            // only, so the root route `/` needs no literal character.
+            if k.literal < min && (mode != KeyMatch::Whole || k.wild) {
                 return None;
             }
             let src = match mode {
                 KeyMatch::Whole => format!("(?is)^(?:{})$", k.source),
                 KeyMatch::Within => format!("(?is){}", k.source),
             };
-            regex::Regex::new(&src).ok().map(|r| (r, k.literal))
+            match regex::Regex::new(&src) {
+                Ok(r) => Some((r, k.literal, k.names.into_iter().collect())),
+                Err(e) => {
+                    if !*warned {
+                        *warned = true;
+                        eprintln!(
+                            "warning: {} the key `{}` gives a pattern that does not compile, the key is matched as text only: {}",
+                            label,
+                            key,
+                            e.to_string().lines().last().unwrap_or("").trim()
+                        );
+                    }
+                    None
+                }
+            }
         });
-        let Some((re, literal)) = compiled else { return (by_text, None) };
+        let Some((re, literal, names)) = compiled else { return (by_text, None) };
         let Some(caps) = re.captures(input) else { return (by_text, None) };
         // A key that also matched as text filled in nothing (it holds the
         // route's own `{id}`), so only a pattern-only match shows values.
@@ -351,7 +378,7 @@ impl<'a> KeyMatcher<'a> {
         } else {
             re.capture_names()
                 .flatten()
-                .filter_map(|n| caps.name(n).map(|m| format!("{}={}", n, m.as_str())))
+                .filter_map(|n| caps.name(n).map(|m| format!("{}={}", names.get(n).map(String::as_str).unwrap_or(n), m.as_str())))
                 .collect()
         };
         (true, Some(PatternHit { literal: *literal, params: params.join(" ") }))
@@ -544,11 +571,11 @@ fn run_query(
             continue;
         }
         let Some(tree) = parser.parse(&source, None) else { continue };
+        let mut file_rows: Vec<(runner::MatchRow, String)> = Vec::new();
         for (_, lb, c, _) in mine {
             let Ok(rows) = runner::run_rows_on(c, lb.as_ref(), &source, &tree, false) else { continue };
             for r in rows {
-                let cap = |n: &str| r.captures.iter().find(|c| c.name == n);
-                let key = match cap("key") {
+                let key = match r.captures.iter().find(|c| c.name == "key") {
                     Some(k) => tidy_key(&k.text),
                     None => r.src_line.clone().unwrap_or_default(),
                 };
@@ -556,6 +583,15 @@ fn run_query(
                     Some(rw) => queries::apply_rewrite(rw, &key),
                     None => key,
                 };
+                file_rows.push((r, key));
+            }
+        }
+        if q.key_nest {
+            nest_keys(&mut file_rows, &tree);
+        }
+        {
+            for (r, key) in file_rows {
+                let cap = |n: &str| r.captures.iter().find(|c| c.name == n);
                 let (key_ok, pattern) = km.test(&key);
                 if !key_ok && ask.extra.is_empty() {
                     continue;
@@ -636,6 +672,68 @@ fn run_query(
     hits.sort_by(|a, b| (&a.file, a.line, &a.key).cmp(&(&b.file, b.line, &b.key)));
     order_by_pattern(q, &mut hits);
     Ok(hits)
+}
+
+/// The node a row spans for `key_nest`: the smallest node holding all its
+/// captures (the route object, or the JSX opening tag), widened from an
+/// opening tag to its whole element so the element's children are inside.
+fn row_span(r: &runner::MatchRow, tree: &tree_sitter::Tree) -> Option<(usize, usize)> {
+    let start = r.captures.iter().map(|c| c.start_byte).min()?;
+    let end = r.captures.iter().map(|c| c.end_byte).max()?;
+    let mut n = tree.root_node().descendant_for_byte_range(start, end)?;
+    if n.kind().ends_with("_opening_element") {
+        n = n.parent().unwrap_or(n);
+    }
+    Some((n.start_byte(), n.end_byte()))
+}
+
+/// `a` and `b` joined with exactly one `/` between them.
+fn join_path(a: &str, b: &str) -> String {
+    let tail = b.trim_start_matches('/');
+    if tail.is_empty() {
+        return if a.is_empty() { "/".to_string() } else { a.to_string() };
+    }
+    format!("{}/{}", a.trim_end_matches('/'), tail)
+}
+
+/// Decision 09: each row whose key lies inside the span of other rows of the
+/// same query in this file takes their keys, outermost first, in front of its
+/// own. A row's own key, and rows on the same key node, do not count.
+fn nest_keys(rows: &mut [(runner::MatchRow, String)], tree: &tree_sitter::Tree) {
+    let key_at = |r: &runner::MatchRow| r.captures.iter().find(|c| c.name == "key").map(|c| (c.start_byte, c.end_byte));
+    // One parent per key node, however many selectors matched it.
+    let mut parents: Vec<((usize, usize), (usize, usize), String)> = Vec::new();
+    for (r, key) in rows.iter() {
+        let (Some(k), Some(span)) = (key_at(r), row_span(r, tree)) else { continue };
+        if !parents.iter().any(|(pk, ..)| *pk == k) {
+            parents.push((k, span, key.clone()));
+        }
+    }
+    let joined: Vec<Option<String>> = rows
+        .iter()
+        .map(|(r, key)| {
+            let k = key_at(r)?;
+            let mut outer: Vec<&((usize, usize), (usize, usize), String)> = parents
+                .iter()
+                .filter(|(pk, span, _)| *pk != k && span.0 <= k.0 && k.1 <= span.1 && !(pk.0 <= k.0 && k.1 <= pk.1))
+                .collect();
+            if outer.is_empty() {
+                return None;
+            }
+            // Outermost first: the widest span starts first.
+            outer.sort_by_key(|(_, span, _)| (span.0, std::cmp::Reverse(span.1)));
+            let mut out = String::new();
+            for (_, _, pkey) in outer {
+                out = if out.is_empty() { pkey.clone() } else { join_path(&out, pkey) };
+            }
+            Some(join_path(&out, key))
+        })
+        .collect();
+    for ((_, key), j) in rows.iter_mut().zip(joined) {
+        if let Some(j) = j {
+            *key = j;
+        }
+    }
 }
 
 /// The file nearest `from` (longest shared directory), then the first by name.
@@ -1072,10 +1170,75 @@ mod tests {
         assert_eq!(r.code, 0, "{}", r.out);
         assert_eq!(
             r.out,
-            "frontend/src/routesConfig.ts:16  /library      Library  frontend/src/routes/library.tsx:3\n\
-             frontend/src/routesConfig.ts:17  /library/:id  Asset    frontend/src/routes/library/[id].tsx:1\n\
+            "frontend/src/routesConfig.ts:16  /w/:workspaceID/library      Library  frontend/src/routes/library.tsx:3\n\
+             frontend/src/routesConfig.ts:17  /w/:workspaceID/library/:id  Asset    frontend/src/routes/library/[id].tsx:1\n\
              2 routes (solid-routes, from .ctsq/queries/solid-routes.toml)\n"
         );
+        // The override leaves the key fields out, so it takes the built-in's,
+        // key_nest and key_pattern among them.
+        let r = run("solid-mavexa", Some("https://app.example.com/w/abc/library/7"), &hide());
+        assert!(
+            r.out.starts_with("frontend/src/routesConfig.ts:17  /w/:workspaceID/library/:id  Asset  frontend/src/routes/library/[id].tsx:1  workspaceID=abc id=7\n"),
+            "{}",
+            r.out
+        );
+    }
+
+    #[test]
+    fn nested_keys_join_with_one_slash() {
+        assert_eq!(join_path("/w/:id", "/start"), "/w/:id/start");
+        assert_eq!(join_path("/org/:org", "team/:team"), "/org/:org/team/:team");
+        assert_eq!(join_path("/", "about"), "/about");
+        assert_eq!(join_path("/a/", "/"), "/a/");
+        assert_eq!(join_path("/a", ""), "/a");
+        assert_eq!(join_path("", "/"), "/");
+    }
+
+    /// Whether `user` finds a row whose key is `key` through the built-in
+    /// pack `file`, and the params it shows.
+    fn pack_test(file: &str, user: &str, key: &str) -> (bool, Option<String>) {
+        let text = std::fs::read_to_string(format!("{}/config/queries/{}", env!("CARGO_MANIFEST_DIR"), file)).unwrap();
+        let q = queries::parse_file("p", &text).unwrap().remove(0);
+        let f = KeyFilter::new(Some(user)).unwrap();
+        let (ok, hit) = KeyMatcher::new(&q, &f, Some(user)).test(key);
+        (ok, hit.map(|h| h.params))
+    }
+
+    #[test]
+    fn a_route_with_no_parameter_needs_no_literal_character_but_a_catch_all_does() {
+        assert!(pack_test("solid-routes.toml", "https://x/", "/").0);
+        assert!(!pack_test("solid-routes.toml", "https://x/a", "*").0);
+        assert!(!pack_test("solid-routes.toml", "https://x/a", "/*").0);
+        assert!(pack_test("go-http.toml", "https://x/", "/{$}").0);
+        assert!(!pack_test("go-http.toml", "https://x/a", "/{$}").0);
+        assert!(pack_test("go-http.toml", "https://x/", "GET /{$}").0);
+        assert!(pack_test("next-app.toml", "https://x/", "/").0);
+        assert!(!pack_test("go-http.toml", "https://x/a", "/").0, "the root no longer takes every path");
+    }
+
+    #[test]
+    fn a_slash_regex_key_is_also_a_pasted_path_on_a_whole_key_query() {
+        assert_eq!(pack_test("solid-routes.toml", "/events/7/", "/events/:id"), (true, Some("id=7".to_string())));
+        assert!(!pack_test("error-go.toml", "/x 7 y/", "x %d y").0, "a within query keeps a regex key a regex");
+    }
+
+    #[test]
+    fn go_routes_take_any_case_method_and_head_for_get() {
+        assert!(pack_test("go-http.toml", "get https://x/a/1", "GET /a/{id}").0);
+        assert!(pack_test("go-http.toml", "HEAD /a/1", "GET /a/{id}").0);
+        assert!(!pack_test("go-http.toml", "HEAD /a/1", "POST /a/{id}").0);
+        assert!(pack_test("go-chi.toml", "/q/12", "/q/{id:\\\\d+}").0, "the Go string is unescaped");
+        assert!(!pack_test("go-chi.toml", "/q/ab", "/q/{id:\\\\d+}").0);
+    }
+
+    #[test]
+    fn splat_routes_also_take_the_bare_prefix() {
+        for key in ["/docs/*rest", "/docs/*"] {
+            assert!(pack_test("solid-routes.toml", "https://x/docs", key).0, "{}", key);
+            assert!(pack_test("react-router.toml", "https://x/docs/", key).0, "{}", key);
+            assert!(pack_test("react-router.toml", "https://x/docs/a/b", key).0, "{}", key);
+        }
+        assert_eq!(pack_test("solid-routes.toml", "/docs/a/b", "/docs/*rest").1.as_deref(), Some("rest=a/b"));
     }
 
     #[test]

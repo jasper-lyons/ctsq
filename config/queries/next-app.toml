@@ -20,9 +20,9 @@ key_input = [
   ['^$', '/'],
 ]
 key_pattern = [
-  ['/\[\[\.\.\.(\w+)\]\]', '(?:/(?P<$1>.+))?'],  # [[...name]] an optional rest
-  ['\[\.\.\.(\w+)\]', '(?P<$1>.+)'],             # [...name] the rest
-  ['\[(\w+)\]', '(?P<$1>[^/]+)'],                # [name] one segment
+  ['/\[\[\.\.\.([^\]/]+)\]\]', '(?:/(?P<$1>.+))?'],  # [[...name]] an optional rest
+  ['\[\.\.\.([^\]/]+)\]', '(?P<$1>.+)'],             # [...name] the rest
+  ['\[([^\]/]+)\]', '(?P<$1>[^/]+)'],                # [name] one segment, [user-id] too
   ['/', '/'],                            # a slash is not a literal character
 ]
-key_min_literal = 1                      # so a catch-all (*, /*, /) is not tested
+key_min_literal = 1                      # so a catch-all ([...all]) is not tested

@@ -1,5 +1,5 @@
 import type { RouteDefinition } from "@solidjs/router";
-import { EventPage, NewEvent, Team, Docs, Settings, Org, Child } from "./pages";
+import { EventPage, NewEvent, Team, Docs, Settings, Org, Child, Guard, Member } from "./pages";
 
 export const routes: RouteDefinition[] = [
   { path: "/events/:id", component: EventPage },
@@ -11,6 +11,18 @@ export const routes: RouteDefinition[] = [
   {
     path: "/nested/:org",
     component: Org,
-    children: [{ path: "/child/:id", component: Child }],
+    children: [
+      { path: "/child/:id", component: Child },
+      {
+        component: Guard,
+        children: [
+          {
+            path: "/squad/:squad",
+            component: Team,
+            children: [{ path: "/member/:member", component: Member }],
+          },
+        ],
+      },
+    ],
   },
 ];
