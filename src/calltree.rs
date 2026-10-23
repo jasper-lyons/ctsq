@@ -5,28 +5,7 @@ use crate::resolve::Confidence;
 use crate::scope;
 use std::collections::HashSet;
 
-// ── Public entry points ───────────────────────────────────────────────────────
-
-pub fn callees(names: &[String], where_: &str, jobs: &[(String, &'static str)], hider: files::Hider, max_depth: usize, scope: Option<scope::Opts>) {
-    run(Direction::Down, names, where_, jobs, hider, max_depth, scope);
-}
-
-pub fn callers(names: &[String], where_: &str, jobs: &[(String, &'static str)], hider: files::Hider, max_depth: usize, scope: Option<scope::Opts>) {
-    run(Direction::Up, names, where_, jobs, hider, max_depth, scope);
-}
-
-fn run(dir: Direction, names: &[String], where_: &str, jobs: &[(String, &'static str)], mut hider: files::Hider, max_depth: usize, scope: Option<scope::Opts>) {
-    let r = report_many(dir, names, where_, jobs, max_depth, &mut hider, scope);
-    print!("{}", r.out);
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
-    eprint!("{}", r.err);
-    if r.code != 0 {
-        std::process::exit(r.code);
-    }
-}
-
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Direction {
     /// `callers`: walk up the call chain.
     Up,
@@ -34,13 +13,223 @@ pub enum Direction {
     Down,
 }
 
-/// The whole `callers` or `callees` tree as text, with the footer when
-/// something was hidden, and the exit code: 1 when every row was hidden.
+// ── Rows ──────────────────────────────────────────────────────────────────────
+
+/// A file and a 1-based line.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Loc {
+    pub file: String,
+    pub line: usize,
+}
+
+/// One row of a `callers` or `callees` tree: one call.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallNode {
+    /// The function the row names: the caller (`callers`) or the callee as
+    /// written at the call (`callees`).
+    pub name: String,
+    /// Where that function is defined. None for a callee call with no target,
+    /// which prints as `unresolved NAME` and has no children.
+    pub def: Option<Loc>,
+    /// How the call resolved: None when it has no target, `Guess` prints `?`.
+    pub confidence: Option<Confidence>,
+    /// The function is already on the path from the root, so the walk stopped.
+    pub cycle: bool,
+    /// Where the call is written. `--scope` rows name the scope holding it.
+    pub site: Loc,
+    pub children: Vec<CallNode>,
+    /// Children past `--max-matches`: counted by the cap, not kept. They are
+    /// always the last ones, so the last kept child does not close the branch.
+    pub children_cut: usize,
+}
+
+/// One definition a tree starts from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallRoot {
+    /// None when the name has no definition: the tree then holds the callers
+    /// of the bare name (`callers`) or nothing (`callees`).
+    pub def: Option<Loc>,
+    pub children: Vec<CallNode>,
+    pub children_cut: usize,
+}
+
+/// One name's trees, one per definition left after hiding.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NameTree {
+    pub name: String,
+    pub roots: Vec<CallRoot>,
+    /// Nothing resolved and nothing hidden: the name goes on the `not found:` line.
+    pub missing: bool,
+}
+
+/// A whole `callers` or `callees` answer. Rows past `--max-matches` are left
+/// out and counted by the cap.
+#[derive(Debug, Clone)]
+pub struct CallTrees {
+    pub dir: Direction,
+    pub names: Vec<NameTree>,
+    /// Rows kept.
+    pub shown: usize,
+    pub hidden: Hidden,
+    /// The names marked `missing`, in order.
+    pub missing: Vec<String>,
+    /// Some name resolved to a definition or had a row to show.
+    pub resolved: bool,
+}
+
+// ── Builder ───────────────────────────────────────────────────────────────────
+
+/// The trees for `names`, walked `max_depth` calls up or down.
 ///
 /// The call graph is built over every file, so a test never changes how a call
-/// resolves. A definition of `function` that sits in a test is left out as a
-/// root, and a row whose call is written in a test is left out with everything
-/// above it. Each one counts once in the footer.
+/// resolves. A definition of a name that sits in a test is left out as a root,
+/// and a row whose call is written in a test is left out with everything
+/// above it. Each one counts once in `hidden`. The cap is not settled into
+/// `hidden` here: `footer::settle` does that.
+pub fn build(
+    dir: Direction,
+    names: &[String],
+    jobs: &[(String, &'static str)],
+    max_depth: usize,
+    hider: &mut files::Hider,
+) -> CallTrees {
+    let g = graph_for(dir, names, jobs, max_depth);
+    let mut w = Walk { g: &g, max_depth, shown: 0, hider, hidden: Hidden::default() };
+    let mut trees = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    let mut resolved = false;
+    for name in names {
+        let shown_before = w.shown;
+        let hidden_before = w.hidden.tests + w.hidden.excluded;
+        let roots = walk_name(&mut w, dir, name);
+        let kept_root = roots.iter().any(|r| r.def.is_some());
+        let hid = w.hidden.tests + w.hidden.excluded > hidden_before;
+        let mut is_missing = false;
+        if kept_root || w.shown > shown_before {
+            resolved = true;
+        } else if !hid {
+            missing.push(name.clone());
+            is_missing = true;
+        }
+        trees.push(NameTree { name: name.clone(), roots, missing: is_missing });
+    }
+    CallTrees { dir, names: trees, shown: w.shown, hidden: w.hidden, missing, resolved }
+}
+
+// ── Printers ──────────────────────────────────────────────────────────────────
+
+fn noun(dir: Direction) -> &'static str {
+    if dir == Direction::Up { "caller" } else { "callee" }
+}
+
+/// One name's tree as text: a `name()` heading per root (with its location
+/// when there are several), the rows under it as a box-drawn tree, and with
+/// `scope` the scope row under each row.
+pub fn render_tree(t: &NameTree, scope: &mut Option<scope::Printer>) -> String {
+    let mut out = String::new();
+    let multiple = t.roots.len() > 1;
+    for (i, root) in t.roots.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        match (&root.def, multiple) {
+            (Some(d), true) => out.push_str(&format!("{}()  [{}:{}]\n", t.name, short_path(&d.file), d.line)),
+            _ => out.push_str(&format!("{}()\n", t.name)),
+        }
+        render_rows(&mut out, &root.children, root.children_cut, "", scope);
+    }
+    out
+}
+
+fn render_rows(out: &mut String, rows: &[CallNode], cut: usize, prefix: &str, scope: &mut Option<scope::Printer>) {
+    let n = rows.len();
+    for (i, c) in rows.iter().enumerate() {
+        let is_last = i == n - 1 && cut == 0;
+        let connector = if is_last { "└── " } else { "├── " };
+        let child_prefix = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
+        match &c.def {
+            // no target: the branch stops at the call
+            None => out.push_str(&format!("{}{}unresolved {}\n", prefix, connector, c.name)),
+            Some(d) => {
+                let mark = if c.confidence == Some(Confidence::Guess) { " ?" } else { "" };
+                let cycle = if c.cycle { " (cycle)" } else { "" };
+                out.push_str(&format!("{}{}{}()  [{}:{}]{}{}\n", prefix, connector, c.name, short_path(&d.file), d.line, mark, cycle));
+            }
+        }
+        if let Some(p) = scope.as_mut() {
+            out.push_str(&p.call_rows(&c.site.file, c.site.line, &child_prefix));
+        }
+        render_rows(out, &c.children, c.children_cut, &child_prefix, scope);
+    }
+}
+
+/// The first name's tree with the count line or footer, and the exit code: 1
+/// when every row was hidden. What `scopeof --callers` reads.
+pub fn render_one(t: &CallTrees, jobs: &[(String, &'static str)], scope: Option<scope::Opts>) -> (String, i32) {
+    let mut printer = scope.map(|o| scope::Printer::new(o, jobs));
+    let mut out = t.names.first().map(|n| render_tree(n, &mut printer)).unwrap_or_default();
+    let code = if t.shown == 0 && t.hidden.any() { 1 } else { 0 };
+    out.push_str(&tail(t.shown, noun(t.dir), &t.hidden, scope.is_some()));
+    (out, code)
+}
+
+/// The whole `callers` or `callees` answer. Each name's tree prints in order
+/// with a blank line between. A name that resolved to nothing goes on the
+/// `not found:` stderr line, and when it is the one name asked for its bare
+/// `name()` line goes to stderr too, with stdout empty. When every row was
+/// hidden stdout is empty and stderr says so (BUILD.md A20). The footer counts
+/// across all names, once. The code is 0 when any name resolved to a
+/// definition or had a row to show. `t.hidden` should be settled.
+pub fn render_many(t: &CallTrees, where_: &str, jobs: &[(String, &'static str)], scope: Option<scope::Opts>) -> crate::resolve::NamesOut {
+    let mut printer = scope.map(|o| scope::Printer::new(o, jobs));
+    let mut out = String::new();
+    for n in &t.names {
+        if n.missing && t.names.len() > 1 {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&render_tree(n, &mut printer));
+    }
+    let names: Vec<&str> = t.names.iter().map(|n| n.name.as_str()).collect();
+    let mut err = String::new();
+    if !t.resolved {
+        // Nothing to print on stdout: a hidden-everything report or the miss.
+        if t.hidden.any() {
+            out.clear();
+            err.push_str(&footer::nothing_shown(
+                &format!("no {} to {}", noun(t.dir), names.join(", ")),
+                where_,
+                jobs.len(),
+                &t.hidden,
+            ));
+        } else {
+            err.push_str(&out);
+            out.clear();
+        }
+    } else {
+        out.push_str(&tail(t.shown, noun(t.dir), &t.hidden, scope.is_some()));
+    }
+    err.push_str(&crate::resolve::not_found_line(&t.missing, jobs));
+    crate::resolve::NamesOut { out, err, code: if t.resolved { 0 } else { 1 } }
+}
+
+// ── Builder then printer ──────────────────────────────────────────────────────
+
+/// `build` for one name, then `render_one`. The cap is not settled.
+pub fn report_scoped(
+    dir: Direction,
+    function: &str,
+    jobs: &[(String, &'static str)],
+    max_depth: usize,
+    hider: &mut files::Hider,
+    scope: Option<scope::Opts>,
+) -> (String, i32) {
+    let t = build(dir, &[function.to_string()], jobs, max_depth, hider);
+    render_one(&t, jobs, scope)
+}
+
 #[cfg(test)]
 pub fn report(
     dir: Direction,
@@ -52,34 +241,7 @@ pub fn report(
     report_scoped(dir, function, jobs, max_depth, hider, None)
 }
 
-/// `report`, with `--scope` rows under each row when `scope` is set: the named
-/// scope holding that row's call site, then the count line.
-pub fn report_scoped(
-    dir: Direction,
-    function: &str,
-    jobs: &[(String, &'static str)],
-    max_depth: usize,
-    hider: &mut files::Hider,
-    scope: Option<scope::Opts>,
-) -> (String, i32) {
-    let g = graph_for(dir, &[function.to_string()], jobs, max_depth);
-    let printer = scope.map(|o| scope::Printer::new(o, jobs));
-    let mut w = Walk { g: &g, max_depth, out: String::new(), shown: 0, hider, hidden: Hidden::default(), scope: printer };
-    walk_name(&mut w, dir, function);
-    let noun = if dir == Direction::Up { "caller" } else { "callee" };
-    let code = if w.shown == 0 && w.hidden.any() { 1 } else { 0 };
-    let mut out = w.out;
-    out.push_str(&tail(w.shown, noun, &w.hidden, scope.is_some()));
-    (out, code)
-}
-
-/// `report_scoped` for several names. Each name's tree prints in order with a
-/// blank line between. A name that resolved to nothing goes on the `not found:`
-/// stderr line, and when it is the one name asked for its bare `name()` line
-/// goes to stderr too, with stdout empty. When every row was hidden stdout is
-/// empty and stderr says so (BUILD.md A20). The footer counts across all names,
-/// once. The code is 0 when any name resolved to a definition or had a row to
-/// show.
+/// `build`, the cap settled into the footer, then `render_many`.
 pub fn report_many(
     dir: Direction,
     names: &[String],
@@ -89,56 +251,9 @@ pub fn report_many(
     hider: &mut files::Hider,
     scope: Option<scope::Opts>,
 ) -> crate::resolve::NamesOut {
-    let g = graph_for(dir, names, jobs, max_depth);
-    let printer = scope.map(|o| scope::Printer::new(o, jobs));
-    let mut w = Walk { g: &g, max_depth, out: String::new(), shown: 0, hider, hidden: Hidden::default(), scope: printer };
-    let mut missing: Vec<String> = Vec::new();
-    let mut resolved = false;
-    for name in names {
-        let sep = !w.out.is_empty();
-        if sep {
-            w.out.push('\n');
-        }
-        let start = w.out.len();
-        let shown_before = w.shown;
-        let hidden_before = w.hidden.tests + w.hidden.excluded;
-        let kept_root = walk_name(&mut w, dir, name);
-        let hid = w.hidden.tests + w.hidden.excluded > hidden_before;
-        if kept_root || w.shown > shown_before {
-            resolved = true;
-        } else if !hid {
-            missing.push(name.clone());
-            if names.len() > 1 {
-                w.out.truncate(start);
-                if sep {
-                    w.out.pop();
-                }
-            }
-        }
-    }
-    let noun = if dir == Direction::Up { "caller" } else { "callee" };
-    footer::settle(&mut w.hidden);
-    let mut err = String::new();
-    let mut out = w.out;
-    if !resolved {
-        // Nothing to print on stdout: a hidden-everything report or the miss.
-        if w.hidden.any() {
-            out.clear();
-            err.push_str(&footer::nothing_shown(
-                &format!("no {} to {}", noun, names.join(", ")),
-                where_,
-                jobs.len(),
-                &w.hidden,
-            ));
-        } else {
-            err.push_str(&out);
-            out.clear();
-        }
-    } else {
-        out.push_str(&tail(w.shown, noun, &w.hidden, scope.is_some()));
-    }
-    err.push_str(&crate::resolve::not_found_line(&missing, jobs));
-    crate::resolve::NamesOut { out, err, code: if resolved { 0 } else { 1 } }
+    let mut t = build(dir, names, jobs, max_depth, hider);
+    footer::settle(&mut t.hidden);
+    render_many(&t, where_, jobs, scope)
 }
 
 /// The graph a walk from `names` reads, built from the files it needs. Its
@@ -149,9 +264,9 @@ fn graph_for(dir: Direction, names: &[String], jobs: &[(String, &'static str)], 
     crate::resolve::scoped::build(jobs, &crate::resolve::scoped::Seeds { names: names.to_vec(), up, down })
 }
 
-/// One name's tree, appended to `w.out`. True when a definition of the name
-/// is left after hiding.
-fn walk_name(w: &mut Walk, dir: Direction, function: &str) -> bool {
+/// One name's roots: one per definition left after hiding, or one with no
+/// definition when the name has none at all.
+fn walk_name(w: &mut Walk, dir: Direction, function: &str) -> Vec<CallRoot> {
     let g = w.g;
     let all_roots = g.index.by_name.get(function).cloned().unwrap_or_default();
     let had_roots = !all_roots.is_empty();
@@ -160,34 +275,31 @@ fn walk_name(w: &mut Walk, dir: Direction, function: &str) -> bool {
         |&r| (g.index.defs[r].id.file.clone(), g.index.defs[r].id.line),
         &mut w.hidden,
     );
+    let mut out = Vec::new();
     if !had_roots {
-        w.out.push_str(&format!("{}()\n", function));
+        let mut root = CallRoot { def: None, children: vec![], children_cut: 0 };
         if dir == Direction::Up {
             // external/undefined name: its callers are still in the graph
             let key = NodeKey::External(function.to_string());
             let mut visited = HashSet::new();
             visited.insert(key.clone());
-            w.up(&key, 0, "", &mut visited);
+            (root.children, root.children_cut) = w.up(&key, 0, &mut visited);
         }
+        out.push(root);
     }
-    let multiple = roots.len() > 1;
-    for (i, &r) in roots.iter().enumerate() {
-        if i > 0 { w.out.push('\n'); }
+    for &r in &roots {
         let id = g.index.defs[r].id.clone();
-        if multiple {
-            w.out.push_str(&format!("{}()  [{}:{}]\n", function, short_path(&id.file), id.line));
-        } else {
-            w.out.push_str(&format!("{}()\n", function));
-        }
+        let def = Some(Loc { file: id.file.clone(), line: id.line });
         let key = NodeKey::Def(id);
         let mut visited = HashSet::new();
         visited.insert(key.clone());
-        match dir {
-            Direction::Up => w.up(&key, 0, "", &mut visited),
-            Direction::Down => w.down(&key, 0, "", &mut visited),
-        }
+        let (children, children_cut) = match dir {
+            Direction::Up => w.up(&key, 0, &mut visited),
+            Direction::Down => w.down(&key, 0, &mut visited),
+        };
+        out.push(CallRoot { def, children, children_cut });
     }
-    !roots.is_empty()
+    out
 }
 
 pub fn callgraph(path: &str, lang_name: Option<&str>, no_ignore: bool, format: &str) {
@@ -253,28 +365,16 @@ pub(crate) fn collect_edges(g: &CallGraph) -> Vec<(String, String, String, Strin
 
 // ── Tree walkers ──────────────────────────────────────────────────────────────
 
-/// One `callers` or `callees` walk: the rows printed so far and what was hidden.
+/// One `callers` or `callees` walk: the rows kept so far and what was hidden.
 struct Walk<'a> {
     g: &'a CallGraph,
     max_depth: usize,
-    out: String,
     shown: usize,
     hider: &'a mut files::Hider,
     hidden: Hidden,
-    scope: Option<scope::Printer>,
 }
 
 impl Walk<'_> {
-    /// The `--scope` rows for the call of edge `e`, under the row just printed.
-    fn scope_rows(&mut self, e: usize, indent: &str) {
-        let g = self.g;
-        let rc = &g.calls[e];
-        let file = &g.index.defs[rc.caller].id.file;
-        if let Some(p) = self.scope.as_mut() {
-            self.out.push_str(&p.call_rows(file, rc.line, indent));
-        }
-    }
-
     /// The edges whose call is not written in a hidden place.
     fn visible(&mut self, edges: &[usize]) -> Vec<usize> {
         let g = self.g;
@@ -288,92 +388,95 @@ impl Walk<'_> {
         )
     }
 
-    fn down(&mut self, key: &NodeKey, depth: usize, prefix: &str, visited: &mut HashSet<NodeKey>) {
+    /// The callee rows under `key`, and how many were cut by the cap.
+    fn down(&mut self, key: &NodeKey, depth: usize, visited: &mut HashSet<NodeKey>) -> (Vec<CallNode>, usize) {
         let g = self.g;
-        if depth >= self.max_depth { return; }
-        let Some(edges) = g.fwd.get(key) else { return };
+        let mut rows = Vec::new();
+        let mut cut = 0;
+        if depth >= self.max_depth { return (rows, cut); }
+        let Some(edges) = g.fwd.get(key) else { return (rows, cut) };
         let edges = self.visible(edges);
-        let n = edges.len();
-        for (i, &e) in edges.iter().enumerate() {
+        for &e in &edges {
             let rc = &g.calls[e];
-            // Past --max-matches a row is counted, not printed, and so is
+            let caller_file = &g.index.defs[rc.caller].id.file;
+            // Past --max-matches a row is counted, not kept, and so is
             // everything below it.
-            let print = footer::take(&g.index.defs[rc.caller].id.file);
-            if print {
+            let keep = footer::take(caller_file);
+            if keep {
                 self.shown += 1;
+            } else {
+                cut += 1;
             }
-            let is_last = i == n - 1;
-            let connector = if is_last { "└── " } else { "├── " };
-            let child_prefix = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
-            match rc.target {
-                Some((t, conf)) => {
-                    let d = &g.index.defs[t];
-                    let mark = if conf == Confidence::Guess { " ?" } else { "" };
-                    let loc = format!("[{}:{}]", short_path(&d.id.file), d.id.line);
-                    let tk = NodeKey::Def(d.id.clone());
-                    if visited.contains(&tk) {
-                        if print {
-                            self.out.push_str(&format!("{}{}{}()  {}{} (cycle)\n", prefix, connector, rc.callee_display, loc, mark));
-                            self.scope_rows(e, &child_prefix);
-                        }
-                    } else {
-                        if print {
-                            self.out.push_str(&format!("{}{}{}()  {}{}\n", prefix, connector, rc.callee_display, loc, mark));
-                            self.scope_rows(e, &child_prefix);
-                        }
-                        visited.insert(tk.clone());
-                        self.down(&tk, depth + 1, &child_prefix, visited);
-                        visited.remove(&tk);
-                    }
+            let site = Loc { file: caller_file.clone(), line: rc.line };
+            let mut node = CallNode {
+                name: rc.callee_display.clone(),
+                def: None,
+                confidence: None,
+                cycle: false,
+                site,
+                children: vec![],
+                children_cut: 0,
+            };
+            // no target: the branch stops at the call
+            if let Some((t, conf)) = rc.target {
+                let d = &g.index.defs[t];
+                node.def = Some(Loc { file: d.id.file.clone(), line: d.id.line });
+                node.confidence = Some(conf);
+                let tk = NodeKey::Def(d.id.clone());
+                if visited.contains(&tk) {
+                    node.cycle = true;
+                } else {
+                    visited.insert(tk.clone());
+                    (node.children, node.children_cut) = self.down(&tk, depth + 1, visited);
+                    visited.remove(&tk);
                 }
-                // no target: the branch stops at the call
-                None => {
-                    if print {
-                        self.out.push_str(&format!("{}{}unresolved {}\n", prefix, connector, rc.callee_display));
-                        self.scope_rows(e, &child_prefix);
-                    }
-                }
+            }
+            if keep {
+                rows.push(node);
             }
         }
+        (rows, cut)
     }
 
-    fn up(&mut self, key: &NodeKey, depth: usize, prefix: &str, visited: &mut HashSet<NodeKey>) {
+    /// The caller rows above `key`, and how many were cut by the cap.
+    fn up(&mut self, key: &NodeKey, depth: usize, visited: &mut HashSet<NodeKey>) -> (Vec<CallNode>, usize) {
         let g = self.g;
-        if depth >= self.max_depth { return; }
-        let Some(edges) = g.rev.get(key) else { return };
+        let mut rows = Vec::new();
+        let mut cut = 0;
+        if depth >= self.max_depth { return (rows, cut); }
+        let Some(edges) = g.rev.get(key) else { return (rows, cut) };
         let edges = self.visible(edges);
-        let n = edges.len();
-        for (i, &e) in edges.iter().enumerate() {
+        for &e in &edges {
             let rc = &g.calls[e];
             let d = &g.index.defs[rc.caller];
-            let print = footer::take(&d.id.file);
-            if print {
+            let keep = footer::take(&d.id.file);
+            if keep {
                 self.shown += 1;
-            }
-            let is_last = i == n - 1;
-            let connector = if is_last { "└── " } else { "├── " };
-            let mark = match rc.target {
-                Some((_, Confidence::Guess)) => " ?",
-                _ => "",
-            };
-            let loc = format!("[{}:{}]", short_path(&d.id.file), d.id.line);
-            let tk = NodeKey::Def(d.id.clone());
-            let child_prefix = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
-            if visited.contains(&tk) {
-                if print {
-                    self.out.push_str(&format!("{}{}{}()  {}{} (cycle)\n", prefix, connector, d.name, loc, mark));
-                    self.scope_rows(e, &child_prefix);
-                }
             } else {
-                if print {
-                    self.out.push_str(&format!("{}{}{}()  {}{}\n", prefix, connector, d.name, loc, mark));
-                    self.scope_rows(e, &child_prefix);
-                }
+                cut += 1;
+            }
+            let tk = NodeKey::Def(d.id.clone());
+            let mut node = CallNode {
+                name: d.name.clone(),
+                def: Some(Loc { file: d.id.file.clone(), line: d.id.line }),
+                confidence: rc.target.map(|(_, c)| c),
+                cycle: false,
+                site: Loc { file: d.id.file.clone(), line: rc.line },
+                children: vec![],
+                children_cut: 0,
+            };
+            if visited.contains(&tk) {
+                node.cycle = true;
+            } else {
                 visited.insert(tk.clone());
-                self.up(&tk, depth + 1, &child_prefix, visited);
+                (node.children, node.children_cut) = self.up(&tk, depth + 1, visited);
                 visited.remove(&tk);
             }
+            if keep {
+                rows.push(node);
+            }
         }
+        (rows, cut)
     }
 }
 
@@ -561,5 +664,43 @@ mod tests {
                 assert!(!guess);
             }
         }
+    }
+
+    fn strict_go() -> (Jobs, files::Hider) {
+        let root = "fixtures/resolve-strict/go";
+        let jobs = files::resolve_jobs(root, None, false);
+        let mut h = files::Hider::new(&Default::default());
+        h.add_jobs(root, &jobs);
+        (jobs, h)
+    }
+
+    #[test]
+    fn build_carries_unresolved_calls_and_confidence_as_data() {
+        let (jobs, mut h) = strict_go();
+        let names: Vec<String> = ["Bare", "Control", "Nope"].iter().map(|s| s.to_string()).collect();
+        let t = build(Direction::Down, &names, &jobs, 3, &mut h);
+        assert!(t.resolved);
+        assert_eq!(t.missing, vec!["Nope".to_string()]);
+        assert_eq!(t.shown, 3);
+        let handler = "fixtures/resolve-strict/go/api/handler.go";
+        let bare = &t.names[0].roots;
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0].def, Some(Loc { file: handler.into(), line: 54 }));
+        let open = &bare[0].children[0];
+        assert_eq!((open.name.as_str(), &open.def, open.confidence), ("Open", &None, None));
+        assert_eq!(open.site, Loc { file: handler.into(), line: 55 });
+        assert!(open.children.is_empty());
+        let control: Vec<(&str, usize, Option<Confidence>)> = t.names[1].roots[0]
+            .children
+            .iter()
+            .map(|c| (c.name.as_str(), c.def.as_ref().map(|d| d.line).unwrap_or(0), c.confidence))
+            .collect();
+        assert_eq!(control, vec![("List", 8, Some(Confidence::Exact)), ("Set", 14, Some(Confidence::Exact))]);
+        assert!(t.names[1].roots[0].children.iter().all(|c| c.def.as_ref().unwrap().file.ends_with("api/cache.go")));
+        // Nope has no definition: one root without one, and no rows
+        assert_eq!(t.names[2].roots, vec![CallRoot { def: None, children: vec![], children_cut: 0 }]);
+        assert!(t.names[2].missing);
+        let out = render_many(&t, "fixtures/resolve-strict/go", &jobs, None);
+        assert!(out.out.starts_with("Bare()\n└── unresolved Open\n\nControl()\n├── List()  [cache.go:8]\n"), "{}", out.out);
     }
 }

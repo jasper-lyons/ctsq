@@ -69,22 +69,60 @@ pub struct Report {
     pub code: i32,
 }
 
-/// All coordinates, blocks separated by a blank line.
-pub fn report(coords: &[Coord], opts: &Options, hide: &files::HideOpts) -> Report {
+/// One coordinate's answer.
+#[derive(Debug, Clone)]
+pub struct Hit {
+    pub coord: Coord,
+    /// The scope holding the line, or the innermost block with `--block`.
+    /// None at the top level, where the window is cut from the whole file.
+    pub scope: Option<Scope>,
+    /// The first and last line shown, 1-based and inclusive.
+    pub shown: (usize, usize),
+    /// The lines the window was cut from: the scope's, or the whole file's.
+    pub span: (usize, usize),
+    /// The shown lines, as they sit in the file.
+    pub lines: Vec<String>,
+    /// With `--siblings`, the named scopes beside the scope.
+    pub siblings: Option<Vec<Scope>>,
+    /// With `--callers`, one level of callers of the scope.
+    pub callers: Option<crate::calltree::CallTrees>,
+    /// `--up` asked past the outermost scope: how many enclosing scopes there are.
+    pub only: Option<usize>,
+}
+
+/// Each coordinate's answer, in order. An error is the stderr line for a
+/// coordinate that did not resolve.
+pub fn build(coords: &[Coord], opts: &Options, hide: &files::HideOpts) -> Vec<Result<Hit, String>> {
+    coords.iter().map(|c| one(c, opts, hide)).collect()
+}
+
+/// The text `scopeof` prints for `hits`: blocks separated by a blank line,
+/// the errors on stderr, code 0 when any coordinate resolved.
+pub fn render(hits: &[Result<Hit, String>]) -> Report {
     let mut r = Report::default();
     let mut resolved = 0usize;
-    for c in coords {
-        let mut block = String::new();
-        if one(c, opts, hide, &mut block, &mut r.err) {
-            if resolved > 0 {
-                r.out.push('\n');
+    for h in hits {
+        match h {
+            Ok(h) => {
+                if resolved > 0 {
+                    r.out.push('\n');
+                }
+                resolved += 1;
+                r.out.push_str(&render_hit(h));
             }
-            resolved += 1;
-            r.out.push_str(&block);
+            Err(e) => {
+                r.err.push_str(e);
+                r.err.push('\n');
+            }
         }
     }
     r.code = if resolved > 0 { 0 } else { 1 };
     r
+}
+
+/// All coordinates, blocks separated by a blank line: `build` then `render`.
+pub fn report(coords: &[Coord], opts: &Options, hide: &files::HideOpts) -> Report {
+    render(&build(coords, opts, hide))
 }
 
 /// The `A-B` lines of `lo..=hi` to show, `budget` of them centred on `center`.
@@ -101,49 +139,75 @@ fn window(center: usize, lo: usize, hi: usize, budget: usize) -> (usize, usize) 
     (a, b)
 }
 
-fn push_lines(out: &mut String, lines: &[&str], a: usize, b: usize) {
-    for l in &lines[a - 1..b] {
-        out.push_str(l);
-        out.push('\n');
-    }
-}
-
 /// The footer for a window that cut the body: the shown lines, the span they
 /// were cut from, and the flag value that shows all of it.
 fn showing(a: usize, b: usize, lo: usize, hi: usize) -> String {
     format!("showing lines {}-{} of {}-{}, --budget {} for all\n", a, b, lo, hi, hi + 1 - lo)
 }
 
-fn one(c: &Coord, o: &Options, hide: &files::HideOpts, out: &mut String, err: &mut String) -> bool {
+fn render_hit(h: &Hit) -> String {
+    let c = &h.coord;
+    let mut out = String::new();
+    match &h.scope {
+        None => out.push_str(&format!("{}:{}  at top level\n", c.path, c.line)),
+        Some(s) => out.push_str(&format!("{}:{}  in  {}:{}-{}  {}\n", c.path, c.line, s.path, s.start_line, s.end_line, s.signature)),
+    }
+    for l in &h.lines {
+        out.push_str(l);
+        out.push('\n');
+    }
+    if let Some(sibs) = &h.siblings {
+        if sibs.is_empty() {
+            out.push_str("siblings: none\n");
+        } else {
+            out.push_str("siblings:\n");
+            for x in sibs {
+                out.push_str(&format!("{}:{}: {}\n", x.path, x.start_line, x.signature));
+            }
+        }
+    }
+    if let (Some(t), Some(s)) = (&h.callers, &h.scope) {
+        let (text, _) = crate::calltree::render_one(t, &[], None);
+        let header = format!("{}()\n", s.name);
+        let rest = text.strip_prefix(&header).unwrap_or(&text);
+        if rest.is_empty() {
+            out.push_str("callers: none\n");
+        } else {
+            out.push_str(&format!("callers:\n{}", rest));
+        }
+    }
+    let (a, b) = h.shown;
+    if h.shown != h.span {
+        out.push_str(&showing(a, b, h.span.0, h.span.1));
+    }
+    if let Some(n) = h.only {
+        out.push_str(&format!("{}:{}: only {} enclosing {}\n", c.path, c.line, n, if n == 1 { "scope" } else { "scopes" }));
+    }
+    out
+}
+
+fn one(c: &Coord, o: &Options, hide: &files::HideOpts) -> Result<Hit, String> {
     let source = match std::fs::read(&c.path) {
         Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            err.push_str(&format!("{}\n", miss::no_such_file(&c.path)));
-            return false;
-        }
-        Err(e) => {
-            err.push_str(&format!("Failed to read {}: {}\n", c.path, e));
-            return false;
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(miss::no_such_file(&c.path)),
+        Err(e) => return Err(format!("Failed to read {}: {}", c.path, e)),
     };
     let lang_name = match &o.lang {
         Some(l) => lang::lang_for_name_canonical(l).map(|n| lang::refine_for_path(n, &c.path)),
         None => lang::lang_for_path(&c.path),
     };
     let Some(lang_name) = lang_name else {
-        err.push_str(&format!("Cannot detect language for {}, use --lang\n", c.path));
-        return false;
+        return Err(format!("Cannot detect language for {}, use --lang", c.path));
     };
     let text = String::from_utf8_lossy(&source);
     let lines: Vec<&str> = text.lines().collect();
     if c.line > lines.len() {
-        err.push_str(&format!("{}:{}: past the end of the file ({} lines)\n", c.path, c.line, lines.len()));
-        return false;
+        return Err(format!("{}:{}: past the end of the file ({} lines)", c.path, c.line, lines.len()));
     }
     let Some(tree) = scope::parse(lang_name, &source) else {
-        err.push_str(&format!("Failed to parse {}\n", c.path));
-        return false;
+        return Err(format!("Failed to parse {}", c.path));
     };
+    let cut = |a: usize, b: usize| lines[a - 1..b].iter().map(|l| l.to_string()).collect::<Vec<String>>();
 
     // A signature line starts before the scope's own node (`export`, `const x =`,
     // `type`), so the last character of the line is tried as well and the deeper
@@ -163,7 +227,7 @@ fn one(c: &Coord, o: &Options, hide: &files::HideOpts, out: &mut String, err: &m
         }
     }
 
-    let mut up_note = String::new();
+    let mut only = None;
     let selected: Option<Scope> = if o.block {
         let mut best: Option<Scope> = None;
         for &b in &bytes {
@@ -181,50 +245,45 @@ fn one(c: &Coord, o: &Options, hide: &files::HideOpts, out: &mut String, err: &m
         None
     } else {
         if o.up >= chain.len() && o.up > 0 {
-            up_note = format!("{}:{}: only {} enclosing {}\n", c.path, c.line, chain.len(), if chain.len() == 1 { "scope" } else { "scopes" });
+            only = Some(chain.len());
         }
         Some(chain[o.up.min(chain.len() - 1)].clone())
     };
 
     let Some(s) = selected else {
         // Top level: a window of the file around the line.
-        out.push_str(&format!("{}:{}  at top level\n", c.path, c.line));
         let (a, b) = window(c.line, 1, lines.len(), o.budget);
-        push_lines(out, &lines, a, b);
-        if (a, b) != (1, lines.len()) {
-            out.push_str(&showing(a, b, 1, lines.len()));
-        }
-        return true;
+        return Ok(Hit {
+            coord: c.clone(),
+            scope: None,
+            shown: (a, b),
+            span: (1, lines.len()),
+            lines: cut(a, b),
+            siblings: None,
+            callers: None,
+            only: None,
+        });
     };
 
-    out.push_str(&format!("{}:{}  in  {}:{}-{}  {}\n", c.path, c.line, s.path, s.start_line, s.end_line, s.signature));
     let (a, b) = window(c.line.clamp(s.start_line, s.end_line), s.start_line, s.end_line, o.budget);
-    push_lines(out, &lines, a, b);
-
-    if o.siblings && s.kind != "block" {
-        let sibs = scope::siblings(&c.path, lang_name, &source, &tree, &s);
-        if sibs.is_empty() {
-            out.push_str("siblings: none\n");
-        } else {
-            out.push_str("siblings:\n");
-            for x in &sibs {
-                out.push_str(&format!("{}:{}: {}\n", x.path, x.start_line, x.signature));
-            }
-        }
-    }
-    if o.callers && s.kind != "block" {
-        out.push_str(&callers(&s, &c.path, o, hide));
-    }
-    if (a, b) != (s.start_line, s.end_line) {
-        out.push_str(&showing(a, b, s.start_line, s.end_line));
-    }
-    out.push_str(&up_note);
-    true
+    let named = s.kind != "block";
+    let siblings = (o.siblings && named).then(|| scope::siblings(&c.path, lang_name, &source, &tree, &s));
+    let callers = (o.callers && named).then(|| callers(&s, &c.path, o, hide));
+    Ok(Hit {
+        coord: c.clone(),
+        shown: (a, b),
+        span: (s.start_line, s.end_line),
+        lines: cut(a, b),
+        siblings,
+        callers,
+        only,
+        scope: Some(s),
+    })
 }
 
 /// One level of callers of `s`, from the calltree walk. It searches the current
 /// directory when the file sits under it, else the file's own directory.
-fn callers(s: &Scope, file: &str, o: &Options, hide: &files::HideOpts) -> String {
+fn callers(s: &Scope, file: &str, o: &Options, hide: &files::HideOpts) -> crate::calltree::CallTrees {
     let p = std::path::Path::new(file);
     let root = if p.is_relative() && !file.starts_with("..") {
         ".".to_string()
@@ -234,14 +293,7 @@ fn callers(s: &Scope, file: &str, o: &Options, hide: &files::HideOpts) -> String
     let jobs = files::resolve_jobs_lenient(&root, o.lang.as_deref(), o.no_ignore);
     let mut hider = files::Hider::new(hide);
     hider.add_jobs(&root, &jobs);
-    let (text, _) = crate::calltree::report_scoped(crate::calltree::Direction::Up, &s.name, &jobs, 1, &mut hider, None);
-    let header = format!("{}()\n", s.name);
-    let rest = text.strip_prefix(&header).unwrap_or(&text);
-    if rest.is_empty() {
-        "callers: none\n".to_string()
-    } else {
-        format!("callers:\n{}", rest)
-    }
+    crate::calltree::build(crate::calltree::Direction::Up, &[s.name.clone()], &jobs, 1, &mut hider)
 }
 
 #[cfg(test)]
@@ -427,5 +479,23 @@ mod tests {
         assert_eq!(window(1, 1, 20, 4), (1, 4));
         assert_eq!(window(20, 1, 20, 4), (17, 20));
         assert_eq!(window(5, 3, 6, 150), (3, 6));
+    }
+
+    #[test]
+    fn build_returns_the_scope_window_and_siblings_as_data() {
+        let f = "fixtures/scope/Asset.tsx";
+        let hits = build(&[at(f, 5), at("fixtures/scope/gone.tsx", 1)], &Options { siblings: true, budget: 2, ..Options::default() }, &files::HideOpts::default());
+        let h = hits[0].as_ref().expect("line 5 resolves");
+        let s = h.scope.as_ref().expect("held by a scope");
+        assert_eq!((s.name.as_str(), s.start_line, s.end_line), ("saveAssetNow", 4, 6));
+        assert_eq!((h.shown, h.span), ((4, 5), (4, 6)));
+        assert_eq!(h.lines, vec!["  const saveAssetNow = async () => {".to_string(), "    return props.asset".to_string()]);
+        let sibs: Vec<usize> = h.siblings.as_ref().expect("asked for").iter().map(|x| x.start_line).collect();
+        assert_eq!(sibs, vec![1, 3, 10]);
+        assert!(h.callers.is_none() && h.only.is_none());
+        assert!(hits[1].as_ref().unwrap_err().starts_with("no such file: fixtures/scope/gone.tsx"));
+        let r = render(&hits);
+        assert_eq!(r.code, 0);
+        assert!(r.out.ends_with("showing lines 4-5 of 4-6, --budget 3 for all\n"), "{}", r.out);
     }
 }
