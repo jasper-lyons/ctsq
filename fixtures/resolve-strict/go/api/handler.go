@@ -1,6 +1,10 @@
 package api
 
-import "example.com/app/store"
+import (
+	"net/http"
+
+	"example.com/app/store"
+)
 
 type Base struct {
 	db *store.Store
@@ -38,4 +42,15 @@ func (h *Handler) Footer() {
 func (h *Handler) Control() {
 	c := &Cache{}
 	c.List()
+	c.Set("k", "v")
+}
+
+// an outside receiver type: net/http.Header.Set, not Cache.Set
+func (h *Handler) Header(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/plain")
+}
+
+// a bare call with nothing of that name in the package or its imports
+func (h *Handler) Bare() {
+	Open()
 }

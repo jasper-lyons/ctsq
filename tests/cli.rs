@@ -1341,6 +1341,24 @@ fn max_depth_replaces_depth_and_path_max_points_at_the_new_name() {
 }
 
 #[test]
+fn a_call_with_no_target_reads_unresolved_in_callees_and_explain() {
+    // `w.Header().Set` has an outside receiver type; the project's Cache.Set
+    // is not its target
+    let dir = format!("{}/fixtures/resolve-strict/go", env!("CARGO_MANIFEST_DIR"));
+    let down = ctsq(&["callees", "Header", &dir, "--no-ignore"]);
+    assert!(down.status.success(), "{}", stderr(&down));
+    let t = stdout(&down);
+    assert!(t.contains("├── unresolved Header\n") && t.contains("└── unresolved Set\n"), "{}", t);
+    assert!(!t.contains("cache.go"), "{}", t);
+    let ex = ctsq(&["explain", "Header", &dir, "--no-ignore"]);
+    let t = stdout(&ex);
+    assert!(t.contains("handler.go:50  unresolved Set  w.Header().Set("), "{}", t);
+    // the unresolved `w.Header()` is listed as a caller of Handler.Header
+    // only through its name, so it is marked as a guess
+    assert!(t.contains("handler.go:50  Header()  [handler.go:49] ?  w.Header()"), "{}", t);
+}
+
+#[test]
 fn each_hidden_reason_gets_its_own_footer_line() {
     let out = ctsq(&["-q", "id#HiddenLimit", &fixture("hidden"), "--exclude", "limit.go", "--tests"]);
     assert!(out.status.success(), "{}", stderr(&out));

@@ -62,3 +62,9 @@ func (r *Repo[D]) Add(phone string) error {
 	log.Printf("%d", n)
 	return err
 }
+
+// The program builds a Repo over a SqliteDriver, so Driver.Exec has one
+// implementor.
+func NewRepo(db *sql.DB) *Repo[*SqliteDriver] {
+	return &Repo[*SqliteDriver]{driver: &SqliteDriver{db: db}}
+}

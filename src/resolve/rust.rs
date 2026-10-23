@@ -720,8 +720,9 @@ fn resolve_bare(name: &str, line: usize, depth: usize, ctx: &Ctx) -> Option<(usi
     if !glob_cands.is_empty() {
         return rank(glob_cands, false, ctx);
     }
-    // (e) ranked fallback over every def with this name
-    rank(name_candidates(ctx, name).collect(), false, ctx)
+    // nothing in scope by that name: unresolved, never a same-named def
+    // elsewhere in the project
+    None
 }
 
 fn resolve_method(
@@ -754,8 +755,9 @@ fn resolve_method(
         }
         Receiver::Opaque(_) => {}
     }
-    // fallback: any def with this name, methods preferred
-    one(rank(name_candidates(ctx, name).collect(), true, ctx))
+    // a receiver with no known type, or a type with no project method of
+    // this name: unresolved
+    vec![]
 }
 
 /// Methods on `ty`: trait dispatch expansion when `ty` is a trait with
@@ -1298,14 +1300,46 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_name_ranks_same_dir_and_marks_guess() {
+    fn bare_name_out_of_scope_is_unresolved() {
+        // no import brings `helper` into scope, so neither same-named
+        // function is a target
         let results = resolve_all(&[
             ("src/near.rs", "pub fn helper() {}\n"),
             ("other/far.rs", "pub fn helper() {}\n"),
             ("src/main.rs", "fn go() { helper(); }\n"),
         ]);
-        let (file, _, conf) = target_of(&results, "go", "helper").unwrap();
-        assert_eq!((file.as_str(), conf), ("src/near.rs", Confidence::Guess));
+        assert_eq!(target_of(&results, "go", "helper"), None);
+    }
+
+    /// `fixtures/resolve-strict/rust`: calls whose names match project
+    /// definitions the call cannot reach.
+    fn strict_fixture() -> Vec<(String, String, Option<(String, usize, Confidence)>)> {
+        resolve_all(&[
+            ("resolve-strict/rust/src/lib.rs", include_str!("../../fixtures/resolve-strict/rust/src/lib.rs")),
+            ("resolve-strict/rust/src/cache.rs", include_str!("../../fixtures/resolve-strict/rust/src/cache.rs")),
+            ("resolve-strict/rust/src/util.rs", include_str!("../../fixtures/resolve-strict/rust/src/util.rs")),
+        ])
+    }
+
+    const CACHE: &str = "resolve-strict/rust/src/cache.rs";
+
+    #[test]
+    fn outside_receiver_type_does_not_reach_a_project_method_by_name() {
+        let r = strict_fixture();
+        assert_eq!(target_of(&r, "outside", "insert"), None, "HashMap::insert must not reach Cache::insert");
+    }
+
+    #[test]
+    fn bare_call_with_no_import_has_no_target() {
+        let r = strict_fixture();
+        assert_eq!(target_of(&r, "bare", "helper"), None, "util::helper is not imported");
+    }
+
+    #[test]
+    fn typed_and_imported_calls_still_resolve() {
+        let r = strict_fixture();
+        assert_eq!(target_of(&r, "control", "insert"), Some((CACHE.into(), 4, Confidence::Exact)));
+        assert_eq!(target_of(&r, "imported", "make"), Some((CACHE.into(), 7, Confidence::Exact)));
     }
 
     #[test]

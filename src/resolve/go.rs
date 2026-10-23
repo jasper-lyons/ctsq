@@ -24,7 +24,7 @@ use super::{
     CallSite, Callee, Confidence, Def, DefId, DefIndex, DefKind, FileModel, Receiver, ResolvedCall,
     Resolver, Want,
 };
-use std::cell::{Cell, OnceCell};
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
 
@@ -148,14 +148,13 @@ impl Resolver for GoResolver {
         let mut sites = Vec::new();
         for fun in &scope.fns {
             let Some(&caller) = def_at.get(&fun.line) else { continue };
-            let ctx = Ctx { file, scope, fun, index, constructed, fields: &fields, fell_back: Cell::new(false) };
+            let ctx = Ctx { file, scope, fun, index, constructed, fields: &fields };
             let whole = want.is_none_or(|w| w.whole(fun.line));
             for call in &fun.calls {
                 if !whole && !wanted_site(&call.callee.callee, fun, want) {
                     continue;
                 }
                 let line = call.line;
-                ctx.fell_back.set(false);
                 // interface dispatch can yield several targets → one edge each
                 let targets: Vec<Option<(usize, Confidence)>> =
                     match resolve_callee(&call.callee, line, 0, &ctx) {
@@ -164,7 +163,7 @@ impl Resolver for GoResolver {
                     };
                 let display = call.callee.callee.name().to_string();
                 if debug {
-                    debug_line(index, caller, &display, file, line, &targets, ctx.fell_back.get());
+                    debug_line(index, caller, &display, file, line, &targets);
                 }
                 for target in targets {
                     out.push(ResolvedCall {
@@ -190,14 +189,13 @@ impl Resolver for GoResolver {
 /// target, saying how it resolved. Read by `plans/explore/edges.sh`.
 pub const DEBUG_ENV: &str = "CTSQ_RESOLVE_DEBUG";
 
-/// How a call target was found: through types and scope (`by-type`), by
-/// the ranked name-only fallback anywhere along the way (`by-name`), or not
-/// at all (`unresolved`).
-fn resolve_class(target: Option<(usize, Confidence)>, fell_back: bool) -> &'static str {
-    match (target, fell_back) {
-        (None, _) => "unresolved",
-        (Some(_), true) => "by-name",
-        (Some(_), false) => "by-type",
+/// How a call target was found: through types and scope (`by-type`), or not
+/// at all (`unresolved`). There is no name-only fallback, so the `by-name`
+/// class `plans/explore/edges.sh` still counts is always empty.
+fn resolve_class(target: Option<(usize, Confidence)>) -> &'static str {
+    match target {
+        None => "unresolved",
+        Some(_) => "by-type",
     }
 }
 
@@ -212,13 +210,12 @@ fn debug_line(
     file: &str,
     line: usize,
     targets: &[Option<(usize, Confidence)>],
-    fell_back: bool,
 ) {
     let id = |d: &Def| format!("{}:{}", crate::calltree::short_path(&d.id.file), d.id.line);
     let from = id(&index.defs[caller]);
     for &t in targets {
         let to = t.map(|(i, _)| id(&index.defs[i])).unwrap_or_else(|| display.to_string());
-        eprintln!("ctsq-resolve\t{}\t{}\t{}\t{}:{}\t{}", resolve_class(t, fell_back), from, to, file, line, display);
+        eprintln!("ctsq-resolve\t{}\t{}\t{}\t{}:{}\t{}", resolve_class(t), from, to, file, line, display);
     }
 }
 
@@ -271,6 +268,24 @@ fn collect_fields(spec: Node, source: &[u8], file: &str, out: &mut Vec<(String, 
     else { return };
     if body.kind() != "struct_type" { return; }
     let owner = text(name, source).to_string();
+    // Type parameters with a named constraint: a field of type `D` in
+    // `Repo[D Driver]` has the methods of `Driver`.
+    let mut tparams: HashMap<String, String> = HashMap::new();
+    if let Some(list) = spec.child_by_field_name("type_parameters") {
+        let mut c = list.walk();
+        for p in list.named_children(&mut c) {
+            let Some(con) = p.child_by_field_name("type") else { continue };
+            let con = text(con, source).trim();
+            if con.is_empty() || !con.chars().all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '.') {
+                continue;
+            }
+            let base = con.rsplit('.').next().unwrap_or(con).to_string();
+            let mut pc = p.walk();
+            for nm in p.children_by_field_name("name", &mut pc) {
+                tparams.insert(text(nm, source).to_string(), base.clone());
+            }
+        }
+    }
     let mut stack = vec![body];
     while let Some(n) = stack.pop() {
         if n.kind() != "field_declaration" {
@@ -279,6 +294,7 @@ fn collect_fields(spec: Node, source: &[u8], file: &str, out: &mut Vec<(String, 
             continue;
         }
         let Some(ty) = n.child_by_field_name("type").and_then(|t| type_name(t, source)) else { continue };
+        let ty = tparams.get(&ty).cloned().unwrap_or(ty);
         let mut c = n.walk();
         let names: Vec<String> = n.children_by_field_name("name", &mut c)
             .map(|x| text(x, source).to_string())
@@ -527,6 +543,8 @@ pub struct FileScope {
     /// `import . "path"` dot-import path segments.
     globs: Vec<Vec<String>>,
     fns: Vec<FnScope>,
+    /// Package-level `var x T` declarations in this file: name to base type.
+    vars: HashMap<String, String>,
 }
 
 impl FileScope {
@@ -546,7 +564,7 @@ impl FileScope {
 
 impl FileScope {
     fn build(root: Node, source: &[u8]) -> FileScope {
-        let mut s = FileScope { imports: HashMap::new(), globs: vec![], fns: vec![] };
+        let mut s = FileScope { imports: HashMap::new(), globs: vec![], fns: vec![], vars: HashMap::new() };
         let mut fn_stack = Vec::new();
         walk_scope(root, source, &mut s, &mut fn_stack);
         s
@@ -616,6 +634,12 @@ fn walk_scope(node: Node, source: &[u8], s: &mut FileScope, fn_stack: &mut Vec<u
             if let Some(&f) = fn_stack.last() {
                 for (var, b) in classify_var_spec(node, source) {
                     s.fns[f].bindings.push((node.start_position().row + 1, var, b));
+                }
+            } else {
+                for (var, b) in classify_var_spec(node, source) {
+                    if let Binding::Typed(t) = b {
+                        s.vars.insert(var, t);
+                    }
                 }
             }
             // fall through: the value expression may contain calls
@@ -877,12 +901,12 @@ struct Ctx<'a> {
     constructed: &'a HashSet<String>,
     /// Struct fields of the indexed files, built on first use.
     fields: &'a OnceCell<StructFields>,
-    /// Set when the ranked name-only fallback produced a target while
-    /// resolving the current call site, at any depth.
-    fell_back: Cell<bool>,
 }
 
-const MAX_BINDING_DEPTH: usize = 4;
+/// How many bindings and calls a receiver may be typed through. With no
+/// name-only fallback a receiver typed through `hs := newHarness()` then
+/// `ws := hs.H.Store.Workspace(id)` needs every link, so this is 6, not 4.
+const MAX_BINDING_DEPTH: usize = 6;
 
 /// Resolve a call site to its target definitions. Every path yields zero or
 /// one target except interface dispatch, which expands to one edge per
@@ -902,15 +926,6 @@ fn resolve_callee(callee: &GoCallee, line: usize, depth: usize, ctx: &Ctx) -> Ve
 
 fn one(hit: Option<(usize, Confidence)>) -> Vec<(usize, Confidence)> {
     hit.into_iter().collect()
-}
-
-/// The ranked name-only fallback, noting in `ctx` when it produced a target.
-fn fallback(cands: Vec<usize>, prefer_methods: bool, ctx: &Ctx) -> Option<(usize, Confidence)> {
-    let hit = rank(cands, prefer_methods, ctx);
-    if hit.is_some() {
-        ctx.fell_back.set(true);
-    }
-    hit
 }
 
 fn resolve_bare(name: &str, line: usize, depth: usize, ctx: &Ctx) -> Option<(usize, Confidence)> {
@@ -958,8 +973,9 @@ fn resolve_bare(name: &str, line: usize, depth: usize, ctx: &Ctx) -> Option<(usi
     if !glob_cands.is_empty() {
         return rank(glob_cands, false, ctx);
     }
-    // (e) ranked fallback over every def with this name
-    fallback(name_candidates(ctx, name).collect(), false, ctx)
+    // nothing in scope by that name: unresolved, never a same-named def
+    // elsewhere in the project
+    None
 }
 
 fn resolve_method(
@@ -999,28 +1015,26 @@ fn resolve_method(
         }
         Receiver::SelfRecv => {}
     }
-    // fallback: any def with this name, methods preferred
-    one(fallback(name_candidates(ctx, name).collect(), true, ctx))
+    // a receiver with no known type, or a type with no project method of
+    // this name (an outside type, a promoted method): unresolved
+    vec![]
 }
 
 /// Base type of a receiver chain at `line`: a variable through `var_type`, a
 /// field through the struct declarations in the index, a call through its
-/// target's return type. None when any link is unknown, and for a call
-/// whose target was only found by name.
+/// target's return type. None when any link is unknown.
 fn chain_type(c: &Chain, line: usize, depth: usize, ctx: &Ctx) -> Option<String> {
     if depth > MAX_BINDING_DEPTH { return None; }
     match c {
         Chain::Name(v) => var_type(v, line, depth, ctx),
+        // a field link is finite syntax, so it does not spend binding depth
         Chain::Field(base, field) => {
-            let ty = chain_type(base, line, depth + 1, ctx)?;
+            let ty = chain_type(base, line, depth, ctx)?;
             ctx.index.ask(&ty);
             ctx.fields.get_or_init(|| StructFields::of(ctx.index)).lookup(&ty, field, ctx.file, 0)
         }
         Chain::Call(callee) => {
-            let outer = ctx.fell_back.replace(false);
             let hit = resolve_callee(callee, line, depth + 1, ctx).first().copied();
-            let guessed = ctx.fell_back.replace(outer);
-            if guessed { return None; }
             ctx.index.defs[hit?.0].ret.clone()
         }
         Chain::Type(t) => Some(t.clone()),
@@ -1146,7 +1160,7 @@ fn last_binding<'a>(fun: &'a FnScope, var: &str, line: usize) -> Option<&'a Bind
 
 /// Type of `var` at `line`: last typed binding — for `x := f()` the resolved
 /// callee's return type, else the `NewT` convention — else receiver or
-/// parameter type.
+/// parameter type, else a package-level `var x T` in the same file.
 fn var_type(var: &str, line: usize, depth: usize, ctx: &Ctx) -> Option<String> {
     match last_binding(ctx.fun, var, line) {
         Some(Binding::Typed(t)) => return Some(t.clone()),
@@ -1161,6 +1175,7 @@ fn var_type(var: &str, line: usize, depth: usize, ctx: &Ctx) -> Option<String> {
         Some(Binding::FnValue(_)) | Some(Binding::Closure) | Some(Binding::Unknown) | None => {}
     }
     ctx.fun.params.iter().find(|(v, _)| v == var).map(|(_, t)| t.clone())
+        .or_else(|| ctx.scope.vars.get(var).cloned())
 }
 
 // ── Public helpers for the attribute and flow stages ──────────────────────────
@@ -1169,7 +1184,7 @@ fn var_type(var: &str, line: usize, depth: usize, ctx: &Ctx) -> Option<String> {
 /// keyed `slog`, `l "log"` is keyed `l`. Dot and blank imports bind no name
 /// and are left out. `root` is the file's root node.
 pub fn go_imports(root: Node, src: &[u8]) -> HashMap<String, String> {
-    let mut s = FileScope { imports: HashMap::new(), globs: vec![], fns: vec![] };
+    let mut s = FileScope { imports: HashMap::new(), globs: vec![], fns: vec![], vars: HashMap::new() };
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
         if child.kind() == "import_declaration" {
@@ -1232,7 +1247,7 @@ pub fn binding_type(
     let fun = scope.fns.iter().filter(|f| f.line <= line).max_by_key(|f| f.line)?;
     let constructed = HashSet::new();
     let fields = OnceCell::new();
-    let ctx = Ctx { file, scope: &scope, fun, index, constructed: &constructed, fields: &fields, fell_back: Cell::new(false) };
+    let ctx = Ctx { file, scope: &scope, fun, index, constructed: &constructed, fields: &fields };
     var_type(var, line, 0, &ctx)
 }
 
@@ -1975,14 +1990,14 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_name_ranks_same_dir_and_marks_guess() {
+    fn method_on_an_untyped_receiver_is_unresolved() {
+        // `x` has no type, so neither same-named function is a target
         let results = resolve_all(&[
             ("a/near.go", "package a\nfunc Helper() {}\n"),
             ("far/far.go", "package far\nfunc Helper() {}\n"),
             ("a/main.go", "package a\nfunc Go() { x.Helper() }\n"),
         ]);
-        let (file, _, conf) = target_of(&results, "Go", "Helper").unwrap();
-        assert_eq!((file.as_str(), conf), ("a/near.go", Confidence::Guess));
+        assert_eq!(target_of(&results, "Go", "Helper"), None);
     }
 
     #[test]
@@ -2126,13 +2141,64 @@ mod tests {
     }
 
     #[test]
-    fn call_result_found_only_by_name_types_nothing() {
+    fn call_result_of_an_outside_call_types_nothing() {
         // `lib.Get()` is outside the project, so its result types nothing
-        // and `.Close()` keeps the name fallback, which A2b removes.
+        // and `.Close()` stays unresolved rather than reaching `R.Close`.
         let results = resolve_all(&[
             ("a/a.go", "package a\nimport \"ext/lib\"\ntype R struct{}\nfunc (r *R) Close() {}\nfunc Go() { lib.Get().Close() }\n"),
         ]);
-        assert_eq!(target_of(&results, "Go", "Close").map(|t| t.1), Some(4));
+        assert_eq!(all_targets(&results, "Go", "Close"), vec![None]);
+    }
+
+    #[test]
+    fn outside_receiver_type_does_not_reach_a_project_method_by_name() {
+        let r = strict_fixture();
+        assert_eq!(all_targets(&r, "Header", "Set"), vec![None], "w.Header().Set must not reach Cache.Set");
+        assert_eq!(all_targets(&r, "Header", "Header"), vec![None]);
+        // positive control: the same name on a typed receiver
+        assert_eq!(target_of(&r, "Control", "Set"), Some((CACHE.into(), 14, Confidence::Exact)));
+    }
+
+    #[test]
+    fn bare_call_out_of_scope_has_no_target() {
+        let r = strict_fixture();
+        assert_eq!(all_targets(&r, "Bare", "Open"), vec![None], "store.Open is not in scope in package api");
+    }
+
+    #[test]
+    fn package_level_typed_var_types_its_receiver() {
+        let results = resolve_all(&[
+            ("a/a.go", "package a\ntype T struct{}\nfunc (t *T) Run() {}\nvar global *T\nfunc Go() { global.Run() }\n"),
+        ]);
+        assert_eq!(target_of(&results, "Go", "Run"), Some(("a/a.go".into(), 3, Confidence::Exact)));
+    }
+
+    #[test]
+    fn generic_field_takes_its_constraint_type() {
+        let results = resolve_all(&[(
+            "a/a.go",
+            "package a\ntype Driver interface{ Exec() }\ntype S struct{}\nfunc (s *S) Exec() {}\n\
+             type Repo[D Driver] struct{ d D }\nfunc (r *Repo[D]) Add() { r.d.Exec() }\nfunc New() { _ = &S{} }\n",
+        )]);
+        assert_eq!(target_of(&results, "Add", "Exec"), Some(("a/a.go".into(), 4, Confidence::Exact)));
+    }
+
+    #[test]
+    fn receiver_typed_through_a_binding_a_field_chain_and_a_call() {
+        let results = resolve_all(&[
+            ("s/s.go", "package s\ntype Store struct{}\ntype WS struct{}\nfunc (s *Store) Workspace(id string) *WS { return nil }\nfunc (w *WS) GetEvent() {}\n"),
+            ("a/a.go", "package a\nimport \"x/s\"\ntype Handler struct{ Store *s.Store }\ntype harness struct{ H *Handler }\n\
+              func newHarness() *harness { return nil }\nfunc Go() {\n  hs := newHarness()\n  ws := hs.H.Store.Workspace(\"id\")\n  ws.GetEvent()\n}\n"),
+        ]);
+        assert_eq!(target_of(&results, "Go", "GetEvent"), Some(("s/s.go".into(), 5, Confidence::Exact)));
+    }
+
+    #[test]
+    fn untyped_receiver_has_no_target() {
+        let results = resolve_all(&[
+            ("a/a.go", "package a\ntype T struct{}\nfunc (t *T) Run() {}\nvar global = load()\nfunc Go() { global.Run() }\n"),
+        ]);
+        assert_eq!(all_targets(&results, "Go", "Run"), vec![None]);
     }
 
     #[test]

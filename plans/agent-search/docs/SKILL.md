@@ -109,7 +109,7 @@ count_items()
 ├── report()  [tree.rs:19]
 ...
 └── count_items()  [tree.rs:120] (cycle)
-11 callers
+8 callers
 hidden: 12 in tests (--tests)
 ```
 

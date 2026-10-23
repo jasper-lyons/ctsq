@@ -326,9 +326,10 @@ impl Walk<'_> {
                         visited.remove(&tk);
                     }
                 }
+                // no target: the branch stops at the call
                 None => {
                     if print {
-                        self.out.push_str(&format!("{}{}{}()\n", prefix, connector, rc.callee_display));
+                        self.out.push_str(&format!("{}{}unresolved {}\n", prefix, connector, rc.callee_display));
                         self.scope_rows(e, &child_prefix);
                     }
                 }
@@ -510,9 +511,9 @@ mod tests {
     }
 
     #[test]
-    fn test_callgraph_marks_cross_file_ambiguity_as_guess() {
-        // helper only defined in two *other* files — best-ranked candidate
-        // wins but the edge is marked as a guess.
+    fn test_callgraph_leaves_an_out_of_scope_bare_call_unresolved() {
+        // helper only defined in two *other* files that caller_c does not
+        // import: no name-only fallback picks either, the edge stays bare.
         let src_a = "fn helper() {}\n";
         let src_b = "fn helper() {}\n";
         let src_c = "fn caller_c() { helper(); }\n";
@@ -530,14 +531,14 @@ mod tests {
         let p = pairs(&jobs);
         let edge = p.iter().find(|(from, _, _)| from.starts_with("ctsq_test_guess_c.rs"));
         let (_, to, guess) = edge.expect("caller_c should have an edge");
-        assert!(to.contains(":1"), "should resolve to one of the candidates, got: {}", to);
-        assert!(guess, "cross-file ambiguous resolution must be marked as a guess");
+        assert_eq!(to, "helper", "an out-of-scope call has no target");
+        assert!(!guess);
     }
 
     #[test]
     fn test_fallback_lang_keeps_name_matching_behavior() {
         // JavaScript goes through the fallback resolver: unique names resolve
-        // exactly, ambiguous names stay bare, nothing is marked as a guess.
+        // as guesses, ambiguous names stay bare.
         let src_a = "function shared() {}\nfunction unique_js() {}\nfunction caller_a() { shared(); unique_js(); }\n";
         let src_b = "function shared() {}\n";
 
@@ -554,10 +555,11 @@ mod tests {
         for (_, to, guess) in &from_caller {
             if to.contains("unique_js") || to.ends_with(":2") {
                 assert!(to.contains(":2"), "unique callee resolves to file:line, got: {}", to);
+                assert!(guess, "a unique-name match is still a guess");
             } else {
                 assert_eq!(to, "shared", "ambiguous callee must remain a bare name, got: {}", to);
+                assert!(!guess);
             }
-            assert!(!guess, "fallback resolver never guesses");
         }
     }
 }

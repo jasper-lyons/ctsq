@@ -312,7 +312,8 @@ fn body(
 
     // Names the resolver could not pin to one definition sit in the graph
     // under their bare name, so callers of an ambiguous symbol are still
-    // reachable. Only used when the definition-keyed lookup found nothing.
+    // reachable, each marked `?`. Only used when the definition-keyed
+    // lookup found nothing.
     let mut caller_keys = keys.clone();
     caller_keys.push(NodeKey::External(bare_name(symbol).to_string()));
 
@@ -556,7 +557,12 @@ fn walk(
     for &e in edges {
         let rc = &g.calls[e];
         let caller = &g.index.defs[rc.caller];
-        let guess = matches!(rc.target, Some((_, Confidence::Guess)));
+        // A caller found through the bare-name node matched only by name,
+        // so it is a guess too.
+        let guess = match dir {
+            Direction::Up => !matches!(rc.target, Some((_, Confidence::Exact))),
+            Direction::Down => matches!(rc.target, Some((_, Confidence::Guess))),
+        };
         match dir {
             Direction::Up => rows.push((
                 caller.id.file.clone(),
@@ -586,22 +592,22 @@ fn walk(
 
     for (site_file, site_line, name, loc, guess, next) in rows {
         ctx.listed.insert((site_file.clone(), site_line));
-        let where_defined = match &loc {
+        // a call with no target reads `unresolved NAME`, with no location
+        let callee = match &loc {
             Some((f, l)) => {
                 ctx.listed.insert((f.clone(), *l));
-                format!("[{}:{}]", short_path(f), l)
+                format!("{}()  [{}:{}]", name, short_path(f), l)
             }
-            None => "[external]".to_string(),
+            None => format!("unresolved {}", name),
         };
         let cycle = next.as_ref().map_or(false, |k| visited.contains(k));
         let text = ctx.lines.text(&site_file, site_line);
         out.push_str(&format!(
-            "{}{}:{}  {}()  {}{}{}  {}\n",
+            "{}{}:{}  {}{}{}  {}\n",
             "  ".repeat(indent),
             site_file,
             site_line,
-            name,
-            where_defined,
+            callee,
             if guess { " ?" } else { "" },
             if cycle { " (cycle)" } else { "" },
             text

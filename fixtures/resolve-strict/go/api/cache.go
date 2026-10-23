@@ -10,3 +10,5 @@ func (c *Cache) List() []string { return nil }
 func (c *Cache) Close() {}
 
 func (c *Cache) write(s string) {}
+
+func (c *Cache) Set(k, v string) {}

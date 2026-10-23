@@ -1,8 +1,8 @@
 //! Name-matching fallback resolver for languages without a dedicated
 //! resolver. Preserves the original calltree behavior: call sites are
 //! extracted with the abstract query engine and matched to definitions by
-//! bare name; only a project-wide unique name resolves, everything else
-//! stays external.
+//! bare name; only a project-wide unique name resolves, as a guess (`?`),
+//! everything else stays external.
 
 use super::{Confidence, Def, DefId, DefIndex, DefKind, FileModel, Resolver, ResolvedCall};
 use crate::compiler::{self, lang};
@@ -54,8 +54,9 @@ impl Resolver for NameResolver {
                 if !whole && !want.is_some_and(|w| w.names.contains(callee)) {
                     continue;
                 }
+                // A unique name is still only a name match, so a guess.
                 let target = match index.named(callee) {
-                    [single] => Some((*single, Confidence::Exact)),
+                    [single] => Some((*single, Confidence::Guess)),
                     _ => None,
                 };
                 out.push(ResolvedCall { caller, callee_display: callee.clone(), line: *line, target });
