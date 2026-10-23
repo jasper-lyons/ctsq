@@ -36,6 +36,32 @@ pub struct RawImport {
     /// `use std::collections::HashMap as Map`. Empty when nothing is bound
     /// or the language does not report bindings (C, C++, Ruby, Go).
     pub bindings: Vec<String>,
+    /// JS/TS only: each binding with the name it has in the target file and
+    /// how it was imported. Empty for other languages and for side-effect imports.
+    #[allow(dead_code)] // wired by B3
+    pub import_bindings: Vec<ImportBinding>,
+}
+
+/// How a JS/TS import names what it takes from the target module.
+#[allow(dead_code)] // wired by B3
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingKind {
+    /// `import {a}`, `import {a as b}`, `const {a} = require(m)`.
+    Named,
+    /// `import a from m`, `import {default as a} from m`.
+    Default,
+    /// `import * as ns from m`, `const ns = require(m)`.
+    Namespace,
+}
+
+/// One local name bound by a JS/TS import: `imported` is the name in the
+/// target module (`"default"` for a default import, `"*"` for a namespace).
+#[allow(dead_code)] // wired by B3
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportBinding {
+    pub local: String,
+    pub imported: String,
+    pub kind: BindingKind,
 }
 
 impl RawImport {
@@ -43,8 +69,10 @@ impl RawImport {
         RawImport {
             specifier: specifier.into(), kind, dots: 0, line,
             ext_label: None, drop_if_unresolved: false, bindings: Vec::new(),
+            import_bindings: Vec::new(),
         }
     }
+    fn bind_detail(mut self, b: Vec<ImportBinding>) -> Self { self.import_bindings = b; self }
     fn with_dots(mut self, d: usize) -> Self { self.dots = d; self }
     fn dropping(mut self) -> Self { self.drop_if_unresolved = true; self }
     fn ext(mut self, label: impl Into<String>) -> Self { self.ext_label = Some(label.into()); self }
@@ -455,9 +483,9 @@ impl ImportResolver for JsTsImports {
     fn imports(&self, source: &[u8]) -> Vec<RawImport> {
         let Some(tree) = self.parse(source) else { return vec![] };
         let mut out = Vec::new();
-        let mut push = |spec: String, line: usize, bindings: Vec<String>| {
+        let mut push = |spec: String, line: usize, bindings: Vec<String>, detail: Vec<ImportBinding>| {
             let kind = classify_js(&spec);
-            out.push(RawImport::new(spec, kind, line).bind(bindings));
+            out.push(RawImport::new(spec, kind, line).bind(bindings).bind_detail(detail));
         };
         walk(tree.root_node(), &mut |n| {
             let line = n.start_position().row + 1;
@@ -465,7 +493,8 @@ impl ImportResolver for JsTsImports {
                 // static import / re-export (`export ... from`)
                 "import_statement" | "export_statement" => {
                     if let Some(src) = n.child_by_field_name("source") {
-                        push(unquote(text(src, source)), line, js_import_bindings(n, source));
+                        push(unquote(text(src, source)), line, js_import_bindings(n, source),
+                            js_import_detail(n, source));
                     }
                 }
                 // require(...) and dynamic import(...)
@@ -480,7 +509,8 @@ impl ImportResolver for JsTsImports {
                     let mut cur = args.walk();
                     for arg in args.children(&mut cur) {
                         if arg.kind() == "string" {
-                            push(unquote(text(arg, source)), line, js_require_bindings(n, source));
+                            push(unquote(text(arg, source)), line, js_require_bindings(n, source),
+                                js_require_detail(n, source));
                             break;
                         }
                     }
@@ -582,6 +612,272 @@ fn js_require_bindings(call: Node, source: &[u8]) -> Vec<String> {
         _ => {}
     }
     out
+}
+
+/// Parse JS/TS source with the grammar for `lang` ("javascript", "typescript", "tsx").
+#[allow(dead_code)] // wired by B3
+pub fn js_parse(lang: &'static str, source: &[u8]) -> Option<tree_sitter::Tree> {
+    JsTsImports { lang }.parse(source)
+}
+
+/// Like `js_import_bindings`, but keeps the imported name and the kind.
+fn js_import_detail(stmt: Node, source: &[u8]) -> Vec<ImportBinding> {
+    let mut out = Vec::new();
+    let mut cur = stmt.walk();
+    for clause in stmt.named_children(&mut cur) {
+        if clause.kind() != "import_clause" { continue; }
+        let mut c = clause.walk();
+        for part in clause.named_children(&mut c) {
+            match part.kind() {
+                "identifier" => out.push(ImportBinding {
+                    local: text(part, source).to_string(),
+                    imported: "default".to_string(),
+                    kind: BindingKind::Default,
+                }),
+                "namespace_import" => {
+                    let mut pc = part.walk();
+                    if let Some(id) = part.named_children(&mut pc).find(|x| x.kind() == "identifier") {
+                        out.push(ImportBinding {
+                            local: text(id, source).to_string(),
+                            imported: "*".to_string(),
+                            kind: BindingKind::Namespace,
+                        });
+                    }
+                }
+                "named_imports" => {
+                    let mut pc = part.walk();
+                    for spec in part.named_children(&mut pc) {
+                        if spec.kind() != "import_specifier" { continue; }
+                        let Some(name) = spec.child_by_field_name("name") else { continue };
+                        let imported = unquote(text(name, source));
+                        let local = spec.child_by_field_name("alias")
+                            .map(|a| unquote(text(a, source)))
+                            .unwrap_or_else(|| imported.clone());
+                        let kind = if imported == "default" { BindingKind::Default } else { BindingKind::Named };
+                        out.push(ImportBinding { local, imported, kind });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// Like `js_require_bindings`, but keeps the imported name and the kind:
+/// `const x = require(m)` is a namespace, `const {a, b: c} = require(m)` is named.
+fn js_require_detail(call: Node, source: &[u8]) -> Vec<ImportBinding> {
+    let mut node = call;
+    if let Some(p) = node.parent().filter(|p| p.kind() == "await_expression") {
+        node = p;
+    }
+    let Some(decl) = node.parent().filter(|p| p.kind() == "variable_declarator") else {
+        return vec![];
+    };
+    let Some(name) = decl.child_by_field_name("name") else { return vec![] };
+    let mut out = Vec::new();
+    match name.kind() {
+        "identifier" => out.push(ImportBinding {
+            local: text(name, source).to_string(),
+            imported: "*".to_string(),
+            kind: BindingKind::Namespace,
+        }),
+        "object_pattern" => {
+            let mut c = name.walk();
+            for prop in name.named_children(&mut c) {
+                match prop.kind() {
+                    "shorthand_property_identifier_pattern" => {
+                        let n = text(prop, source).to_string();
+                        out.push(ImportBinding { local: n.clone(), imported: n, kind: BindingKind::Named });
+                    }
+                    "pair_pattern" => {
+                        let key = prop.child_by_field_name("key");
+                        let val = prop.child_by_field_name("value").filter(|v| v.kind() == "identifier");
+                        if let (Some(k), Some(v)) = (key, val) {
+                            out.push(ImportBinding {
+                                local: text(v, source).to_string(),
+                                imported: unquote(text(k, source)),
+                                kind: BindingKind::Named,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// One `export ... from S` clause. `exported`/`imported` are both None for
+/// `export * from S`.
+#[allow(dead_code)] // wired by B3
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReExport {
+    pub specifier: String,
+    /// The name this file exposes (`y` in `export {x as y} from S`).
+    pub exported: Option<String>,
+    /// The name taken from S (`x`; `"default"` for `export {default as X}`).
+    pub imported: Option<String>,
+}
+
+/// What one JS/TS file exports.
+#[allow(dead_code)] // wired by B3
+#[derive(Debug, Clone, Default)]
+pub struct ExportTable {
+    /// Exported name -> the local name that defines it in this file.
+    pub named: HashMap<String, String>,
+    /// True when the file has a default export, named or not.
+    pub has_default: bool,
+    /// The default export's local name; None when anonymous.
+    pub default_local: Option<String>,
+    pub reexports: Vec<ReExport>,
+}
+
+fn js_default_name(node: Node, source: &[u8]) -> Option<String> {
+    if node.kind() == "identifier" {
+        return Some(text(node, source).to_string());
+    }
+    node.child_by_field_name("name").map(|n| text(n, source).to_string())
+}
+
+fn js_decl_names(decl: Node, source: &[u8]) -> Vec<String> {
+    match decl.kind() {
+        "lexical_declaration" | "variable_declaration" => {
+            let mut c = decl.walk();
+            decl.named_children(&mut c)
+                .filter(|d| d.kind() == "variable_declarator")
+                .filter_map(|d| d.child_by_field_name("name"))
+                .filter(|n| n.kind() == "identifier")
+                .map(|n| text(n, source).to_string())
+                .collect()
+        }
+        _ => decl.child_by_field_name("name")
+            .map(|n| vec![text(n, source).to_string()])
+            .unwrap_or_default(),
+    }
+}
+
+/// The export table of one parsed JS/TS file. Only top-level
+/// `export` statements count.
+#[allow(dead_code)] // wired by B3
+pub fn js_exports(tree: &tree_sitter::Tree, source: &[u8]) -> ExportTable {
+    let mut t = ExportTable::default();
+    let root = tree.root_node();
+    let mut cur = root.walk();
+    for st in root.named_children(&mut cur) {
+        if st.kind() != "export_statement" { continue; }
+        let from = st.child_by_field_name("source").map(|s| unquote(text(s, source)));
+        let is_default = {
+            let mut c = st.walk();
+            st.children(&mut c).any(|x| x.kind() == "default")
+        };
+        let (clause, ns_export) = {
+            let mut c = st.walk();
+            let kids: Vec<Node> = st.named_children(&mut c).collect();
+            (
+                kids.iter().find(|k| k.kind() == "export_clause").copied(),
+                kids.iter().any(|k| k.kind() == "namespace_export"),
+            )
+        };
+        if let Some(clause) = clause {
+            let mut c = clause.walk();
+            for spec in clause.named_children(&mut c) {
+                if spec.kind() != "export_specifier" { continue; }
+                let Some(name) = spec.child_by_field_name("name") else { continue };
+                let name = unquote(text(name, source));
+                let exported = spec.child_by_field_name("alias")
+                    .map(|a| unquote(text(a, source)))
+                    .unwrap_or_else(|| name.clone());
+                match &from {
+                    Some(s) => t.reexports.push(ReExport {
+                        specifier: s.clone(), exported: Some(exported), imported: Some(name),
+                    }),
+                    None => {
+                        if exported == "default" {
+                            t.has_default = true;
+                            t.default_local = Some(name.clone());
+                        }
+                        t.named.insert(exported, name);
+                    }
+                }
+            }
+        } else if let Some(s) = &from {
+            // `export * from S`; `export * as ns from S` names a namespace, not a symbol.
+            if !ns_export {
+                t.reexports.push(ReExport { specifier: s.clone(), exported: None, imported: None });
+            }
+        } else if let Some(decl) = st.child_by_field_name("declaration") {
+            if is_default {
+                t.has_default = true;
+                t.default_local = js_default_name(decl, source);
+            } else {
+                for n in js_decl_names(decl, source) { t.named.insert(n.clone(), n); }
+            }
+        } else if is_default {
+            t.has_default = true;
+            t.default_local = st.child_by_field_name("value").and_then(|v| js_default_name(v, source));
+        }
+    }
+    t
+}
+
+/// The file and local name that define export `name` of `file`, following
+/// re-exports through `r`. `file` and every path `table_of` is asked about are
+/// display paths as `JsSpecResolver::resolve` returns them. `"default"` asks
+/// for the default export; an anonymous default comes back as `(file,
+/// "default")`. A re-export whose specifier names more than one file ends that
+/// branch with no answer. At most 8 files deep, cycles end the branch.
+#[allow(dead_code)] // wired by B3
+pub fn resolve_export<'t>(
+    r: &JsSpecResolver,
+    table_of: impl Fn(&str) -> Option<&'t ExportTable>,
+    file: &str,
+    name: &str,
+) -> Option<(String, String)> {
+    let mut visited = HashSet::new();
+    export_walk(r, &table_of, file, name, 1, &mut visited)
+}
+
+fn export_walk<'t>(
+    r: &JsSpecResolver,
+    table_of: &impl Fn(&str) -> Option<&'t ExportTable>,
+    file: &str,
+    name: &str,
+    depth: usize,
+    visited: &mut HashSet<(String, String)>,
+) -> Option<(String, String)> {
+    if depth > 8 { return None; }
+    if !visited.insert((file.to_string(), name.to_string())) { return None; }
+    let table = table_of(file)?;
+    let follow = |spec: &str, wanted: &str, visited: &mut HashSet<(String, String)>| {
+        let mut hits = r.resolve(file, spec);
+        if hits.len() != 1 { return None; }
+        export_walk(r, table_of, &hits.remove(0), wanted, depth + 1, visited)
+    };
+    if name == "default" {
+        if table.has_default {
+            let local = table.default_local.clone().unwrap_or_else(|| "default".to_string());
+            return Some((file.to_string(), local));
+        }
+    } else if let Some(local) = table.named.get(name) {
+        return Some((file.to_string(), local.clone()));
+    }
+    for re in &table.reexports {
+        if re.exported.as_deref() == Some(name) {
+            if let Some(hit) = follow(&re.specifier, re.imported.as_deref().unwrap_or(name), visited) {
+                return Some(hit);
+            }
+        }
+    }
+    // `export *` never carries the default export.
+    if name != "default" {
+        for re in table.reexports.iter().filter(|re| re.exported.is_none()) {
+            if let Some(hit) = follow(&re.specifier, name, visited) { return Some(hit); }
+        }
+    }
+    None
 }
 
 /// Strip a leading alias sigil (`~`, `@`) and resolve the remaining path tail by
@@ -1261,6 +1557,144 @@ mod tests {
             b("std::collections::HashMap", &["HashMap"]), b("std::fmt::self", &["fmt"]),
             b("std::fmt::Write", &["W"]), b("crate::a", &[]),
         ]);
+    }
+
+    // ── import bindings and export tables over fixtures/ts-resolve/imports ──
+
+    fn fx_dir() -> String {
+        format!("{}/fixtures/ts-resolve/imports", env!("CARGO_MANIFEST_DIR"))
+    }
+    fn fx(rel: &str) -> String { format!("{}/{}", fx_dir(), rel) }
+
+    fn fx_files(dir: &Path, out: &mut Vec<String>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() { fx_files(&p, out); }
+            else if p.extension().map(|x| x == "ts").unwrap_or(false) {
+                out.push(p.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    fn fx_setup() -> (JsSpecResolver, HashMap<String, ExportTable>) {
+        let mut files = Vec::new();
+        fx_files(Path::new(&fx_dir()), &mut files);
+        files.sort();
+        let jobs: Vec<(String, &'static str)> = files.iter().map(|f| (f.clone(), "typescript")).collect();
+        let mut tables = HashMap::new();
+        for f in &files {
+            let src = std::fs::read(f).unwrap();
+            let tree = js_parse("typescript", &src).unwrap();
+            tables.insert(f.clone(), js_exports(&tree, &src));
+        }
+        (JsSpecResolver::new(&jobs), tables)
+    }
+
+    fn export_of(rel_file: &str, name: &str) -> Option<(String, String)> {
+        let (r, tables) = fx_setup();
+        resolve_export(&r, |f| tables.get(f), &fx(rel_file), name)
+            .map(|(f, l)| (f.strip_prefix(&format!("{}/", fx_dir())).unwrap().to_string(), l))
+    }
+
+    fn some(f: &str, l: &str) -> Option<(String, String)> { Some((f.to_string(), l.to_string())) }
+
+    fn detail_of(rel: &str) -> Vec<(String, Vec<(String, String, BindingKind)>)> {
+        let src = std::fs::read(fx(rel)).unwrap();
+        import_resolver_for("typescript").imports(&src).into_iter()
+            .map(|r| (r.specifier, r.import_bindings.into_iter()
+                .map(|b| (b.local, b.imported, b.kind)).collect()))
+            .collect()
+    }
+
+    fn ib(l: &str, i: &str, k: BindingKind) -> (String, String, BindingKind) {
+        (l.to_string(), i.to_string(), k)
+    }
+
+    #[test]
+    fn import_detail_named_aliased_default_namespace() {
+        let got = detail_of("src/main.ts");
+        assert_eq!(got[0], ("./api".to_string(), vec![ib("listAssets", "listAssets", BindingKind::Named)]));
+        assert_eq!(got[1], ("~/api".to_string(), vec![ib("o", "orig", BindingKind::Named)]));
+        assert_eq!(got[2], ("./widget".to_string(), vec![ib("Widget", "default", BindingKind::Default)]));
+        assert_eq!(got[3], ("./barrel1".to_string(), vec![ib("deep", "*", BindingKind::Namespace)]));
+        assert_eq!(got[4], ("side".to_string(), vec![]));
+    }
+
+    #[test]
+    fn import_detail_require_namespace_and_destructure() {
+        let got = detail_of("src/main.ts");
+        assert_eq!(got[5], ("./api".to_string(), vec![ib("whole", "*", BindingKind::Namespace)]));
+        assert_eq!(got[6], ("./api".to_string(), vec![
+            ib("la", "listAssets", BindingKind::Named), ib("orig", "orig", BindingKind::Named)]));
+    }
+
+    #[test]
+    fn export_table_reads_every_form() {
+        let (_, tables) = fx_setup();
+        let api = &tables[&fx("src/api.ts")];
+        assert_eq!(api.named.get("listAssets").map(|s| s.as_str()), Some("listAssets"));
+        assert_eq!(api.named.get("k2").map(|s| s.as_str()), Some("k2"));
+        assert_eq!(api.named.get("Thing").map(|s| s.as_str()), Some("Thing"));
+        assert_eq!(api.named.get("k1alias").map(|s| s.as_str()), Some("k1"));
+        assert!(!api.has_default);
+        let w = &tables[&fx("src/widget.ts")];
+        assert!(w.has_default);
+        assert_eq!(w.default_local.as_deref(), Some("Widget"));
+        let a = &tables[&fx("src/anon.ts")];
+        assert!(a.has_default);
+        assert_eq!(a.default_local, None);
+        let b = &tables[&fx("src/barrel1.ts")];
+        assert_eq!(b.reexports, vec![ReExport {
+            specifier: "./barrel2".into(), exported: None, imported: None }]);
+    }
+
+    #[test]
+    fn resolve_export_named_and_aliased() {
+        assert_eq!(export_of("src/api.ts", "listAssets"), some("src/api.ts", "listAssets"));
+        assert_eq!(export_of("src/api.ts", "k1alias"), some("src/api.ts", "k1"));
+        assert_eq!(export_of("src/api.ts", "missing"), None);
+    }
+
+    #[test]
+    fn resolve_export_default() {
+        assert_eq!(export_of("src/widget.ts", "default"), some("src/widget.ts", "Widget"));
+    }
+
+    #[test]
+    fn resolve_export_star_through_two_barrels() {
+        assert_eq!(export_of("src/barrel1.ts", "deepFn"), some("src/deep.ts", "deepFn"));
+        assert_eq!(export_of("src/barrel1.ts", "default"), None);
+    }
+
+    #[test]
+    fn resolve_export_renamed_reexport() {
+        assert_eq!(export_of("src/renamed.ts", "shiny"), some("src/api.ts", "orig"));
+        assert_eq!(export_of("src/renamed.ts", "orig"), None);
+    }
+
+    #[test]
+    fn resolve_export_default_as_named_reexport() {
+        assert_eq!(export_of("src/defas.ts", "Gadget"), some("src/widget.ts", "Widget"));
+    }
+
+    #[test]
+    fn resolve_export_anonymous_default() {
+        assert_eq!(export_of("src/anon.ts", "default"), some("src/anon.ts", "default"));
+    }
+
+    #[test]
+    fn resolve_export_cycle_ends() {
+        assert_eq!(export_of("src/cycle_a.ts", "nothing"), None);
+    }
+
+    #[test]
+    fn resolve_export_through_tsconfig_alias() {
+        let (r, _) = fx_setup();
+        let hits = r.resolve(&fx("src/main.ts"), "~/api");
+        assert_eq!(hits, vec![fx("src/api.ts")]);
+        let (r, tables) = fx_setup();
+        let got = resolve_export(&r, |f| tables.get(f), &hits[0], "orig");
+        assert_eq!(got, Some((fx("src/api.ts"), "orig".to_string())));
     }
 
     #[test]
