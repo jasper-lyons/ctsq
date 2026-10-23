@@ -17,6 +17,7 @@ pub mod go;
 pub mod graph;
 pub mod imports;
 pub mod rust;
+pub mod ts;
 pub mod tsconfig;
 
 pub mod scoped;

@@ -1,0 +1,3 @@
+# Read by path from src/resolve/ts.rs tests only; kept out of walks over
+# fixtures/ so the pinned call graph (resolve/graph.rs) is unchanged.
+*
