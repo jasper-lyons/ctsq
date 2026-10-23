@@ -1486,6 +1486,68 @@ mod tests {
         evaluate_flows(&parse(&head).unwrap(), open, &store, &g, &d, &d, &FlowOptions::default()).unwrap()
     }
 
+    /// A store over the Go `files` of fixture folder `dir`, and the folder.
+    fn fixture(dir: &str, files: &[&str]) -> (TreeStore, std::path::PathBuf) {
+        let d = Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
+        let mut store = TreeStore::default();
+        for f in files {
+            store.insert(f, "go", std::fs::read(d.join(f)).unwrap());
+        }
+        (store, d)
+    }
+
+    #[test]
+    fn byte_at_and_parse_position_read_one_based_positions() {
+        assert_eq!(byte_at(b"ab\ncd\n", 2, 2), Some(4));
+        assert_eq!(byte_at(b"ab\ncd", 1, 3), None);
+        assert_eq!(byte_at(b"ab\ncd", 3, 1), None);
+        assert_eq!(parse_position("a/b.go:16:2"), Some(("a/b.go", 16, 2)));
+        assert_eq!(parse_position("a/b.go:16"), None);
+    }
+
+    #[test]
+    fn a_downward_start_at_a_position_prints_what_path_prints() {
+        let (store, d) = fixture("fixtures/flow/flow-calls", &["handler.go", "norm.go"]);
+        let g = whole_graph(&crate::resolve::graph::build_from_store(&store));
+        let opts = FlowOptions::default();
+        let report =
+            evaluate_flows(&parse("id#body").unwrap(), Some(Combinator::FlowsEventually), &store, &g, &d, &d, &opts).unwrap();
+        let setup = DownSetup::new(&store, &g, &d, &d, None, true, &opts).unwrap();
+        // `body` in `body, _ := io.ReadAll(r.Body)`
+        let t = setup.walk().tree_at("handler.go", 16, 2).unwrap().unwrap();
+        let mut text = String::new();
+        print_tree(t.hop.as_ref().unwrap(), 0, &mut text);
+        assert!(t.found > 0);
+        assert_eq!(t.found, report.found);
+        assert!(report.text.starts_with(&text), "{}\n---\n{}", text, report.text);
+        assert!(setup.walk().tree_at("handler.go", 99, 1).is_err());
+    }
+
+    #[test]
+    fn an_upward_start_at_a_position_prints_what_path_prints() {
+        let (store, d) = fixture("fixtures/flow/flow-up", &["render.go"]);
+        let g = whole_graph(&crate::resolve::graph::build_from_store(&store));
+        let opts = FlowOptions::default();
+        let report = evaluate_flows(
+            &parse("id#dir").unwrap(),
+            Some(Combinator::FlowsFromEventually),
+            &store,
+            &g,
+            &d,
+            &d,
+            &opts,
+        )
+        .unwrap();
+        let setup = UpSetup::new(&store, &g, &d, &d, None, true, &opts).unwrap();
+        // `dir` in `dir := os.Getenv("DATA_DIR")`
+        let t = setup.walk().tree_at("render.go", 32, 2).unwrap().unwrap();
+        let mut text = String::new();
+        print_tree_with(t.hop.as_ref().unwrap(), 0, true, &mut text);
+        assert!(t.found > 0);
+        assert_eq!(t.found, report.found);
+        assert!(report.text.starts_with(&text), "{}\n---\n{}", text, report.text);
+    }
+
     #[test]
     fn open_end_strips_a_trailing_flow_combinator() {
         assert_eq!(open_end("a ==> "), Some(("a ".to_string(), Combinator::FlowsEventually)));
