@@ -271,7 +271,7 @@ impl<'a> Scope<'a> {
 /// A definition's name, and a call's callee name, is a token of its file,
 /// and a lexer takes the longest run of identifier bytes, so a file holding
 /// a name holds it bounded by bytes that cannot continue it.
-pub(crate) struct Words {
+pub struct Words {
     sources: Vec<Option<crate::parsed::Source>>,
     langs: Vec<&'static str>,
     /// Each word with its id and the jobs holding it.
@@ -285,7 +285,7 @@ fn word_byte(b: u8) -> bool {
 }
 
 impl Words {
-    pub(crate) fn new(jobs: &[(String, &'static str)]) -> Words {
+    pub fn new(jobs: &[(String, &'static str)]) -> Words {
         let mut tokens: HashMap<Box<str>, (u32, Vec<u32>)> = HashMap::new();
         let mut sources = Vec::with_capacity(jobs.len());
         for (j, (file, _)) in jobs.iter().enumerate() {

@@ -26,3 +26,11 @@ cc = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[lib]
+name = "ctsq"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ctsq"
+path = "src/main.rs"

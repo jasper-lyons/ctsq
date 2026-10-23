@@ -1,25 +1,25 @@
-mod compiler;
-mod cooccur;
-mod example;
-mod explain;
-mod files;
-mod find;
-mod footer;
-mod miss;
-mod needle;
-mod parsed;
-mod query;
-mod runner;
-mod scope;
-mod scopeof;
-mod tree;
-mod calltree;
-mod importgraph;
-mod types;
-mod resolve;
-mod config;
-mod flow;
-mod semantic;
+use ctsq::{
+    calltree, compiler,
+    config,
+    cooccur,
+    example,
+    explain,
+    files,
+    find,
+    footer,
+    importgraph,
+    miss,
+    needle,
+    parsed,
+    query,
+    resolve,
+    runner,
+    scope,
+    scopeof,
+    semantic,
+    tree,
+    types,
+};
 
 use clap::{Parser, Subcommand};
 use compiler::lang;
