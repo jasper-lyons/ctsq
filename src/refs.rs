@@ -177,11 +177,11 @@ mod tests {
         assert_eq!(rows, vec![("fixtures/hidden/limit.go", 5), ("fixtures/hidden/limit.go", 7)]);
         assert!(r.names[1].rows.is_empty());
         assert_eq!(r.missing, vec!["Nowhere".to_string()]);
-        // three hits in limit_test.go, every row counts
-        assert_eq!(r.hidden.tests, 3);
+        // one row per line in limit_test.go, every row counts
+        assert_eq!(r.hidden.tests, 2);
         let out = render(&r, "fixtures/hidden", &jobs, None);
         assert_eq!(out.code, 0);
-        assert!(out.out.starts_with("fixtures/hidden/limit.go:5: const HiddenLimit = 3\n"), "{}", out.out);
+        assert!(out.out.starts_with("fixtures/hidden/limit.go:5: \"HiddenLimit\"\n"), "{}", out.out);
         assert!(out.err.starts_with("not found: Nowhere"), "{}", out.err);
     }
 

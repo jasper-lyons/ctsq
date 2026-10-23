@@ -1712,4 +1712,32 @@ mod tests {
         assert!(KeyFilter::new(None).unwrap().file_needle(false).is_none());
         assert!(KeyFilter::new(Some("- ")).unwrap().file_needle(false).is_none());
     }
+
+    #[test]
+    fn rows_give_each_route_as_data_grouped_by_framework() {
+        let dir = fixture("next-app");
+        let qs = queries_in(&dir);
+        let mut scan = Scan::new(&dir, false);
+        let f = rows(&qs, "route", Some("/about"), &mut scan, &hide(), None).expect("route runs");
+        assert_eq!(f.groups.len(), 1);
+        let g = &f.groups[0];
+        assert_eq!(g.framework, "next-app");
+        let got: Vec<(&str, usize, &str, &str)> =
+            g.rows.iter().map(|r| (shown(&f.prefix, &r.file), r.line, r.key.as_str(), r.target.as_str())).collect();
+        assert_eq!(got, vec![("app/about/page.tsx", 1, "/about", "About")]);
+        assert_eq!(g.rows[0].target_loc, "app/about/page.tsx:1");
+        assert_eq!(f.shown(), 1);
+        let all = list(&qs, &mut Scan::new(&dir, false));
+        let next = all.iter().find(|a| a.framework == "next-app" && a.name == "route").expect("listed");
+        assert!(next.why.is_some());
+        assert!(all.iter().any(|a| a.why.is_none()));
+    }
+
+    #[test]
+    fn an_unknown_query_is_an_error_report_not_rows() {
+        let dir = fixture("next-app");
+        let e = rows(&queries_in(&dir), "nope", None, &mut Scan::new(&dir, false), &hide(), None).err().expect("unknown");
+        assert_eq!(e.code, 2);
+        assert!(e.out.starts_with("no named query 'nope'"), "{}", e.out);
+    }
 }

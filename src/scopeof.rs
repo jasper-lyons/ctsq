@@ -480,4 +480,22 @@ mod tests {
         assert_eq!(window(20, 1, 20, 4), (17, 20));
         assert_eq!(window(5, 3, 6, 150), (3, 6));
     }
+
+    #[test]
+    fn build_returns_the_scope_window_and_siblings_as_data() {
+        let f = "fixtures/scope/Asset.tsx";
+        let hits = build(&[at(f, 5), at("fixtures/scope/gone.tsx", 1)], &Options { siblings: true, budget: 2, ..Options::default() }, &files::HideOpts::default());
+        let h = hits[0].as_ref().expect("line 5 resolves");
+        let s = h.scope.as_ref().expect("held by a scope");
+        assert_eq!((s.name.as_str(), s.start_line, s.end_line), ("saveAssetNow", 4, 6));
+        assert_eq!((h.shown, h.span), ((4, 5), (4, 6)));
+        assert_eq!(h.lines, vec!["  const saveAssetNow = async () => {".to_string(), "    return props.asset".to_string()]);
+        let sibs: Vec<usize> = h.siblings.as_ref().expect("asked for").iter().map(|x| x.start_line).collect();
+        assert_eq!(sibs, vec![1, 3, 10]);
+        assert!(h.callers.is_none() && h.only.is_none());
+        assert!(hits[1].as_ref().unwrap_err().starts_with("no such file: fixtures/scope/gone.tsx"));
+        let r = render(&hits);
+        assert_eq!(r.code, 0);
+        assert!(r.out.ends_with("showing lines 4-5 of 4-6, --budget 3 for all\n"), "{}", r.out);
+    }
 }

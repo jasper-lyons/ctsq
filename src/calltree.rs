@@ -665,4 +665,42 @@ mod tests {
             }
         }
     }
+
+    fn strict_go() -> (Jobs, files::Hider) {
+        let root = "fixtures/resolve-strict/go";
+        let jobs = files::resolve_jobs(root, None, false);
+        let mut h = files::Hider::new(&Default::default());
+        h.add_jobs(root, &jobs);
+        (jobs, h)
+    }
+
+    #[test]
+    fn build_carries_unresolved_calls_and_confidence_as_data() {
+        let (jobs, mut h) = strict_go();
+        let names: Vec<String> = ["Bare", "Control", "Nope"].iter().map(|s| s.to_string()).collect();
+        let t = build(Direction::Down, &names, &jobs, 3, &mut h);
+        assert!(t.resolved);
+        assert_eq!(t.missing, vec!["Nope".to_string()]);
+        assert_eq!(t.shown, 3);
+        let handler = "fixtures/resolve-strict/go/api/handler.go";
+        let bare = &t.names[0].roots;
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0].def, Some(Loc { file: handler.into(), line: 54 }));
+        let open = &bare[0].children[0];
+        assert_eq!((open.name.as_str(), &open.def, open.confidence), ("Open", &None, None));
+        assert_eq!(open.site, Loc { file: handler.into(), line: 55 });
+        assert!(open.children.is_empty());
+        let control: Vec<(&str, usize, Option<Confidence>)> = t.names[1].roots[0]
+            .children
+            .iter()
+            .map(|c| (c.name.as_str(), c.def.as_ref().map(|d| d.line).unwrap_or(0), c.confidence))
+            .collect();
+        assert_eq!(control, vec![("List", 8, Some(Confidence::Exact)), ("Set", 14, Some(Confidence::Exact))]);
+        assert!(t.names[1].roots[0].children.iter().all(|c| c.def.as_ref().unwrap().file.ends_with("api/cache.go")));
+        // Nope has no definition: one root without one, and no rows
+        assert_eq!(t.names[2].roots, vec![CallRoot { def: None, children: vec![], children_cut: 0 }]);
+        assert!(t.names[2].missing);
+        let out = render_many(&t, "fixtures/resolve-strict/go", &jobs, None);
+        assert!(out.out.starts_with("Bare()\n└── unresolved Open\n\nControl()\n├── List()  [cache.go:8]\n"), "{}", out.out);
+    }
 }
