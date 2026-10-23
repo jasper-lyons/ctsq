@@ -54,7 +54,7 @@ Why: today's junk callees come from recording raw text. Fixing them in the model
 
 ### B04. Calls stay attributed to the top-level definition
 
-A call inside a nested arrow function still belongs to the outermost named definition, as it does today. Nested functions as their own call-graph nodes can wait. Why: it keeps B to resolution, and the browser shows the whole function anyway.
+A call inside a nested arrow function still belongs to the outermost named definition, as it does today. Amended 2026-10-23 after plan review: "as it does today" is the rule. A call belongs to the innermost enclosing definition that `DefIndex` lists for the file (the `own: &[Def]` that `Resolver::model` receives, built by the recursive `tree::fn_locs_recursive`, `src/tree.rs:639`). Class methods are listed defs today, so `callees m` on a method keeps its own calls. "Outermost" applies only to nested functions that are not listed defs. Nested functions as their own call-graph nodes can wait. Why: it keeps B to resolution, and the browser shows the whole function anyway.
 
 ### B05. Left for later
 
@@ -68,7 +68,9 @@ None yet.
 
 - `plans/explore/PLAN.md` `## Conventions` applies in full: gates, `REF=` and `REFCACHE=0`, never `make install`, Mavexa read-only.
 - Before launching, the orchestrator runs one architecture-lens plan review of this file, as the orchestrate skill requires.
-- B1 and B2 own no file that stage A edits, so they may run while stage A is in progress, each cut from the `explore-stage-b` tip. B3 launches only after stage A has merged, from a tip that contains both stage A and B1/B2.
+- B1 owns no file that stage A edits. B2 adds one line to `src/resolve/mod.rs`, which stage A's strict-calls and structure-out also own: the `mod ts;` line in the module list at `mod.rs:15-22`, which stage A does not touch, so the merge is trivial. Both may run while stage A is in progress, each cut from the `explore-stage-b` tip.
+- No warnings before B3: everything B1 and B2 add is unread until B3 wires it, and the crate is binary-only, so `cargo build` would warn `dead_code`. B1 marks each new item `#[allow(dead_code)] // wired by B3`, as at `src/resolve/go.rs:1080`. B2 uses one `#![allow(dead_code)]` at the top of `ts.rs`. B3 removes all of them.
+- Unit tests read fixtures through `env!("CARGO_MANIFEST_DIR")/fixtures/...` (as `src/cooccur.rs:182` does). No unit test reads a file outside the repo. B3 launches only after stage A has merged, from a tip that contains both stage A and B1/B2.
 
 ## Work packages
 
@@ -85,12 +87,12 @@ None yet.
 Files: `src/resolve/imports.rs`, new fixtures under `fixtures/ts-resolve/imports/`, and tests beside the code.
 
 Add to the import model without changing anything that exists:
-- `RawImport` (`imports.rs:19`) keeps `bindings` as it is and gains a list of `{local, imported, kind}`, where kind is named, default or namespace, and `imported` is the original name of an aliased `{a as b}`. Fill it in `js_import_bindings` (`:519`) and `js_require_bindings` (`:555`).
-- A per-file export table: the named exports, the default export's local name, and the re-exports, as `export * from S` or `export {x as y} from S`, read from `export_statement` (the file edge is made at `:463`).
-- `fn resolve_export(file, name, depth) -> Option<(file, local name)>`, which follows re-exports through `JsSpecResolver::resolve` (`:260`) to at most 8 files and stops on a cycle.
+- `RawImport` (`imports.rs:19`) keeps `bindings` as it is and gains a list of `{local, imported, kind}`, where kind is named, default or namespace, and `imported` is the original name of an aliased `{a as b}`. Fill it in `js_import_bindings` (`:519`) and `js_require_bindings` (`:555`). Every construction goes through `RawImport::new` (`:42`): initialise the list empty there and add a builder beside `bind` (`:51`). The `push` closure at `:457` gains an argument. `const x = require(m)` is a namespace binding, and `const {a, b: c} = require(m)` gives named bindings.
+- A per-file export table, `ExportTable`, built by `pub fn js_exports(tree, source) -> ExportTable` for one file. It holds the named exports (`export function f`, `export const x`, `export {a, b as c}`), the default export (its local name, or none for an anonymous `export default function () {}`), and the re-exports (`export * from S`, `export {x as y} from S`, `export {default} from S`, `export {default as X} from S`). Exports with no source need a new arm in the walk around `:463`. That arm must not push a `RawImport`, or the import graph changes.
+- `pub fn resolve_export(r: &JsSpecResolver, table_of: impl Fn(&str) -> Option<&ExportTable>, file: &str, name: &str) -> Option<(String, String)>` returns the file and the local name that defines the export. Pass `"default"` as the name for a default import. It follows re-exports through `JsSpecResolver::resolve` (`:260`). The depth limit of 8 files and the visited set for cycles live inside the function. When `resolve` returns more than one candidate file, the result is `None`. B1 builds neither the project-wide resolver nor the tables; B3 builds them and caches them on `DefIndex`. Tests build them over the fixture directory.
 
 Acceptance:
-- the fixtures cover a named import, an aliased import, a default import, `export *` through two barrels, `export {x as y} from`, a cycle, and a `~/` alias through a tsconfig, with a unit test each
+- the fixtures cover a named import, an aliased import, a default import, `export *` through two barrels, `export {x as y} from`, `export {default as X} from`, an anonymous default export, a `require` namespace and destructure, a cycle, and a `~/` alias through a tsconfig, with a unit test each
 - `same-output.sh` at 0 differences against the `explore-stage-b` base, because the import graph and `find` must not change
 - the other gates pass
 
@@ -99,20 +101,20 @@ Acceptance:
 Files: new `src/resolve/ts.rs` (not yet registered in `resolver_for`, but declared as a module in `src/resolve/mod.rs` with one `mod ts;` line), new fixtures under `fixtures/ts-resolve/model/`, and tests beside the code.
 
 Builds `ts::FileScope` from a parsed file. It doesn't resolve anything yet:
-- definitions with an export flag, using the definition rules of `tree::collect_function_locs` (`src/tree.rs:615`), so the definitions match today's `DefIndex`
-- each call site, with its enclosing top-level definition (B04), its cleaned callee (B03) as bare, member (with the receiver text) or JSX, and its position
-- local bindings per scope: parameters, `const`/`let`, array and object destructuring, and nested function declarations
-- `call_positions()`, matching `go::FileScope::call_positions` (used at `src/resolve/scoped.rs:1306`, `:1339`)
+- the definitions are the `own: &[Def]` list `Resolver::model` receives (today's `DefIndex` entries for the file, from `tree::collect_function_locs`, `src/tree.rs:615`), one entry per def in that order, each with an export flag. `FileScope::build(tree, source, own: &[Def])` takes them as given and does not recompute them.
+- each call site holds its def index (the innermost enclosing listed def, B04 as amended), its cleaned callee (B03) as bare, member (with the receiver text, type arguments stripped, `a?.b()` treated as `a.b()`) or JSX, its line, and the start and end byte of the node the TS `call` abstract type matches: `call_expression`, `jsx_self_closing_element` or `jsx_opening_element` (`src/compiler/lang/typescript.rs:259-320`), and `new_expression` for `new X()`. Callers look a site up by that exact byte span.
+- local bindings as `Binding { name, kind, scope: Range<usize>, decl_byte: usize }`, where kind is param, const, let, destructure or fn, and `scope` is the byte range of the block or function that holds the binding. A binding encloses a call when the call's start byte lies inside `scope`. It covers parameters, `const`/`let`, array and object destructuring, and nested function declarations. Import bindings belong to B1, not here.
+- `call_positions()` with the same shape as `go::FileScope::call_positions` (`src/resolve/go.rs:357`): `(Vec<def line>, HashMap<(start_byte, end_byte), (def idx, call idx)>)`, used at `src/resolve/scoped.rs:1306`, `:1339`
 
 Acceptance:
-- unit tests over the fixtures assert the exact call sites (name, kind, position) and bindings, covering: multi-line JSX with props, a dotted JSX tag, generic calls, `new X()`, a destructured signal pair, and a nested arrow function
-- run over `AssetsIndex.tsx` from Mavexa in a test, `<Row a={a} />` at `:343` is a JSX call to `Row`, and `setQuery` is a local binding
+- unit tests over the fixtures assert the exact call sites (name, kind, line, byte span) and bindings, covering: multi-line JSX with props, a dotted JSX tag, generic calls, a generic member call `api.get<T>()`, an optional call `a?.b()`, `new X()`, a destructured signal pair, a nested arrow function, a class method keeping its own calls, and one `.jsx` fixture parsed with the JavaScript grammar
+- an excerpt of Mavexa's `frontend/src/.../AssetsIndex.tsx` (the signal pair at `:102`, `on(query, …)` and `q.trim()` at `:105-106`, the setter call at `:300`, `<Row a={a} />` at `:343`), copied into `fixtures/ts-resolve/model/AssetsIndex.tsx` with the surrounding structure kept. A test asserts that `<Row a={a} />` is a JSX call to `Row` and that `setQuery` is a local binding enclosing the `:300` call
 - `same-output.sh` at 0 differences, since nothing is wired yet
 - no warnings: `ts.rs` starts with `#![allow(dead_code)]` until B3 wires it, and B3 removes that line
 
 ## Package: ts-resolve
 
-Files: `src/resolve/ts.rs`, `src/resolve/mod.rs` (`resolver_for`, `FileModel::Ts`, a cached project import table on `DefIndex` like `go_constructed` at `mod.rs:79`), `src/resolve/scoped.rs` (the TS arm of the `call_positions` reads), new `plans/explore/ts-edges.sh`, fixtures under `fixtures/ts-resolve/resolve/`, tests, and expected outputs in `tests/` and `plans/agent-search/docs/` that change.
+Files: `src/resolve/ts.rs`, `src/resolve/mod.rs` (`resolver_for`, `FileModel::Ts`, a cached project import table on `DefIndex` like `go_constructed` at `mod.rs:78`), `src/resolve/scoped.rs` (the TS arm of the `call_positions` reads), new `plans/explore/ts-edges.sh`, fixtures under `fixtures/ts-resolve/resolve/`, tests, and expected outputs in `tests/` and `plans/agent-search/docs/` that change.
 
 Implements B01 and B02 on top of B1 and B2. `resolve_model` receives only the file, its model and the `DefIndex`, so the project's export tables and the `JsSpecResolver` are built once and cached on `DefIndex`.
 
