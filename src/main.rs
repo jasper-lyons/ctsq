@@ -9,9 +9,10 @@ use ctsq::{
     footer,
     importgraph,
     miss,
-    needle,
     parsed,
     query,
+    query_run,
+    refs,
     resolve,
     runner,
     scope,
@@ -23,7 +24,7 @@ use ctsq::{
 
 use clap::{Parser, Subcommand};
 use compiler::lang;
-use std::collections::HashMap;
+use query_run::with_path;
 use std::io::{BufRead, IsTerminal, Read};
 
 #[derive(Parser)]
@@ -721,13 +722,17 @@ fn main() {
             return;
         }
         Some(Commands::Callers { args, max_depth, scope }) => {
-            let t = targets(&args, "callers", cli.lang.as_deref(), cli.no_ignore, &hide);
-            calltree::callers(&t.names, &t.where_, &t.jobs, t.hider, max_depth, scope.opts());
+            let mut t = targets(&args, "callers", cli.lang.as_deref(), cli.no_ignore, &hide);
+            let mut trees = calltree::build(calltree::Direction::Up, &t.names, &t.jobs, max_depth, &mut t.hider);
+            footer::settle(&mut trees.hidden);
+            emit(calltree::render_many(&trees, &t.where_, &t.jobs, scope.opts()));
             return;
         }
         Some(Commands::Callees { args, max_depth, scope }) => {
-            let t = targets(&args, "callees", cli.lang.as_deref(), cli.no_ignore, &hide);
-            calltree::callees(&t.names, &t.where_, &t.jobs, t.hider, max_depth, scope.opts());
+            let mut t = targets(&args, "callees", cli.lang.as_deref(), cli.no_ignore, &hide);
+            let mut trees = calltree::build(calltree::Direction::Down, &t.names, &t.jobs, max_depth, &mut t.hider);
+            footer::settle(&mut trees.hidden);
+            emit(calltree::render_many(&trees, &t.where_, &t.jobs, scope.opts()));
             return;
         }
         Some(Commands::Callgraph { path, format }) => {
@@ -763,17 +768,32 @@ fn main() {
                 lang: cli.lang.clone(),
                 no_ignore: cli.no_ignore,
             };
-            let r = scopeof::report(&parsed, &opts, &hide);
+            let hits = scopeof::build(&parsed, &opts, &hide);
+            let r = scopeof::render(&hits);
             eprint!("{}", r.err);
             print!("{}", r.out);
             std::process::exit(r.code);
         }
         Some(Commands::Find { query, key }) => {
-            std::process::exit(find::run(query.as_deref(), key.as_deref(), cli.no_ignore, &hide));
+            let r = find::report_here(query.as_deref(), key.as_deref(), cli.no_ignore, &hide);
+            // A miss, a usage error and an everything-hidden report go to stderr.
+            if r.code != 0 {
+                eprint!("{}", r.out);
+            } else {
+                print!("{}", r.out);
+            }
+            std::process::exit(r.code);
         }
         Some(Commands::Refs { args, scope }) => {
-            let t = targets(&args, "refs", cli.lang.as_deref(), cli.no_ignore, &hide);
-            run_refs(&t.names, &t.where_, &t.jobs, t.hider, scope.opts());
+            let mut t = targets(&args, "refs", cli.lang.as_deref(), cli.no_ignore, &hide);
+            let out = match refs::build(&t.names, &t.jobs, &mut t.hider) {
+                Ok(mut r) => {
+                    footer::settle(&mut r.hidden);
+                    refs::render(&r, &t.where_, &t.jobs, scope.opts())
+                }
+                Err(o) => o,
+            };
+            emit(out);
             return;
         }
         Some(Commands::Imports { file, path, depth }) => {
@@ -866,18 +886,7 @@ fn main() {
             }
             let compiled = compiler::compile(&ast, lang.as_ref());
             println!("=== Compiled S-expression ({}) ===", lang_name);
-            if compiled.is_empty() {
-                println!("<no patterns — abstract type has no mapping in this language>");
-            } else {
-                match &compiled {
-                    compiler::CompiledQuery::Simple(s) => println!("{}", s),
-                    compiler::CompiledQuery::Scoped { outer, scope_field, inner } => {
-                        println!("[scoped two-phase query on field '{}']", scope_field);
-                        println!("  outer: {}", outer);
-                        println!("  inner: {}", inner);
-                    }
-                }
-            }
+            print_compiled(&compiled);
             if cli.source_files.is_empty() {
                 return;
             }
@@ -948,8 +957,6 @@ fn main() {
         hider.add_jobs(if files_from_stdin { "." } else { path }, &found);
         jobs.extend(found);
     }
-    let mut hidden = footer::Hidden::default();
-
     let multiple = jobs.len() > 1;
     let mut total_matches = 0usize;
     let mut printed_a_block = false;
@@ -984,68 +991,26 @@ fn main() {
         }
     }
 
-    let mut compiled_cache: HashMap<&'static str, (Box<dyn lang::Lang>, compiler::CompiledQuery, Option<(compiler::CompiledQuery, compiler::CompiledQuery)>)> =
-        HashMap::new();
-
-    // A file without the query's names cannot match, so it is never parsed.
-    // --show-query prints per file, so it keeps every file.
-    let needles = if cli.show_query { needle::Needles::none() } else { needle::Needles::from_query(&ast) };
-
+    // The builder answers each file with its rows, this loop prints them.
+    let mut run = query_run::Run::new(&ast, &attrs, cli.body, cli.show_query, stdin_bytes);
     for (file, lang_name) in &jobs {
-        if lacks_needles(&needles, file) {
-            continue;
-        }
-        let (lang_box, compiled, gate) = compiled_cache.entry(lang_name).or_insert_with(|| {
-            let l = lang::for_name(lang_name).expect("lang_name always valid here");
-            let c = compiler::compile(&ast, l.as_ref());
-            let g = compiler::sibling_gate(&ast, l.as_ref()); (l, c, g)
-        });
-
+        let Some(answer) = run.file(&mut hider, file, lang_name) else { continue };
         if cli.show_query && !multiple {
             println!("=== Compiled S-expression ({}) ===", lang_name);
-            if compiled.is_empty() {
-                println!("<no patterns — abstract type has no mapping in this language>");
-            } else {
-                match compiled {
-                    compiler::CompiledQuery::Simple(s) => println!("{}", s),
-                    compiler::CompiledQuery::Scoped { outer, scope_field, inner } => {
-                        println!("[scoped two-phase query on field '{}']", scope_field);
-                        println!("  outer: {}", outer);
-                        println!("  inner: {}", inner);
-                    }
-                }
-            }
+            print_compiled(run.compiled(lang_name));
             println!("\n=== Matches in {} ===", file);
         }
-
-        // A file's text and tree come from the run's cache, so test hiding
-        // and anything after reuse this parse. Stdin has no path to key on.
-        let fetched = if file == "-" {
-            Fetched::Text(std::rc::Rc::new(stdin_bytes.as_ref().expect("stdin pre-read").clone()))
-        } else {
-            match fetch(file, lang_name, compiled.is_empty()) {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("Failed to read {}: {}", file, e);
-                    continue;
-                }
+        let display = answer.display();
+        match &answer.outcome {
+            query_run::Outcome::ReadError(e) => {
+                eprintln!("Failed to read {}: {}", file, e);
             }
-        };
-        let source: &[u8] = fetched.source();
-
-        let display = if file == "-" { "<stdin>" } else { file.as_str() };
-
-        let result = (if gated_out(&fetched, gate.as_ref(), lang_box.as_ref()) { Ok(vec![]) } else { fetched.rows(compiled, lang_box.as_ref(), cli.body) }).map(|rows| {
-            let rows = semantic::attrs::filter_rows(rows, &attrs, lang_name, &lang_box.ts_language(), source);
-            hide_rows(&mut hider, file, source, fetched.tree(), rows, true, &mut hidden)
-        });
-        match result {
-            Ok(rows) if rows.is_empty() => {
+            query_run::Outcome::Rows { rows, .. } if rows.is_empty() => {
                 if cli.show_query && !multiple {
                     println!("(no matches)");
                 }
             }
-            Ok(rows) => match cli.context {
+            query_run::Outcome::Rows { source, rows } => match cli.context {
                 Some(ctx) => {
                     print_with_context(
                         display,
@@ -1058,7 +1023,7 @@ fn main() {
                 }
                 None => {
                     let mut seen = std::collections::HashSet::new();
-                    for r in &rows {
+                    for r in rows {
                         let out = match (&r.src_line, cli.node) {
                             // Default: the whole source line, the way explain prints
                             // its REFERENCES, always prefixed with the path.
@@ -1081,11 +1046,12 @@ fn main() {
                     }
                 }
             },
-            Err(e) => {
+            query_run::Outcome::RunnerError(e) => {
                 eprintln!("Runner error in {}: {}", file, e);
             }
         }
     }
+    let mut hidden = run.hidden;
 
     // A query whose only matches were hidden prints the footer, not a miss
     // report, so the reader sees what is hidden and how to show it.
@@ -1118,109 +1084,20 @@ fn main() {
     print!("{}", footer::tail(total_matches, "match", &hidden, scope_opts.is_some()));
 }
 
-/// Whether `file` is readable and lacks the bytes of `needles`, so a query
-/// cannot match in it. Stdin and unreadable files are not skipped, the loop
-/// reports the unreadable ones.
-fn lacks_needles(needles: &needle::Needles, file: &str) -> bool {
-    if needles.is_none() || file == "-" {
-        return false;
-    }
-    match parsed::try_source(file) {
-        Ok(src) => !needles.holds(&src),
-        Err(_) => false,
-    }
-}
-
-/// A file's text and, when the query has patterns, its tree: from the run's
-/// cache for a file, unparsed text for stdin.
-enum Fetched {
-    File(std::rc::Rc<parsed::ParsedFile>),
-    /// Read but not parsed: stdin, or a query with no pattern for the language.
-    Text(parsed::Source),
-}
-
-impl Fetched {
-    fn source(&self) -> &[u8] {
-        match self {
-            Fetched::File(p) => &p.source,
-            Fetched::Text(s) => s,
-        }
-    }
-
-    fn tree(&self) -> Option<&tree_sitter::Tree> {
-        match self {
-            Fetched::File(p) => p.tree.as_ref(),
-            Fetched::Text(_) => None,
-        }
-    }
-
-    /// `runner::run_rows`, over the cached tree when there is one.
-    fn rows(&self, compiled: &compiler::CompiledQuery, l: &dyn lang::Lang, body: bool) -> Result<Vec<runner::MatchRow>, String> {
-        match self.tree() {
-            Some(t) => runner::run_rows_on(compiled, l, self.source(), t, body),
-            None => runner::run_rows(compiled, l, self.source(), body),
-        }
-    }
-}
-
-/// `file` from the cache, parsed with `lang_name`'s grammar unless `text_only`
-/// (a query with no pattern matches nothing and needs no tree).
-fn fetch(file: &str, lang_name: &'static str, text_only: bool) -> std::io::Result<Fetched> {
-    let source = parsed::try_source(file)?;
-    if text_only {
-        return Ok(Fetched::Text(source));
-    }
-    Ok(match parsed::get(file, lang_name) {
-        Some(p) => Fetched::File(p),
-        None => Fetched::Text(source),
-    })
-}
-
-/// Drop the rows `hider` hides, counting them in `hidden`. With `per_line` a
-/// hidden row counts once per line, the way `-q` prints one line per match.
-/// Without it every row counts, the way `refs` prints every row. `tree` is
-/// the file's parse when the caller holds it, so test scopes reuse it.
-fn hide_rows(
-    hider: &mut files::Hider,
-    file: &str,
-    source: &[u8],
-    tree: Option<&tree_sitter::Tree>,
-    rows: Vec<runner::MatchRow>,
-    per_line: bool,
-    hidden: &mut footer::Hidden,
-) -> Vec<runner::MatchRow> {
-    if rows.is_empty() {
-        return rows;
-    }
-    let count = |cut: &[usize]| {
-        if per_line {
-            cut.iter().collect::<std::collections::HashSet<_>>().len()
-        } else {
-            cut.len()
-        }
-    };
-    if let Some(why) = hider.file(file) {
-        let lines: Vec<usize> = rows.iter().map(|r| r.line).collect();
-        hidden.count(why, count(&lines));
-        return vec![];
-    }
-    let scopes = hider.scope_lines_in(file, Some(source), tree);
-    if scopes.is_empty() {
-        return rows;
-    }
-    let mut cut = Vec::new();
-    let kept = rows
-        .into_iter()
-        .filter(|r| {
-            let inside = scopes.iter().any(|(a, b)| *a <= r.line && r.line <= *b);
-            if inside {
-                cut.push(r.line);
+/// The compiled S-expression `--show-query` prints.
+fn print_compiled(compiled: &compiler::CompiledQuery) {
+    if compiled.is_empty() {
+        println!("<no patterns — abstract type has no mapping in this language>");
+    } else {
+        match compiled {
+            compiler::CompiledQuery::Simple(s) => println!("{}", s),
+            compiler::CompiledQuery::Scoped { outer, scope_field, inner } => {
+                println!("[scoped two-phase query on field '{}']", scope_field);
+                println!("  outer: {}", outer);
+                println!("  inner: {}", inner);
             }
-            !inside
-        })
-        .collect();
-    hidden.count(files::Hide::Test, count(&cut));
-    kept
+        }
+    }
 }
 
 /// `-C N` output, modelled on grep -C: every match prints with the N source
@@ -1296,17 +1173,6 @@ fn print_with_context(
         *printed_a_block = true;
         *total_matches += 1;
         println!("{}", with_path(display, &r.node_text));
-    }
-}
-
-/// The node-text form has to say which file it came from, or a multi-line hit
-/// sends the reader back to the file to find it. `<match>` is a placeholder for
-/// exactly that, so the path replaces it. The capture form (`@f:4: …, @c:6: …`)
-/// has no slot of its own and takes the path as a prefix.
-fn with_path(display: &str, node_text: &str) -> String {
-    match node_text.strip_prefix("<match>") {
-        Some(rest) => format!("{}{}", display, rest),
-        None => format!("{}:{}", display, node_text),
     }
 }
 
@@ -1437,87 +1303,15 @@ fn targets(
     Targets { names: split.names, where_: paths.join(" "), jobs, hider }
 }
 
-fn run_refs(
-    names: &[String],
-    where_: &str,
-    jobs: &[(String, &'static str)],
-    mut hider: files::Hider,
-    scope_opts: Option<scope::Opts>,
-) {
-    let mut asts = Vec::new();
-    for name in names {
-        let query_str = format!("id#{}", name);
-        match query::parse(&query_str) {
-            Ok(q) => asts.push(q),
-            Err(e) => { eprint!("{}", miss::query_error_report(&query_str, &e)); std::process::exit(2); }
-        }
-    }
-    if jobs.is_empty() {
-        eprint!("{}", resolve::not_found_line(names, jobs));
-        std::process::exit(1);
-    }
-    let mut scopes = scope::Scopes::new();
-    let mut hidden = footer::Hidden::default();
-    let mut shown = 0usize;
-    let mut missing: Vec<String> = Vec::new();
-
-    for (name, ast) in names.iter().zip(&asts) {
-        let mut name_hidden = footer::Hidden::default();
-        let shown_before = shown;
-        let mut compiled_cache: HashMap<&'static str, (Box<dyn lang::Lang>, compiler::CompiledQuery)> =
-            HashMap::new();
-        let needles = needle::Needles::from_query(ast);
-        for (file, lang_name) in jobs {
-            if lacks_needles(&needles, file) {
-                continue;
-            }
-            let (lang_box, compiled) = compiled_cache.entry(lang_name).or_insert_with(|| {
-                let l = lang::for_name(lang_name).expect("lang_name always valid here");
-                let c = compiler::compile(ast, l.as_ref());
-                (l, c)
-            });
-            let fetched = match fetch(file, lang_name, compiled.is_empty()) {
-                Ok(f) => f,
-                Err(e) => { eprintln!("Failed to read {}: {}", file, e); continue; }
-            };
-            let source = fetched.source();
-            match fetched.rows(compiled, lang_box.as_ref(), false) {
-                Ok(rows) => {
-                    for r in &hide_rows(&mut hider, file, source, fetched.tree(), rows, false, &mut name_hidden) {
-                        if !footer::take(file) {
-                            continue;
-                        }
-                        shown += 1;
-                        println!("{}", with_path(file, &r.node_text));
-                        if let Some(o) = scope_opts {
-                            if let Some(s) = scopes.hit(file, lang_name, source, r.start_byte) {
-                                print!("{}", scope::render(&s, source, o.body, ""));
-                            }
-                        }
-                    }
-                }
-                Err(e) => eprintln!("Runner error in {}: {}", file, e),
-            }
-        }
-        if shown == shown_before && !name_hidden.any() {
-            missing.push(name.clone());
-        }
-        resolve::merge_hidden(&mut hidden, &name_hidden);
-    }
-    footer::settle(&mut hidden);
-    if shown == 0 && hidden.any() {
-        eprint!(
-            "{}",
-            footer::nothing_shown(&format!("no reference to {}", names.join(", ")), where_, jobs.len(), &hidden)
-        );
-    } else if shown > 0 {
-        print!("{}", footer::tail(shown, "reference", &hidden, scope_opts.is_some()));
-    }
-    eprint!("{}", resolve::not_found_line(&missing, jobs));
-    if shown == 0 {
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-        std::process::exit(1);
+/// Print a names report: stdout, then stderr, exiting with its code when
+/// that is not 0.
+fn emit(r: resolve::NamesOut) {
+    print!("{}", r.out);
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    eprint!("{}", r.err);
+    if r.code != 0 {
+        std::process::exit(r.code);
     }
 }
 
@@ -1733,14 +1527,6 @@ mod arg_tests {
         assert!(!identifier_like("src/"));
         assert!(!identifier_like("9lives"));
         assert!(!identifier_like(""));
-    }
-}
-
-/// Whether a sibling pair `A ~ B` cannot match in `fetched`, because A or B has no match alone.
-fn gated_out(fetched: &Fetched, gate: Option<&(compiler::CompiledQuery, compiler::CompiledQuery)>, l: &dyn lang::Lang) -> bool {
-    match (fetched.tree(), gate) {
-        (Some(t), Some((a, b))) => !runner::has_match(a, l, fetched.source(), t) || !runner::has_match(b, l, fetched.source(), t),
-        _ => false,
     }
 }
 

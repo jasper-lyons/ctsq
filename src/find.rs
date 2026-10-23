@@ -186,12 +186,35 @@ fn columns(rows: &[Vec<String>]) -> String {
 }
 
 /// `ctsq find` with no arguments: every named query that applies here.
-pub fn list_report(queries: &[NamedQuery], scan: &mut Scan) -> Report {
+/// One named query and whether it applies here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Applies {
+    /// The query file and line the query is defined at.
+    pub source: String,
+    pub line: usize,
+    pub name: String,
+    pub framework: String,
+    /// Why it applies (the detection that fired), or None when it does not.
+    pub why: Option<String>,
+}
+
+/// Every named query, with why it applies here or None.
+pub fn list(queries: &[NamedQuery], scan: &mut Scan) -> Vec<Applies> {
     let why = verdicts(queries, scan);
+    queries
+        .iter()
+        .zip(why)
+        .map(|(q, w)| Applies { source: q.source.clone(), line: q.line, name: q.name.clone(), framework: q.framework.clone(), why: w })
+        .collect()
+}
+
+/// The text `find` with no query prints: a row per query that applies, then
+/// the ones that do not.
+pub fn render_list(all: &[Applies]) -> Report {
     let mut rows = Vec::new();
     let mut missing = Vec::new();
-    for (q, w) in queries.iter().zip(&why) {
-        match w {
+    for q in all {
+        match &q.why {
             Some(w) => rows.push(vec![
                 format!("{}:{}:", q.source, q.line),
                 q.name.clone(),
@@ -211,7 +234,11 @@ pub fn list_report(queries: &[NamedQuery], scan: &mut Scan) -> Report {
     Report { out, code: 0 }
 }
 
-/// A text a file must hold, see `KeyFilter::file_needle`.
+/// `list`, then `render_list`.
+pub fn list_report(queries: &[NamedQuery], scan: &mut Scan) -> Report {
+    render_list(&list(queries, scan))
+}
+
 enum KeyNeedle {
     /// Lowercase ASCII letters and digits, found whatever the case.
     Fold(String),
@@ -920,30 +947,82 @@ pub fn report(queries: &[NamedQuery], name: &str, key: Option<&str>, scan: &mut 
     report_with(queries, name, key, scan, hide, None)
 }
 
-/// `report` with a repo glossary: a key that is, or holds as a whole phrase, a
-/// glossary term also finds the rows whose key holds, or whose target is, one
-/// of the term's names. A line says so, last before any footer.
-pub fn report_with(
+/// One row of a `find` answer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FindRow {
+    /// The file the match is in, as walked (the printer cuts the scan prefix).
+    pub file: String,
+    pub line: usize,
+    /// The whole key: the printer caps it at `KEY_MAX` characters.
+    pub key: String,
+    /// What the key leads to: a component or handler name, or empty.
+    pub target: String,
+    /// Where `target` is defined, as printed (`path:LINE`), or empty.
+    pub target_loc: String,
+    /// `name=value` for each named group of the key's pattern that took part,
+    /// when a pasted key matched by pattern and took values.
+    pub params: Option<String>,
+}
+
+/// The rows one framework's query gave, after rows another framework already
+/// gave are dropped and rows past `--max-matches` are cut.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FindGroup {
+    pub framework: String,
+    /// The query file the query came from.
+    pub source: String,
+    pub rows: Vec<FindRow>,
+}
+
+/// A `find <query> [key]` answer as data.
+#[derive(Debug, Clone)]
+pub struct Found {
+    pub name: String,
+    pub key: Option<String>,
+    /// One group per framework the query applies to here, in order.
+    pub groups: Vec<FindGroup>,
+    /// (framework, source) of the queries that did not apply here.
+    pub not_detected: Vec<(String, String)>,
+    /// The glossary lines for a key that is a glossary term.
+    pub notes: Vec<String>,
+    pub hidden: footer::Hidden,
+    /// What every walked path starts with.
+    pub prefix: String,
+    /// The search root and how many files it holds, for the all-hidden report.
+    pub root: String,
+    pub files: usize,
+}
+
+impl Found {
+    pub fn shown(&self) -> usize {
+        self.groups.iter().map(|g| g.rows.len()).sum()
+    }
+}
+
+/// The rows of query `name` for every framework it applies to. An error is
+/// the whole report of a call that cannot run: an unknown query, a bad key or
+/// a config error, each code 2. The cap is not settled into `hidden`.
+pub fn rows(
     queries: &[NamedQuery],
     name: &str,
     key: Option<&str>,
     scan: &mut Scan,
     hide: &files::HideOpts,
     glossary: Option<&Glossary>,
-) -> Report {
+) -> Result<Found, Report> {
     let mine: Vec<&NamedQuery> = queries.iter().filter(|q| q.name == name).collect();
     if mine.is_empty() {
         let mut names: Vec<&str> = queries.iter().map(|q| q.name.as_str()).collect();
         names.sort_unstable();
         names.dedup();
-        return Report {
+        return Err(Report {
             out: format!("no named query '{}', the queries are: {}\n", name, names.join(", ")),
             code: 2,
-        };
+        });
     }
     let filter = match KeyFilter::new(key) {
         Ok(f) => f,
-        Err(e) => return Report { out: format!("{}\n", e), code: 2 },
+        Err(e) => return Err(Report { out: format!("{}\n", e), code: 2 }),
     };
     let mut extra: Vec<Name> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
@@ -964,57 +1043,60 @@ pub fn report_with(
     hider.add_jobs(&root, &scan.jobs.clone());
     let mut hidden = footer::Hidden::default();
 
-    let mut tried: Vec<(String, String)> = Vec::new();
     let mut not_detected: Vec<(String, String)> = Vec::new();
-    let mut rows: Vec<Vec<String>> = Vec::new();
-    let mut counts: Vec<(usize, String)> = Vec::new();
+    let mut groups: Vec<FindGroup> = Vec::new();
     let mut printed: HashSet<(String, usize, String, String)> = HashSet::new();
     for (q, w) in owned.iter().zip(&why) {
         if w.is_none() {
             not_detected.push((q.framework.clone(), q.source.clone()));
             continue;
         }
-        tried.push((q.framework.clone(), q.source.clone()));
-        let hits = match run_query(q, scan, &ask, &mut hider, &mut hidden) {
-            Ok(h) => h,
-            Err(r) => return r,
-        };
+        let hits = run_query(q, scan, &ask, &mut hider, &mut hidden)?;
         // A row two frameworks both found prints once, under the first.
         let hits: Vec<Hit> = hits
             .into_iter()
             .filter(|h| printed.insert((h.file.clone(), h.line, h.key.clone(), h.target.clone())))
             .collect();
-        if hits.is_empty() {
-            counts.push((0, format!("0 {} ({}, from {})", footer::plural(name, 0), q.framework, q.source)));
-            continue;
-        }
         // The count line counts the rows printed, so --max-matches shows in it.
-        let before = rows.len();
+        let mut rows = Vec::new();
         for h in hits {
             if !footer::take(&h.file) {
                 continue;
             }
-            let mut row = vec![format!("{}:{}", shown(&scan.prefix, &h.file), h.line), cap_key(&h.key), h.target, h.target_loc];
-            if let Some(p) = h.pattern.filter(|p| !p.params.is_empty()) {
-                row.push(p.params);
-            }
-            rows.push(row);
+            rows.push(FindRow {
+                file: h.file,
+                line: h.line,
+                key: h.key,
+                target: h.target,
+                target_loc: h.target_loc,
+                params: h.pattern.map(|p| p.params).filter(|p| !p.is_empty()),
+            });
         }
-        let n = rows.len() - before;
-        counts.push((n, format!(
-            "{} {} ({}, from {})",
-            n,
-            footer::plural(name, n),
-            q.framework,
-            q.source
-        )));
+        groups.push(FindGroup { framework: q.framework.clone(), source: q.source.clone(), rows });
     }
-    footer::settle(&mut hidden);
+    Ok(Found {
+        name: name.to_string(),
+        key: key.map(|k| k.to_string()),
+        groups,
+        not_detected,
+        notes,
+        hidden,
+        prefix: scan.prefix.clone(),
+        root,
+        files: scan.jobs.len(),
+    })
+}
 
-    let shown_n = rows.len();
-    if shown_n == 0 && !hidden.any() {
-        let mut out = crate::miss::find_report(name, key, &tried, &not_detected);
-        for n in &notes {
+/// The text `find <query> [key]` prints for `f`, with its code: 1 for a miss
+/// or an everything-hidden report, whose text belongs on stderr.
+pub fn render(f: &Found) -> Report {
+    let name = f.name.as_str();
+    let key = f.key.as_deref();
+    let shown_n = f.shown();
+    if shown_n == 0 && !f.hidden.any() {
+        let tried: Vec<(String, String)> = f.groups.iter().map(|g| (g.framework.clone(), g.source.clone())).collect();
+        let mut out = crate::miss::find_report(name, key, &tried, &f.not_detected);
+        for n in &f.notes {
             out.push_str(n);
             out.push('\n');
         }
@@ -1025,61 +1107,76 @@ pub fn report_with(
             Some(k) => format!("no {} to {}", name, k),
             None => format!("no {}", name),
         };
-        let out = footer::nothing_shown(&phrase, &scan.root.display().to_string(), scan.jobs.len(), &hidden);
+        let out = footer::nothing_shown(&phrase, &f.root, f.files, &f.hidden);
         return Report { out, code: 1 };
+    }
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for g in &f.groups {
+        for h in &g.rows {
+            let mut row = vec![format!("{}:{}", shown(&f.prefix, &h.file), h.line), cap_key(&h.key), h.target.clone(), h.target_loc.clone()];
+            if let Some(p) = &h.params {
+                row.push(p.clone());
+            }
+            rows.push(row);
+        }
     }
     let mut out = columns(&rows);
     // Frameworks that matched nothing are listed too, but only beside one that
     // matched, so the reader sees they were tried.
-    let any_matched = counts.iter().any(|(n, _)| *n > 0);
-    for (n, c) in &counts {
-        if *n == 0 && !any_matched {
-            continue;
-        }
-        out.push_str(c);
-        out.push('\n');
+    for g in &f.groups {
+        let n = g.rows.len();
+        out.push_str(&format!("{} {} ({}, from {})\n", n, footer::plural(name, n), g.framework, g.source));
     }
-    for n in &notes {
+    for n in &f.notes {
         out.push_str(n);
         out.push('\n');
     }
-    if hidden.any() {
+    if f.hidden.any() {
         // The footer's own count line repeats what the count lines said.
-        out.push_str(&footer::hidden_lines(&hidden));
+        out.push_str(&footer::hidden_lines(&f.hidden));
     }
     Report { out, code: 0 }
 }
 
-/// Entry for the CLI: loads the queries for the current directory and runs
-/// the list or one query. Prints and returns the exit code.
-pub fn run(name: Option<&str>, key: Option<&str>, no_ignore: bool, hide: &files::HideOpts) -> i32 {
+/// `report` with a repo glossary: a key that is, or holds as a whole phrase, a
+/// glossary term also finds the rows whose key holds, or whose target is, one
+/// of the term's names. A line says so, last before any footer. `rows`, the
+/// cap settled, then `render`.
+pub fn report_with(
+    queries: &[NamedQuery],
+    name: &str,
+    key: Option<&str>,
+    scan: &mut Scan,
+    hide: &files::HideOpts,
+    glossary: Option<&Glossary>,
+) -> Report {
+    match rows(queries, name, key, scan, hide, glossary) {
+        Ok(mut f) => {
+            footer::settle(&mut f.hidden);
+            render(&f)
+        }
+        Err(r) => r,
+    }
+}
+
+/// `ctsq find [query] [key]` from the current directory: the queries and
+/// glossary loaded, then the list or the query's answer. A code other than 0
+/// means the text belongs on stderr.
+pub fn report_here(name: Option<&str>, key: Option<&str>, no_ignore: bool, hide: &files::HideOpts) -> Report {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let queries = match crate::config::queries::load(&cwd) {
         Ok(q) => q,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            return 2;
-        }
+        Err(e) => return Report { out: format!("error: {}\n", e), code: 2 },
     };
     let glossary = match crate::config::glossary::load(&cwd) {
         Ok(g) => g,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            return 2;
-        }
+        Err(e) => return Report { out: format!("error: {}\n", e), code: 2 },
     };
     let mut scan = Scan::new(Path::new("."), no_ignore);
-    let r = match name {
+    match name {
         None => list_report(&queries, &mut scan),
         Some(n) => report_with(&queries, n, key, &mut scan, hide, glossary.as_ref()),
-    };
-    // A miss, a usage error and an everything-hidden report go to stderr.
-    if r.code != 0 {
-        eprint!("{}", r.out);
-    } else {
-        print!("{}", r.out);
     }
-    r.code
 }
 
 #[cfg(test)]

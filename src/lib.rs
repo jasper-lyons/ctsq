@@ -9,6 +9,8 @@ pub mod miss;
 pub mod needle;
 pub mod parsed;
 pub mod query;
+pub mod query_run;
+pub mod refs;
 pub mod runner;
 pub mod scope;
 pub mod scopeof;
