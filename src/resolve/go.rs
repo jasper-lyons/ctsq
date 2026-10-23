@@ -5,10 +5,15 @@
 //! `x, err := f()` binds the first result), falling back to the `NewType()`
 //! naming convention. Interface dispatch is CHA-lite: a call through an
 //! interface-typed receiver expands to one edge per project type whose
-//! method set covers the interface. Out of scope (calls fall back to ranked
-//! name matching): embedded interfaces/structs, struct-field receivers
-//! (`s.client.Do()` is an opaque receiver), and plain reassignment
-//! (`x = ...` after the declaration).
+//! method set covers the interface. Receivers that are not a bare variable
+//! are typed as a chain: struct fields through the indexed struct
+//! declarations (`h.store.List()`, embedded fields promoted), call results
+//! through the target's return type (`NewX().M()`, `x.Get().M()`). A local
+//! closure (`write := func(...)`) is called with no target, never matched by
+//! name. Out of scope (calls fall back to ranked name matching): embedded
+//! interfaces, receivers whose type is outside the project, func-typed
+//! fields and params, and plain reassignment (`x = ...` after the
+//! declaration). `CTSQ_RESOLVE_DEBUG=1` prints how each call resolved.
 //!
 //! Go-specific shape: `pkg.Fn()` and `x.Method()` are the same syntax
 //! (`selector_expression`), so call sites are classified as `Method` with a
@@ -19,6 +24,7 @@ use super::{
     CallSite, Callee, Confidence, Def, DefId, DefIndex, DefKind, FileModel, Receiver, ResolvedCall,
     Resolver, Want,
 };
+use std::cell::{Cell, OnceCell};
 use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
 
@@ -71,7 +77,9 @@ impl Resolver for GoResolver {
     }
 
     /// Types this file constructs (composite literals, `new(T)`), recorded as
-    /// `(T, CONSTRUCTED)`. Interface dispatch widens only to these.
+    /// `(T, CONSTRUCTED)`. Interface dispatch widens only to these. Also the
+    /// fields of each struct it declares, recorded as `(T, FIELD...)` (see
+    /// `collect_fields`), which type field-chain receivers.
     fn collect_impls(&self, file: &str, source: &[u8]) -> Vec<(String, String)> {
         self.collect_impls_tree(file, source, None)
     }
@@ -79,6 +87,7 @@ impl Resolver for GoResolver {
     fn collect_impls_tree(&self, file: &str, source: &[u8], given: Option<&tree_sitter::Tree>) -> Vec<(String, String)> {
         let Some(tree) = parse_or(given, file, source) else { return vec![] };
         let mut seen: HashSet<String> = HashSet::new();
+        let mut fields: Vec<(String, String)> = Vec::new();
         let mut stack = vec![tree.root_node()];
         while let Some(n) = stack.pop() {
             match n.kind() {
@@ -87,6 +96,7 @@ impl Resolver for GoResolver {
                         seen.insert(t);
                     }
                 }
+                "type_spec" => collect_fields(n, source, file, &mut fields),
                 "call_expression" => {
                     let is_new = n.child_by_field_name("function").is_some_and(|f| text(f, source) == "new");
                     if is_new {
@@ -105,6 +115,7 @@ impl Resolver for GoResolver {
             stack.extend(n.children(&mut c));
         }
         let mut out: Vec<(String, String)> = seen.into_iter().map(|t| (t, CONSTRUCTED.to_string())).collect();
+        out.extend(fields);
         out.sort();
         out
     }
@@ -131,24 +142,30 @@ impl Resolver for GoResolver {
             .map(|&i| (index.defs[i].id.line, i))
             .collect();
 
+        let debug = std::env::var_os(DEBUG_ENV).is_some_and(|v| !v.is_empty() && v != "0");
+        let fields = OnceCell::new();
         let mut out = Vec::new();
         let mut sites = Vec::new();
         for fun in &scope.fns {
             let Some(&caller) = def_at.get(&fun.line) else { continue };
-            let ctx = Ctx { file, scope, fun, index, constructed };
+            let ctx = Ctx { file, scope, fun, index, constructed, fields: &fields, fell_back: Cell::new(false) };
             let whole = want.is_none_or(|w| w.whole(fun.line));
             for call in &fun.calls {
-                if !whole && !wanted_site(&call.callee, fun, want) {
+                if !whole && !wanted_site(&call.callee.callee, fun, want) {
                     continue;
                 }
                 let line = call.line;
+                ctx.fell_back.set(false);
                 // interface dispatch can yield several targets → one edge each
                 let targets: Vec<Option<(usize, Confidence)>> =
                     match resolve_callee(&call.callee, line, 0, &ctx) {
                         t if t.is_empty() => vec![None],
                         t => t.into_iter().map(Some).collect(),
                     };
-                let display = call.callee.name().to_string();
+                let display = call.callee.callee.name().to_string();
+                if debug {
+                    debug_line(index, caller, &display, file, line, &targets, ctx.fell_back.get());
+                }
                 for target in targets {
                     out.push(ResolvedCall {
                         caller, callee_display: display.clone(), line, target,
@@ -166,6 +183,42 @@ impl Resolver for GoResolver {
             }
         }
         (out, sites)
+    }
+}
+
+/// Environment variable that turns on one stderr line per resolved Go call
+/// target, saying how it resolved. Read by `plans/explore/edges.sh`.
+pub const DEBUG_ENV: &str = "CTSQ_RESOLVE_DEBUG";
+
+/// How a call target was found: through types and scope (`by-type`), by
+/// the ranked name-only fallback anywhere along the way (`by-name`), or not
+/// at all (`unresolved`).
+fn resolve_class(target: Option<(usize, Confidence)>, fell_back: bool) -> &'static str {
+    match (target, fell_back) {
+        (None, _) => "unresolved",
+        (Some(_), true) => "by-name",
+        (Some(_), false) => "by-type",
+    }
+}
+
+/// Print one `ctsq-resolve` line per target to stderr, tab separated:
+/// class, caller id, target id (the callee name when unresolved), call site
+/// `file:line`, callee name. Ids are `basename:line`, the form
+/// `callgraph --format edges` prints.
+fn debug_line(
+    index: &DefIndex,
+    caller: usize,
+    display: &str,
+    file: &str,
+    line: usize,
+    targets: &[Option<(usize, Confidence)>],
+    fell_back: bool,
+) {
+    let id = |d: &Def| format!("{}:{}", crate::calltree::short_path(&d.id.file), d.id.line);
+    let from = id(&index.defs[caller]);
+    for &t in targets {
+        let to = t.map(|(i, _)| id(&index.defs[i])).unwrap_or_else(|| display.to_string());
+        eprintln!("ctsq-resolve\t{}\t{}\t{}\t{}:{}\t{}", resolve_class(t, fell_back), from, to, file, line, display);
     }
 }
 
@@ -203,6 +256,103 @@ pub fn constructed_types(index: &DefIndex) -> HashSet<String> {
         }
     }
     set
+}
+
+/// Marker prefix under which `collect_impls` records a struct field:
+/// `(Struct, "#field\t<name>\t<base type>\t<embedded 0|1>\t<file>")`.
+const FIELD: &str = "#field";
+
+/// Record each field of `type T struct { ... }` whose type has a base name
+/// (`*pkg.Store` gives `Store`; maps, slices and func types are left out).
+/// An embedded field is named after its type and marked embedded, so its
+/// fields are promoted.
+fn collect_fields(spec: Node, source: &[u8], file: &str, out: &mut Vec<(String, String)>) {
+    let (Some(name), Some(body)) = (spec.child_by_field_name("name"), spec.child_by_field_name("type"))
+    else { return };
+    if body.kind() != "struct_type" { return; }
+    let owner = text(name, source).to_string();
+    let mut stack = vec![body];
+    while let Some(n) = stack.pop() {
+        if n.kind() != "field_declaration" {
+            let mut c = n.walk();
+            stack.extend(n.named_children(&mut c));
+            continue;
+        }
+        let Some(ty) = n.child_by_field_name("type").and_then(|t| type_name(t, source)) else { continue };
+        let mut c = n.walk();
+        let names: Vec<String> = n.children_by_field_name("name", &mut c)
+            .map(|x| text(x, source).to_string())
+            .collect();
+        if names.is_empty() {
+            out.push((owner.clone(), format!("{FIELD}\t{ty}\t{ty}\t1\t{file}")));
+        }
+        for f in names {
+            out.push((owner.clone(), format!("{FIELD}\t{f}\t{ty}\t0\t{file}")));
+        }
+    }
+}
+
+/// One struct field read back from `index.impls`.
+#[derive(Debug)]
+struct FieldRec {
+    name: String,
+    ty: String,
+    embedded: bool,
+    file: String,
+}
+
+/// Struct name to its fields, over every struct the index has read. Built
+/// once per resolved file, on the first field-chain receiver.
+#[derive(Debug, Default)]
+struct StructFields(HashMap<String, Vec<FieldRec>>);
+
+impl StructFields {
+    fn of(index: &DefIndex) -> StructFields {
+        let mut map: HashMap<String, Vec<FieldRec>> = HashMap::new();
+        for (owner, rec) in &index.impls {
+            let Some(rest) = rec.strip_prefix(FIELD).and_then(|r| r.strip_prefix('\t')) else { continue };
+            let mut parts = rest.splitn(4, '\t');
+            let (Some(name), Some(ty), Some(emb), Some(file)) = (parts.next(), parts.next(), parts.next(), parts.next())
+            else { continue };
+            map.entry(owner.clone()).or_default().push(FieldRec {
+                name: name.to_string(), ty: ty.to_string(), embedded: emb == "1", file: file.to_string(),
+            });
+        }
+        StructFields(map)
+    }
+
+    /// Base type of `ty.field`, promoted through embedded structs. Several
+    /// structs may share the name `ty` across packages: one answer is kept
+    /// when they agree, else the one declared in `from`'s directory, else none.
+    fn lookup(&self, ty: &str, field: &str, from: &str, depth: usize) -> Option<String> {
+        let recs = self.0.get(ty)?;
+        let direct: Vec<&FieldRec> = recs.iter().filter(|r| r.name == field).collect();
+        if !direct.is_empty() {
+            return pick(direct.iter().map(|r| (r.ty.as_str(), r.file.as_str())), from);
+        }
+        if depth >= MAX_BINDING_DEPTH { return None; }
+        let promoted: Vec<(String, &str)> = recs.iter()
+            .filter(|r| r.embedded)
+            .filter_map(|r| self.lookup(&r.ty, field, from, depth + 1).map(|t| (t, r.file.as_str())))
+            .collect();
+        pick(promoted.iter().map(|(t, f)| (t.as_str(), *f)), from)
+    }
+}
+
+/// The one type among (type, declaring file) answers, preferring answers
+/// declared in the same directory as `from` when they disagree.
+fn pick<'a>(answers: impl Iterator<Item = (&'a str, &'a str)>, from: &str) -> Option<String> {
+    let answers: Vec<(&str, &str)> = answers.collect();
+    let one = |set: &[(&str, &str)]| -> Option<String> {
+        let first = set.first()?.0;
+        set.iter().all(|(t, _)| *t == first).then(|| first.to_string())
+    };
+    if let Some(t) = one(&answers) { return Some(t); }
+    let dir = std::path::Path::new(from).parent();
+    let local: Vec<(&str, &str)> = answers.into_iter()
+        .filter(|(_, f)| std::path::Path::new(f).parent() == dir)
+        .collect();
+    one(&local)
 }
 
 #[cfg(test)]
@@ -308,14 +458,43 @@ fn type_name(node: Node, source: &[u8]) -> Option<String> {
 #[derive(Debug)]
 enum Binding {
     /// `f := helper` / `g := x.Close` — variable holds a function value.
-    FnValue(Callee),
+    FnValue(GoCallee),
     /// `var x Server` / `x := &Server{}`.
     Typed(String),
     /// `x := f()` / `x, err := pkg.F()` — type comes from the callee's
     /// return type at resolve time (or the `NewT` naming convention).
-    Call(Callee),
+    Call(GoCallee),
+    /// `write := func(...) {...}` or `var write func(...)`: a local closure.
+    /// Calling it reaches no definition, so it never matches by name.
+    Closure,
     /// A type switch variable in a `default` or multi-type case: no single type.
     Unknown,
+}
+
+/// A callee as `Callee` classifies it, plus the shape of the receiver
+/// expression when a method is called on anything but a bare identifier
+/// (`h.store.List()`, `NewX().M()`), which `Receiver::Opaque` only names.
+#[derive(Debug, Clone)]
+struct GoCallee {
+    callee: Callee,
+    recv: Option<Chain>,
+}
+
+impl GoCallee {
+    fn plain(callee: Callee) -> GoCallee {
+        GoCallee { callee, recv: None }
+    }
+}
+
+/// A receiver expression that can be typed: a variable, a field of a typed
+/// expression, the result of a call, or an expression naming its type
+/// (`x.(*T)`, `T{}`).
+#[derive(Debug, Clone)]
+enum Chain {
+    Name(String),
+    Field(Box<Chain>, String),
+    Call(Box<GoCallee>),
+    Type(String),
 }
 
 #[derive(Debug)]
@@ -332,7 +511,7 @@ struct FnScope {
 
 #[derive(Debug)]
 struct CallRec {
-    callee: Callee,
+    callee: GoCallee,
     line: usize,
     start_byte: usize,
     end_byte: usize,
@@ -466,7 +645,7 @@ fn walk_scope(node: Node, source: &[u8], s: &mut FileScope, fn_stack: &mut Vec<u
         }
         // `F[T](x)` parses as a conversion to a generic type: it calls `F`.
         "type_conversion_expression" => {
-            if let (Some(&f), Some(callee)) = (fn_stack.last(), generic_conversion_callee(node, source)) {
+            if let (Some(&f), Some(callee)) = (fn_stack.last(), generic_conversion_callee(node, source).map(GoCallee::plain)) {
                 let args = node.child_by_field_name("operand")
                     .map(|a| vec![(a.start_byte(), a.end_byte())])
                     .unwrap_or_default();
@@ -568,6 +747,9 @@ fn classify_var_spec(node: Node, source: &[u8]) -> Vec<(String, Binding)> {
     if let Some(ty) = node.child_by_field_name("type").and_then(|t| type_name(t, source)) {
         return names.into_iter().map(|v| (v, Binding::Typed(ty.clone()))).collect();
     }
+    if node.child_by_field_name("type").is_some_and(|t| t.kind() == "function_type") {
+        return names.into_iter().map(|v| (v, Binding::Closure)).collect();
+    }
     // value bindings: only the single-name single-value form
     if names.len() == 1 {
         if let Some(value) = node.child_by_field_name("value")
@@ -587,6 +769,7 @@ fn classify_value(value: Node, source: &[u8]) -> Option<Binding> {
         // `f := helper` / `g := x.Close` — function value, resolved like a call
         "identifier" | "selector_expression" =>
             classify_callee_expr(value, source).map(Binding::FnValue),
+        "func_literal" => Some(Binding::Closure),
         "composite_literal" => {
             type_name(value.child_by_field_name("type")?, source).map(Binding::Typed)
         }
@@ -630,25 +813,26 @@ fn generic_conversion_callee(node: Node, source: &[u8]) -> Option<Callee> {
     }
 }
 
-fn classify_call(node: Node, source: &[u8]) -> Option<Callee> {
+fn classify_call(node: Node, source: &[u8]) -> Option<GoCallee> {
     classify_callee_expr(node.child_by_field_name("function")?, source)
 }
 
-fn classify_callee_expr(f: Node, source: &[u8]) -> Option<Callee> {
+fn classify_callee_expr(f: Node, source: &[u8]) -> Option<GoCallee> {
     match f.kind() {
-        "identifier" => Some(Callee::Bare(text(f, source).to_string())),
+        "identifier" => Some(GoCallee::plain(Callee::Bare(text(f, source).to_string()))),
         // `pkg.Fn()` and `x.Method()` are syntactically identical; classify as
         // a method with a Var receiver and let resolution disambiguate.
         "selector_expression" => {
             let name = text(f.child_by_field_name("field")?, source).to_string();
             let operand = f.child_by_field_name("operand")?;
-            let receiver = match operand.kind() {
-                "identifier" => Receiver::Var(text(operand, source).to_string()),
-                _ => Receiver::Opaque(
-                    text(operand, source).lines().next().unwrap_or("").to_string(),
+            let (receiver, recv) = match operand.kind() {
+                "identifier" => (Receiver::Var(text(operand, source).to_string()), None),
+                _ => (
+                    Receiver::Opaque(text(operand, source).lines().next().unwrap_or("").to_string()),
+                    chain(operand, source),
                 ),
             };
-            Some(Callee::Method { receiver, name })
+            Some(GoCallee { callee: Callee::Method { receiver, name }, recv })
         }
         // `f[int]()` — generic instantiation
         "index_expression" | "generic_function" =>
@@ -657,6 +841,27 @@ fn classify_callee_expr(f: Node, source: &[u8]) -> Option<Callee> {
                 .and_then(|inner| classify_callee_expr(inner, source)),
         "parenthesized_expression" =>
             f.named_child(0).and_then(|inner| classify_callee_expr(inner, source)),
+        _ => None,
+    }
+}
+
+/// The shape of a receiver expression, or None when it is not one `Chain`
+/// can type (an index, a func literal, an operator).
+fn chain(n: Node, source: &[u8]) -> Option<Chain> {
+    match n.kind() {
+        "identifier" => Some(Chain::Name(text(n, source).to_string())),
+        "selector_expression" => {
+            let base = chain(n.child_by_field_name("operand")?, source)?;
+            let field = text(n.child_by_field_name("field")?, source).to_string();
+            Some(Chain::Field(Box::new(base), field))
+        }
+        "call_expression" => classify_call(n, source).map(|c| Chain::Call(Box::new(c))),
+        "parenthesized_expression" => chain(n.named_child(0)?, source),
+        // `(*p).M()`, `(&x).M()`: the same base type
+        "unary_expression" if n.child_by_field_name("operator").is_some_and(|o| matches!(text(o, source), "*" | "&")) =>
+            chain(n.child_by_field_name("operand")?, source),
+        "type_assertion_expression" | "composite_literal" =>
+            type_name(n.child_by_field_name("type")?, source).map(Chain::Type),
         _ => None,
     }
 }
@@ -670,6 +875,11 @@ struct Ctx<'a> {
     index: &'a DefIndex,
     /// Types constructed somewhere in the scanned files.
     constructed: &'a HashSet<String>,
+    /// Struct fields of the indexed files, built on first use.
+    fields: &'a OnceCell<StructFields>,
+    /// Set when the ranked name-only fallback produced a target while
+    /// resolving the current call site, at any depth.
+    fell_back: Cell<bool>,
 }
 
 const MAX_BINDING_DEPTH: usize = 4;
@@ -677,15 +887,16 @@ const MAX_BINDING_DEPTH: usize = 4;
 /// Resolve a call site to its target definitions. Every path yields zero or
 /// one target except interface dispatch, which expands to one edge per
 /// implementing method.
-fn resolve_callee(callee: &Callee, line: usize, depth: usize, ctx: &Ctx) -> Vec<(usize, Confidence)> {
+fn resolve_callee(callee: &GoCallee, line: usize, depth: usize, ctx: &Ctx) -> Vec<(usize, Confidence)> {
     if depth > MAX_BINDING_DEPTH { return vec![]; }
-    match callee {
+    match &callee.callee {
         Callee::Path(segs) => {
             let Some((name, pkg)) = segs.split_last() else { return vec![] };
             resolve_pkg_fn(pkg, name, ctx).into_iter().collect()
         }
         Callee::Bare(name) => one(resolve_bare(name, line, depth, ctx)),
-        Callee::Method { receiver, name } => resolve_method(receiver, name, line, depth, ctx),
+        Callee::Method { receiver, name } =>
+            resolve_method(receiver, callee.recv.as_ref(), name, line, depth, ctx),
     }
 }
 
@@ -693,12 +904,26 @@ fn one(hit: Option<(usize, Confidence)>) -> Vec<(usize, Confidence)> {
     hit.into_iter().collect()
 }
 
+/// The ranked name-only fallback, noting in `ctx` when it produced a target.
+fn fallback(cands: Vec<usize>, prefer_methods: bool, ctx: &Ctx) -> Option<(usize, Confidence)> {
+    let hit = rank(cands, prefer_methods, ctx);
+    if hit.is_some() {
+        ctx.fell_back.set(true);
+    }
+    hit
+}
+
 fn resolve_bare(name: &str, line: usize, depth: usize, ctx: &Ctx) -> Option<(usize, Confidence)> {
-    // (a) local binding holding a function value
-    if let Some(Binding::FnValue(inner)) = last_binding(ctx.fun, name, line) {
-        if let Some(&hit) = resolve_callee(inner, line, depth + 1, ctx).first() {
-            return Some(hit);
+    // (a) local binding holding a function value, or a local closure, which
+    // reaches no definition
+    match last_binding(ctx.fun, name, line) {
+        Some(Binding::FnValue(inner)) => {
+            if let Some(&hit) = resolve_callee(inner, line, depth + 1, ctx).first() {
+                return Some(hit);
+            }
         }
+        Some(Binding::Closure) => return None,
+        _ => {}
     }
     // (b) function in the same file
     let same_file: Vec<usize> = name_candidates(ctx, name)
@@ -734,11 +959,12 @@ fn resolve_bare(name: &str, line: usize, depth: usize, ctx: &Ctx) -> Option<(usi
         return rank(glob_cands, false, ctx);
     }
     // (e) ranked fallback over every def with this name
-    rank(name_candidates(ctx, name).collect(), false, ctx)
+    fallback(name_candidates(ctx, name).collect(), false, ctx)
 }
 
 fn resolve_method(
     receiver: &Receiver,
+    recv: Option<&Chain>,
     name: &str,
     line: usize,
     depth: usize,
@@ -763,10 +989,42 @@ fn resolve_method(
                 if !impls.is_empty() { return impls; }
             }
         }
-        Receiver::Opaque(_) | Receiver::SelfRecv => {}
+        // `h.store.List()`, `NewX().M()`: typed through the chain
+        Receiver::Opaque(_) => {
+            if let Some(ty) = recv.and_then(|c| chain_type(c, line, depth + 1, ctx)) {
+                if let Some(hit) = method_on(&ty, name, ctx) { return one(Some(hit)); }
+                let impls = interface_impls(&ty, name, ctx);
+                if !impls.is_empty() { return impls; }
+            }
+        }
+        Receiver::SelfRecv => {}
     }
     // fallback: any def with this name, methods preferred
-    one(rank(name_candidates(ctx, name).collect(), true, ctx))
+    one(fallback(name_candidates(ctx, name).collect(), true, ctx))
+}
+
+/// Base type of a receiver chain at `line`: a variable through `var_type`, a
+/// field through the struct declarations in the index, a call through its
+/// target's return type. None when any link is unknown, and for a call
+/// whose target was only found by name.
+fn chain_type(c: &Chain, line: usize, depth: usize, ctx: &Ctx) -> Option<String> {
+    if depth > MAX_BINDING_DEPTH { return None; }
+    match c {
+        Chain::Name(v) => var_type(v, line, depth, ctx),
+        Chain::Field(base, field) => {
+            let ty = chain_type(base, line, depth + 1, ctx)?;
+            ctx.index.ask(&ty);
+            ctx.fields.get_or_init(|| StructFields::of(ctx.index)).lookup(&ty, field, ctx.file, 0)
+        }
+        Chain::Call(callee) => {
+            let outer = ctx.fell_back.replace(false);
+            let hit = resolve_callee(callee, line, depth + 1, ctx).first().copied();
+            let guessed = ctx.fell_back.replace(outer);
+            if guessed { return None; }
+            ctx.index.defs[hit?.0].ret.clone()
+        }
+        Chain::Type(t) => Some(t.clone()),
+    }
 }
 
 /// CHA-lite: a call through interface `iface` expands to `name` on every
@@ -898,9 +1156,9 @@ fn var_type(var: &str, line: usize, depth: usize, ctx: &Ctx) -> Option<String> {
                     return Some(ret.clone());
                 }
             }
-            return new_convention_type(callee);
+            return new_convention_type(&callee.callee);
         }
-        Some(Binding::FnValue(_)) | Some(Binding::Unknown) | None => {}
+        Some(Binding::FnValue(_)) | Some(Binding::Closure) | Some(Binding::Unknown) | None => {}
     }
     ctx.fun.params.iter().find(|(v, _)| v == var).map(|(_, t)| t.clone())
 }
@@ -973,7 +1231,8 @@ pub fn binding_type(
     let scope = scope_for(root, src);
     let fun = scope.fns.iter().filter(|f| f.line <= line).max_by_key(|f| f.line)?;
     let constructed = HashSet::new();
-    let ctx = Ctx { file, scope: &scope, fun, index, constructed: &constructed };
+    let fields = OnceCell::new();
+    let ctx = Ctx { file, scope: &scope, fun, index, constructed: &constructed, fields: &fields, fell_back: Cell::new(false) };
     var_type(var, line, 0, &ctx)
 }
 
@@ -1797,6 +2056,94 @@ mod tests {
     fn zero_candidates_stay_unresolved() {
         let results = resolve_all(&[("a/a.go", "package a\nfunc Go() { println() }\n")]);
         assert_eq!(target_of(&results, "Go", "println"), None);
+    }
+
+    /// The `fixtures/resolve-strict/go` package pair: `api` calls through
+    /// receivers whose methods share names with `api.Cache`'s, which the
+    /// name-only fallback would pick.
+    fn strict_fixture() -> Vec<(String, String, Option<(String, usize, Confidence)>)> {
+        resolve_all(&[
+            ("resolve-strict/go/store/store.go", include_str!("../../fixtures/resolve-strict/go/store/store.go")),
+            ("resolve-strict/go/api/cache.go", include_str!("../../fixtures/resolve-strict/go/api/cache.go")),
+            ("resolve-strict/go/api/handler.go", include_str!("../../fixtures/resolve-strict/go/api/handler.go")),
+        ])
+    }
+
+    fn all_targets(
+        results: &[(String, String, Option<(String, usize, Confidence)>)],
+        caller: &str,
+        callee: &str,
+    ) -> Vec<Option<(String, usize, Confidence)>> {
+        results.iter()
+            .filter(|(cr, ce, _)| cr == caller && ce == callee)
+            .map(|(_, _, t)| t.clone())
+            .collect()
+    }
+
+    const STORE: &str = "resolve-strict/go/store/store.go";
+    const CACHE: &str = "resolve-strict/go/api/cache.go";
+
+    #[test]
+    fn field_chain_receiver_resolves_through_the_field_type() {
+        let r = strict_fixture();
+        assert_eq!(target_of(&r, "Index", "List"), Some((STORE.into(), 9, Confidence::Exact)));
+    }
+
+    #[test]
+    fn field_chain_promotes_fields_of_embedded_structs() {
+        let r = strict_fixture();
+        assert_eq!(target_of(&r, "Promoted", "List"), Some((STORE.into(), 9, Confidence::Exact)));
+    }
+
+    #[test]
+    fn call_result_receiver_resolves_through_the_return_type() {
+        let r = strict_fixture();
+        assert_eq!(target_of(&r, "Rows", "Close"), Some((STORE.into(), 13, Confidence::Exact)));
+        assert_eq!(target_of(&r, "Rows", "Query"), Some((STORE.into(), 11, Confidence::Exact)));
+        assert_eq!(all_targets(&r, "Rows", "List"), vec![Some((STORE.into(), 9, Confidence::Exact))]);
+    }
+
+    #[test]
+    fn closure_named_like_a_method_has_no_target() {
+        let r = strict_fixture();
+        let calls = all_targets(&r, "Footer", "write");
+        assert_eq!(calls, vec![None], "the closure must not reach Cache.write by name");
+    }
+
+    #[test]
+    fn same_package_method_on_typed_variable_still_resolves() {
+        let r = strict_fixture();
+        assert_eq!(target_of(&r, "Control", "List"), Some((CACHE.into(), 8, Confidence::Exact)));
+    }
+
+    #[test]
+    fn func_typed_var_is_a_closure() {
+        let results = resolve_all(&[(
+            "a/a.go",
+            "package a\ntype T struct{}\nfunc (t *T) run() {}\nfunc Go() {\n  var run func()\n  run()\n}\n",
+        )]);
+        assert_eq!(all_targets(&results, "Go", "run"), vec![None]);
+    }
+
+    #[test]
+    fn call_result_found_only_by_name_types_nothing() {
+        // `lib.Get()` is outside the project, so its result types nothing
+        // and `.Close()` keeps the name fallback, which A2b removes.
+        let results = resolve_all(&[
+            ("a/a.go", "package a\nimport \"ext/lib\"\ntype R struct{}\nfunc (r *R) Close() {}\nfunc Go() { lib.Get().Close() }\n"),
+        ]);
+        assert_eq!(target_of(&results, "Go", "Close").map(|t| t.1), Some(4));
+    }
+
+    #[test]
+    fn struct_fields_pick_the_local_declaration_when_names_clash() {
+        let idx = build_index(&[
+            ("x/a.go", "package x\ntype H struct{ s *A }\n"),
+            ("y/b.go", "package y\ntype H struct{ s *B }\n"),
+        ]);
+        let f = StructFields::of(&idx);
+        assert_eq!(f.lookup("H", "s", "x/main.go", 0).as_deref(), Some("A"));
+        assert_eq!(f.lookup("H", "s", "z/main.go", 0), None);
     }
 }
 

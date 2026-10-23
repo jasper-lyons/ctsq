@@ -1,0 +1,5 @@
+# Kept out of walks over fixtures/ so the pinned call graph
+# (resolve::graph::tests::GRAPH_PIN) does not change. The unit tests in
+# src/resolve/go.rs read these files with include_str!. To run ctsq over
+# them, pass --no-ignore.
+go/
