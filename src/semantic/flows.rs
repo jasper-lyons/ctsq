@@ -18,7 +18,7 @@ use crate::config::{self, gomod, LangConfig, Slot};
 use crate::flow::{template, widen};
 use crate::flow::{
     self, upward, analyse_function, analyse_function_with, enclosing_function, start_at, start_in, CallEffect, CallSite,
-    EndFn, FlowCtx, FlowResult, Hop, ModelOutside, Module, Outside, Paths, StartKind,
+    EndFn, FlowCtx, FlowResult, Hop, ModelOutside, Module, Outside, Paths, Start, StartKind,
 };
 use crate::query::ast::{Combinator, Query};
 use crate::resolve::go::{binding_type_qualified, go_imports, go_signatures, GoSignature};
@@ -115,57 +115,11 @@ pub fn evaluate_flows(
         return Err(":not() is not available in data-flow queries yet".into());
     }
     let eventually = comb == Combinator::FlowsEventually;
-
-    let mut cfg = config::load(root, "go").map_err(|e| e.to_string())?;
-    if let Some(m) = gomod::module_path(scan) {
-        cfg.module_path = Some(m);
-    }
-
-    // The end: tail rows by file, or every outside call.
-    let mut ends: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
-    if let Some(t) = tail {
-        for (file, rows) in tail_rows(t, store)? {
-            ends.insert(file, rows.iter().map(|r| (r.start_byte, r.end_byte)).collect());
-        }
-    }
-    let imports_cache: RefCell<HashMap<String, HashMap<String, String>>> = RefCell::new(HashMap::new());
-    // A lazy store gives a module read one name at a time.
-    let module = match store.finder() {
-        Some(f) => Module::lazy(f, &cfg.mechanics),
-        None => {
-            let files: Vec<(&str, Node, &[u8])> = store
-                .iter()
-                .filter(|(_, pf)| pf.lang == "go")
-                .filter_map(|(f, pf)| pf.tree.as_ref().map(|t| (f, t.root_node(), pf.source.as_slice())))
-                .collect();
-            Module::build(&files, &cfg.mechanics)
-        }
-    };
-    let modpath = cfg.module_path.clone();
     let has_end = tail.is_some();
-    let is_end = |n: Node, src: &[u8]| -> bool {
-        let Some(file) = store.file_of(src) else { return false };
-        let Some(f) = n.child_by_field_name("function") else { return false };
-        if has_end {
-            let name = f.child_by_field_name("field").unwrap_or(f);
-            return ends
-                .get(file)
-                .is_some_and(|rs| rs.iter().any(|&(s, e)| s <= name.start_byte() && name.end_byte() <= e));
-        }
-        let mut root = n;
-        while let Some(p) = root.parent() {
-            root = p;
-        }
-        let cx = FlowCtx { file, src, root, mech: &cfg.mechanics, module: &module };
-        is_outside_call(&cx, n, f, modpath.as_deref(), &imports_cache)
-    };
 
-    let mut walk = Walk::new(store, graph, &cfg, &module, &is_end, eventually, opts.max);
-    walk.expand = opts.expand;
-    walk.tail = tail;
-    walk.tmpl_mech = config::load(root, "gotmpl").ok().map(|c| c.mechanics);
+    let setup = DownSetup::new(store, graph, root, scan, tail, eventually, opts)?;
+    let walk = setup.walk();
     let mut groups: Vec<FlowResult> = vec![];
-    let mut raw: Vec<FlowResult> = vec![];
 
     // Start points from the head segment.
     let mut seen_vars: HashSet<(String, usize, String)> = HashSet::new();
@@ -176,7 +130,7 @@ pub fn evaluate_flows(
         if pf.lang != "go" {
             continue;
         }
-        let cx = FlowCtx { file: &file, src: &pf.source, root: tree.root_node(), mech: &cfg.mechanics, module: &module };
+        let cx = FlowCtx { file: &file, src: &pf.source, root: tree.root_node(), mech: &setup.cfg.mechanics, module: &setup.module };
         for r in &rows {
             let Some(start) = start_in(&cx, r.start_byte, r.end_byte) else { continue };
             match &start.kind {
@@ -185,9 +139,7 @@ pub fn evaluate_flows(
                     if !seen_vars.insert((file.clone(), func.start_byte(), name.clone())) {
                         continue;
                     }
-                    let res = walk.run(&file, || analyse_function(&cx, func, &start, walk.end, &walk));
-                    raw.push(res.clone());
-                    groups.push(res);
+                    groups.extend(walk.walk_start(&file, &start));
                 }
                 StartKind::Field { name, owner } => {
                     let key = (name.clone(), owner.clone());
@@ -201,28 +153,7 @@ pub fn evaluate_flows(
                         .filter_map(|x| start_in(&cx, x.start_byte, x.end_byte))
                         .find(|s| s.kind == start.kind && s.func == "field" && is_decl_row(&cx, s.start_byte))
                         .unwrap_or_else(|| start.clone());
-                    let mut root: Option<FlowResult> = None;
-                    for (ffile, func_byte) in field_users(store, &cfg, &module, name, owner.as_deref()) {
-                        let Some(fpf) = store.get(&ffile) else { continue };
-                        let Some(ftree) = &fpf.tree else { continue };
-                        let fcx = FlowCtx {
-                            file: &ffile,
-                            src: &fpf.source,
-                            root: ftree.root_node(),
-                            mech: &cfg.mechanics,
-                            module: &module,
-                        };
-                        let Some(func) = enclosing_function(fcx.root, fcx.mech, func_byte) else { continue };
-                        let res = walk.run(&ffile, || analyse_function(&fcx, func, &decl, walk.end, &walk));
-                        match &mut root {
-                            None => root = Some(res),
-                            Some(r) => r.root.children.extend(res.root.children),
-                        }
-                    }
-                    if let Some(r) = root {
-                        raw.push(r.clone());
-                        groups.push(r);
-                    }
+                    groups.extend(walk.walk_start(&file, &decl));
                 }
             }
         }
@@ -232,27 +163,13 @@ pub fn evaluate_flows(
     let mut out = String::new();
     let (mut found, mut cut, mut through) = (0, 0, 0);
     for g in &groups {
-        let mut root = g.root.clone();
-        if !has_end {
-            retag(&mut root, false);
+        let t = walk.shape(g);
+        found += t.found;
+        if let Some(h) = &t.hop {
+            through += t.through;
+            cut += t.cut;
+            print_tree(h, 0, &mut out);
         }
-        let mut pruned = prune(&root, end_tag, eventually, 0, false).unwrap_or_else(|| Hop { children: vec![], ..root.clone() });
-        let routes_through = through_unmodelled(&pruned, end_tag, false);
-        if opts.only.is_empty() {
-            found += pruned.walk().iter().filter(|h| h.has(end_tag)).count();
-        } else {
-            // Routes count when a hop on them carries a wanted tag. A group
-            // with none of those prints nothing.
-            let n = matching_routes(&pruned, &opts.only, end_tag, false);
-            found += n;
-            match only(&pruned, &opts.only, true) {
-                Some(o) if !o.children.is_empty() => pruned = o,
-                _ => continue,
-            }
-        }
-        through += routes_through;
-        cut += pruned.walk().iter().filter(|h| h.has(MAX_DEPTH)).count();
-        print_tree(&pruned, 0, &mut out);
     }
     out.push_str(&walk.outside_rows());
     if groups.is_empty() {
@@ -269,7 +186,7 @@ pub fn evaluate_flows(
     if through > 0 {
         out.push_str(&format!("{} passed through unmodelled calls\n", plural(through, "route")));
     }
-    let ends: Vec<&Hop> = raw.iter().flat_map(|r| r.unmodelled_ends()).collect();
+    let ends: Vec<&Hop> = groups.iter().flat_map(|r| r.unmodelled_ends()).collect();
     if !ends.is_empty() {
         let list: Vec<String> = ends
             .iter()
@@ -297,25 +214,8 @@ fn evaluate_upward(
     scan: &Path,
     opts: &FlowOptions,
 ) -> Result<FlowReport, String> {
-    let mut cfg = config::load(root, "go").map_err(|e| e.to_string())?;
-    if let Some(m) = gomod::module_path(scan) {
-        cfg.module_path = Some(m);
-    }
-    let mut ends: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
-    if let Some(t) = tail {
-        for (file, rows) in segment_rows(t, store)? {
-            ends.insert(file, rows.iter().map(|r| (r.start_byte, r.end_byte)).collect());
-        }
-    }
-    let is_end = |file: &str, call: Node| -> bool {
-        let Some(f) = call.child_by_field_name("function") else { return false };
-        let name = f.child_by_field_name("field").unwrap_or(f);
-        ends.get(file).is_some_and(|rs| rs.iter().any(|&(s, e)| s <= name.start_byte() && name.end_byte() <= e))
-    };
-    let mut up = upward::Up::new(store, graph, Some(&cfg), opts.max);
-    if tail.is_some() {
-        up.end = Some(&is_end);
-    }
+    let setup = UpSetup::new(store, graph, root, scan, tail, eventually, opts)?;
+    let up = setup.walk();
     let mut out = String::new();
     let (mut found, mut cut, mut groups) = (0, 0, 0);
     let mut seen: HashSet<(String, usize, String)> = HashSet::new();
@@ -328,46 +228,20 @@ fn evaluate_upward(
         let cx_root = tree.root_node();
         let mut starts: Vec<Node> = vec![];
         for r in &rows {
-            let Some(n) = cx_root.descendant_for_byte_range(r.start_byte, r.end_byte) else { continue };
-            // A parameter row names its parameter, a field access its field.
-            let n = match n.kind() {
-                "parameter_declaration" | "variadic_parameter_declaration" => n.child_by_field_name("name").unwrap_or(n),
-                _ => n,
-            };
-            if n.kind() != "identifier" {
-                continue;
-            }
+            let Some(n) = up_ident(cx_root, r.start_byte, r.end_byte) else { continue };
             let func = upward::function_at(cx_root, n.start_byte()).map(|f| f.start_byte()).unwrap_or(0);
             if seen.insert((file.clone(), func, upward::text(n, &pf.source).to_string())) {
                 starts.push(n);
             }
         }
         for n in starts {
-            let Some(mut h) = up.start(&file, n) else { continue };
-            if !eventually {
-                h = upward::truncate(&h, 1);
-            }
-            if tail.is_some() {
-                match upward::prune_to_end(&h) {
-                    Some(p) => h = p,
-                    None => continue,
-                }
-            }
-            if !opts.only.is_empty() {
-                match only(&h, &opts.only, true) {
-                    Some(o) if !o.children.is_empty() || o.tags.iter().any(|t| tag_matches(t, &opts.only)) => h = o,
-                    _ => continue,
-                }
-            }
+            let Some(t) = up.tree(&file, n) else { continue };
             groups += 1;
-            let hops = h.walk();
-            found += if tail.is_some() {
-                hops.iter().filter(|x| x.has(upward::END)).count()
-            } else {
-                hops.iter().filter(|x| x.tags.iter().any(|t| t.starts_with("source"))).count()
-            };
-            cut += hops.iter().filter(|x| x.has(MAX_DEPTH)).count();
-            print_tree_with(&h, 0, true, &mut out);
+            found += t.found;
+            cut += t.cut;
+            if let Some(h) = &t.hop {
+                print_tree_with(h, 0, true, &mut out);
+            }
         }
     }
     if groups == 0 && opts.only.is_empty() && tail.is_none() {
@@ -384,6 +258,272 @@ fn evaluate_upward(
         out.push_str(&format!("{} cut at --max-depth {}\n", plural(cut, "route"), opts.max));
     }
     Ok(FlowReport { text: out, found })
+}
+
+/// One start's tree, shaped the way `ctsq path` prints it, and its counts.
+#[derive(Debug, Clone)]
+pub struct StartTree {
+    /// The tree with the start as its root. Downward: after `retag` (no end
+    /// selector), `prune` and `--only`. Upward: after `truncate` (`<=`),
+    /// `prune_to_end` (an end selector) and `--only`. None when `--only` left
+    /// nothing under a downward start, whose `found` still counts.
+    pub hop: Option<Hop>,
+    /// Routes found: sink or `outside` hops downward, origins upward.
+    pub found: usize,
+    /// Downward routes that passed through an unmodelled call. 0 upward.
+    pub through: usize,
+    /// Routes cut at `--max-depth` (hops tagged `stopped: max depth`).
+    pub cut: usize,
+}
+
+/// Byte offset of 1-based `line` and 1-based byte column `col` in `src`.
+/// None when the line does not exist or the column is past its end.
+pub fn byte_at(src: &[u8], line: usize, col: usize) -> Option<usize> {
+    if line == 0 || col == 0 {
+        return None;
+    }
+    let mut start = 0;
+    for _ in 1..line {
+        start += src.get(start..)?.iter().position(|&b| b == b'\n')? + 1;
+    }
+    let len = src[start..].iter().position(|&b| b == b'\n').unwrap_or(src.len() - start);
+    (col <= len).then_some(start + col - 1)
+}
+
+/// Splits `path:line:col` into its parts. None unless both numbers parse.
+pub fn parse_position(s: &str) -> Option<(&str, usize, usize)> {
+    let mut parts = s.rsplitn(3, ':');
+    let col = parts.next()?.parse().ok()?;
+    let line = parts.next()?.parse().ok()?;
+    let path = parts.next().filter(|p| !p.is_empty())?;
+    Some((path, line, col))
+}
+
+/// The parsed Go file `file` in `store` and the byte at `line`, `col`, or the
+/// error to show.
+fn locate<'s>(store: &'s TreeStore, file: &str, line: usize, col: usize) -> Result<(&'s [u8], Node<'s>, usize), String> {
+    let pf = store.get(file).ok_or_else(|| format!("no such file in the scan: {file}"))?;
+    if pf.lang != "go" {
+        return Err(format!("{file} is not a Go file, data flow reads Go only"));
+    }
+    let tree = pf.tree.as_ref().ok_or_else(|| format!("{file} did not parse"))?;
+    let byte = byte_at(&pf.source, line, col).ok_or_else(|| format!("{file} has no line {line} column {col}"))?;
+    Ok((&pf.source, tree.root_node(), byte))
+}
+
+/// What every downward (`=>`, `==>`) start shares: the Go config with the
+/// module path, the module's structs and globals, and the end selector's rows.
+/// `walk` borrows it for the walk the starts run on.
+pub struct DownSetup<'s> {
+    store: &'s TreeStore,
+    graph: &'s FlowGraph,
+    cfg: LangConfig,
+    module: Module,
+    /// The end: tail rows by file. Empty without an end selector, where
+    /// every outside call is an end.
+    ends: HashMap<String, Vec<(usize, usize)>>,
+    tail: Option<&'s Query>,
+    eventually: bool,
+    opts: FlowOptions,
+    tmpl_mech: Option<config::Mechanics>,
+    imports_cache: RefCell<HashMap<String, HashMap<String, String>>>,
+}
+
+impl<'s> DownSetup<'s> {
+    /// `root` is the repo root the language config is loaded from, `scan` the
+    /// path whose nearest go.mod gives the module path. `tail` is the end
+    /// selector, `eventually` true for `==>`.
+    pub fn new(
+        store: &'s TreeStore,
+        graph: &'s FlowGraph,
+        root: &Path,
+        scan: &Path,
+        tail: Option<&'s Query>,
+        eventually: bool,
+        opts: &FlowOptions,
+    ) -> Result<Self, String> {
+        let mut cfg = config::load(root, "go").map_err(|e| e.to_string())?;
+        if let Some(m) = gomod::module_path(scan) {
+            cfg.module_path = Some(m);
+        }
+        let mut ends: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+        if let Some(t) = tail {
+            for (file, rows) in tail_rows(t, store)? {
+                ends.insert(file, rows.iter().map(|r| (r.start_byte, r.end_byte)).collect());
+            }
+        }
+        // A lazy store gives a module read one name at a time.
+        let module = match store.finder() {
+            Some(f) => Module::lazy(f, &cfg.mechanics),
+            None => {
+                let files: Vec<(&str, Node, &[u8])> = store
+                    .iter()
+                    .filter(|(_, pf)| pf.lang == "go")
+                    .filter_map(|(f, pf)| pf.tree.as_ref().map(|t| (f, t.root_node(), pf.source.as_slice())))
+                    .collect();
+                Module::build(&files, &cfg.mechanics)
+            }
+        };
+        let tmpl_mech = config::load(root, "gotmpl").ok().map(|c| c.mechanics);
+        Ok(DownSetup {
+            store,
+            graph,
+            cfg,
+            module,
+            ends,
+            tail,
+            eventually,
+            opts: opts.clone(),
+            tmpl_mech,
+            imports_cache: RefCell::new(HashMap::new()),
+        })
+    }
+
+    /// Whether call `n` in `src` is an end: a call the end selector matched,
+    /// or without one, a call outside the module.
+    fn is_end(&self, n: Node, src: &[u8]) -> bool {
+        let Some(file) = self.store.file_of(src) else { return false };
+        let Some(f) = n.child_by_field_name("function") else { return false };
+        if self.tail.is_some() {
+            let name = f.child_by_field_name("field").unwrap_or(f);
+            return self
+                .ends
+                .get(file)
+                .is_some_and(|rs| rs.iter().any(|&(s, e)| s <= name.start_byte() && name.end_byte() <= e));
+        }
+        let mut root = n;
+        while let Some(p) = root.parent() {
+            root = p;
+        }
+        let cx = FlowCtx { file, src, root, mech: &self.cfg.mechanics, module: &self.module };
+        is_outside_call(&cx, n, f, self.cfg.module_path.as_deref(), &self.imports_cache)
+    }
+
+    /// The walk the starts run on. One walk serves every start of a query:
+    /// it remembers callee effects and the interfaces it widened.
+    pub fn walk(&self) -> Walk<'_> {
+        let mut walk = Walk::new(
+            self.store,
+            self.graph,
+            &self.cfg,
+            &self.module,
+            Box::new(move |n, src| self.is_end(n, src)),
+            self.eventually,
+            self.opts.max,
+        );
+        walk.expand = self.opts.expand;
+        walk.tail = self.tail;
+        walk.tmpl_mech = self.tmpl_mech.as_ref();
+        walk.only = &self.opts.only;
+        walk
+    }
+}
+
+/// What every upward (`<=`, `<==`) start shares: the Go config with the
+/// module path and the end selector's rows. `walk` borrows it.
+pub struct UpSetup<'s> {
+    store: &'s TreeStore,
+    graph: &'s FlowGraph,
+    cfg: LangConfig,
+    /// Whether a call is one the end selector matched. None without one.
+    end: Option<Box<upward::UpEnd<'static>>>,
+    eventually: bool,
+    opts: FlowOptions,
+}
+
+impl<'s> UpSetup<'s> {
+    /// The arguments are those of `DownSetup::new`, `eventually` true for `<==`.
+    pub fn new(
+        store: &'s TreeStore,
+        graph: &'s FlowGraph,
+        root: &Path,
+        scan: &Path,
+        tail: Option<&Query>,
+        eventually: bool,
+        opts: &FlowOptions,
+    ) -> Result<Self, String> {
+        let mut cfg = config::load(root, "go").map_err(|e| e.to_string())?;
+        if let Some(m) = gomod::module_path(scan) {
+            cfg.module_path = Some(m);
+        }
+        let mut end: Option<Box<upward::UpEnd<'static>>> = None;
+        if let Some(t) = tail {
+            let mut ends: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+            for (file, rows) in segment_rows(t, store)? {
+                ends.insert(file, rows.iter().map(|r| (r.start_byte, r.end_byte)).collect());
+            }
+            end = Some(Box::new(move |file: &str, call: Node| -> bool {
+                let Some(f) = call.child_by_field_name("function") else { return false };
+                let name = f.child_by_field_name("field").unwrap_or(f);
+                ends.get(file).is_some_and(|rs| rs.iter().any(|&(s, e)| s <= name.start_byte() && name.end_byte() <= e))
+            }));
+        }
+        Ok(UpSetup { store, graph, cfg, end, eventually, opts: opts.clone() })
+    }
+
+    /// The walk the starts run on. One walk serves every start of a query:
+    /// they share its step budget.
+    pub fn walk(&self) -> UpWalk<'_> {
+        let mut up = upward::Up::new(self.store, self.graph, Some(&self.cfg), self.opts.max);
+        up.end = self.end.as_deref();
+        UpWalk { up, eventually: self.eventually, has_end: self.end.is_some(), only: &self.opts.only }
+    }
+}
+
+/// The upward walk of one query, see `UpSetup::walk`.
+pub struct UpWalk<'a> {
+    up: upward::Up<'a>,
+    eventually: bool,
+    has_end: bool,
+    only: &'a [String],
+}
+
+/// The identifier an upward start at `start..end` of the tree under `root`
+/// names: a parameter row names its parameter. None when it is no identifier.
+pub fn up_ident(root: Node, start: usize, end: usize) -> Option<Node> {
+    let n = root.descendant_for_byte_range(start, end)?;
+    let n = match n.kind() {
+        "parameter_declaration" | "variadic_parameter_declaration" => n.child_by_field_name("name").unwrap_or(n),
+        _ => n,
+    };
+    (n.kind() == "identifier").then_some(n)
+}
+
+impl<'a> UpWalk<'a> {
+    /// The origins of identifier `n` in `file`, as `ctsq path` prints them.
+    /// None when the walk finds no start there, the end selector matches
+    /// nothing below it, or `--only` leaves nothing.
+    pub fn tree(&self, file: &str, n: Node<'a>) -> Option<StartTree> {
+        let mut h = self.up.start(file, n)?;
+        if !self.eventually {
+            h = upward::truncate(&h, 1);
+        }
+        if self.has_end {
+            h = upward::prune_to_end(&h)?;
+        }
+        if !self.only.is_empty() {
+            match only(&h, self.only, true) {
+                Some(o) if !o.children.is_empty() || o.tags.iter().any(|t| tag_matches(t, self.only)) => h = o,
+                _ => return None,
+            }
+        }
+        let hops = h.walk();
+        let found = if self.has_end {
+            hops.iter().filter(|x| x.has(upward::END)).count()
+        } else {
+            hops.iter().filter(|x| x.tags.iter().any(|t| t.starts_with("source"))).count()
+        };
+        let cut = hops.iter().filter(|x| x.has(MAX_DEPTH)).count();
+        Some(StartTree { hop: Some(h), found, through: 0, cut })
+    }
+
+    /// `tree` from the identifier at 1-based `line` and byte column `col` of
+    /// `file`, a path as the store holds it. Ok(None) when no value starts there.
+    pub fn tree_at(&self, file: &str, line: usize, col: usize) -> Result<Option<StartTree>, String> {
+        let (_, root, byte) = locate(self.up.store, file, line, col)?;
+        let Some(n) = up_ident(root, byte, byte) else { return Ok(None) };
+        Ok(self.tree(file, n))
+    }
 }
 
 /// Rows of the end selector. An end that only template files have, such as
@@ -686,8 +826,9 @@ fn print_tree_with(h: &Hop, depth: usize, upward: bool, out: &mut String) {
     }
 }
 
-/// The `Outside` hook that walks into in-repo callees.
-struct Walk<'a> {
+/// The `Outside` hook that walks into in-repo callees, and the downward walk
+/// of one query (`DownSetup::walk`).
+pub struct Walk<'a> {
     store: &'a TreeStore,
     graph: &'a FlowGraph,
     cfg: &'a LangConfig,
@@ -705,7 +846,7 @@ struct Walk<'a> {
     /// their field paths.
     memo: RefCell<HashMap<(String, usize, Vec<usize>, bool, String), CallEffect>>,
     /// The end predicate, used inside callees too.
-    end: &'a EndFn<'a>,
+    end: Box<EndFn<'a>>,
     /// Outside implementations of module interfaces, by interface, found on
     /// first use.
     outside: RefCell<HashMap<String, Vec<widen::OutsideImpl>>>,
@@ -716,7 +857,9 @@ struct Walk<'a> {
     /// The end selector, matched against linked templates too.
     tail: Option<&'a Query>,
     /// Mechanics of the template language, None when it cannot be loaded.
-    tmpl_mech: Option<config::Mechanics>,
+    tmpl_mech: Option<&'a config::Mechanics>,
+    /// `--only`: keep hops carrying one of these tags.
+    only: &'a [String],
 }
 
 impl<'a> Walk<'a> {
@@ -725,7 +868,7 @@ impl<'a> Walk<'a> {
         graph: &'a FlowGraph,
         cfg: &'a LangConfig,
         module: &'a Module,
-        end: &'a EndFn<'a>,
+        end: Box<EndFn<'a>>,
         follow: bool,
         max: usize,
     ) -> Walk<'a> {
@@ -747,7 +890,84 @@ impl<'a> Walk<'a> {
             widened_ifaces: RefCell::new(vec![]),
             tail: None,
             tmpl_mech: None,
+            only: &[],
         }
+    }
+
+    /// The raw walk from `start` in `file`: a variable is walked in its
+    /// function, a field in every function that reads or writes it, those
+    /// walks merged under one root. None when no function holds the start.
+    pub fn walk_start(&self, file: &str, start: &Start) -> Option<FlowResult> {
+        match &start.kind {
+            StartKind::Var(_) => {
+                let pf = self.store.get(file)?;
+                let tree = pf.tree.as_ref()?;
+                let cx = FlowCtx { file, src: &pf.source, root: tree.root_node(), mech: &self.cfg.mechanics, module: self.module };
+                let func = enclosing_function(cx.root, cx.mech, start.start_byte)?;
+                Some(self.run(file, || analyse_function(&cx, func, start, &*self.end, self)))
+            }
+            StartKind::Field { name, owner } => {
+                let mut root: Option<FlowResult> = None;
+                for (ffile, func_byte) in field_users(self.store, self.cfg, self.module, name, owner.as_deref()) {
+                    let Some(fpf) = self.store.get(&ffile) else { continue };
+                    let Some(ftree) = &fpf.tree else { continue };
+                    let fcx = FlowCtx {
+                        file: &ffile,
+                        src: &fpf.source,
+                        root: ftree.root_node(),
+                        mech: &self.cfg.mechanics,
+                        module: self.module,
+                    };
+                    let Some(func) = enclosing_function(fcx.root, fcx.mech, func_byte) else { continue };
+                    let res = self.run(&ffile, || analyse_function(&fcx, func, start, &*self.end, self));
+                    match &mut root {
+                        None => root = Some(res),
+                        Some(r) => r.root.children.extend(res.root.children),
+                    }
+                }
+                root
+            }
+        }
+    }
+
+    /// A raw walk shaped as `ctsq path` prints it: outside calls retagged
+    /// without an end selector, pruned to the routes reaching an end, then
+    /// `--only`.
+    pub fn shape(&self, g: &FlowResult) -> StartTree {
+        let has_end = self.tail.is_some();
+        let end_tag = if has_end { "sink" } else { "outside" };
+        let mut root = g.root.clone();
+        if !has_end {
+            retag(&mut root, false);
+        }
+        let mut pruned = prune(&root, end_tag, self.follow, 0, false).unwrap_or_else(|| Hop { children: vec![], ..root.clone() });
+        let through = through_unmodelled(&pruned, end_tag, false);
+        let found;
+        if self.only.is_empty() {
+            found = pruned.walk().iter().filter(|h| h.has(end_tag)).count();
+        } else {
+            // Routes count when a hop on them carries a wanted tag. A group
+            // with none of those prints nothing.
+            found = matching_routes(&pruned, self.only, end_tag, false);
+            match only(&pruned, self.only, true) {
+                Some(o) if !o.children.is_empty() => pruned = o,
+                _ => return StartTree { hop: None, found, through: 0, cut: 0 },
+            }
+        }
+        let cut = pruned.walk().iter().filter(|h| h.has(MAX_DEPTH)).count();
+        StartTree { hop: Some(pruned), found, through, cut }
+    }
+
+    /// The shaped tree from the value at 1-based `line` and byte column `col`
+    /// of `file`, a path as the store holds it. A field start merges the
+    /// walks of every function using the field. Ok(None) when no variable,
+    /// parameter or field starts there.
+    pub fn tree_at(&self, file: &str, line: usize, col: usize) -> Result<Option<StartTree>, String> {
+        let (src, root, byte) = locate(self.store, file, line, col)?;
+        let cx = FlowCtx { file, src, root, mech: &self.cfg.mechanics, module: self.module };
+        let Some(n) = root.descendant_for_byte_range(byte, byte) else { return Ok(None) };
+        let Some(start) = start_in(&cx, n.start_byte(), n.end_byte()) else { return Ok(None) };
+        Ok(self.walk_start(file, &start).map(|g| self.shape(&g)))
     }
 
     /// Run a top-level walk in `file`.
@@ -808,7 +1028,7 @@ impl<'a> Walk<'a> {
         let func = enclosing_function(cx.root, cx.mech, first.start_byte)?;
         let also: Vec<(String, Paths)> = params[1..].iter().map(|(p, ps)| (p.name.clone(), ps.clone())).collect();
         self.files.borrow_mut().push(d.id.file.clone());
-        let r = analyse_function_with(&cx, func, &start, &also, self.end, self);
+        let r = analyse_function_with(&cx, func, &start, &also, &*self.end, self);
         self.files.borrow_mut().pop();
         let is_ptr = |p: &crate::resolve::go::GoParam, name: &str| p.name == name && p.ty.starts_with('*');
         let mut writes = vec![];
@@ -1064,7 +1284,7 @@ impl Walk<'_> {
     /// data as `.`, each tree hung under the call. None when the call is not
     /// one or no template could be linked.
     fn template_effect(&self, site: &CallSite, file: &str) -> Option<CallEffect> {
-        let mech = self.tmpl_mech.as_ref()?;
+        let mech = self.tmpl_mech?;
         let method = site.method.as_deref()?;
         let model = flow::model_key(self.cfg, site).and_then(|k| self.cfg.model(&k)).and_then(|m| m.template.clone());
         let data_arg = match (model, method) {
