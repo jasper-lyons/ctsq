@@ -231,15 +231,16 @@ fixtures/scope/Asset.tsx:11: const saveAssetNow = () => props.asset  ?
 
 ```
 ctsq -q 'id#hide_rows' --scope src/
-src/main.rs:1040: hide_rows(&mut hider, file, source, fetched.tree(), rows, true, &mut hidden)
-  in src/main.rs:666-1119  fn main() {
-src/main.rs:1183: fn hide_rows(
-src/main.rs:1486: for r in &hide_rows(&mut hider, file, source, fetched.tree(), rows, false, &mut name_hidden) {
-  in src/main.rs:1440-1522  fn run_refs(
-3 matches
+src/query_run.rs:85: pub fn hide_rows(
+src/query_run.rs:242: hide_rows(hider, file, source, fetched.tree(), rows, true, &mut self.hidden)
+  in src/query_run.rs:220-249  pub fn file(&mut self, hider: &mut files::Hider, file: &str, lang_name: &'static str) -> Option<File...
+src/refs.rs:11: use crate::query_run::{fetch, hide_rows, lacks_needles, with_path};
+src/refs.rs:90: for m in hide_rows(hider, file, source, fetched.tree(), found, false, &mut name_hidden) {
+  in src/refs.rs:53-107  pub fn build(names: &[String], jobs: &[(String, &'static str)], hider: &mut files::Hider) -> Result<...
+4 matches
 ```
 
-Next: pull the scope with `ctsq -q '*function#run_refs' --body src/main.rs`.
+Next: pull the scope with `ctsq -q '*function#build' --body src/refs.rs`.
 
 ### 14. From a line to its definition
 
