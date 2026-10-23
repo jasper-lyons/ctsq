@@ -1,0 +1,4 @@
+# Kept out of walks over fixtures/ so the pinned call graph
+# (resolve::graph::tests::GRAPH_PIN) does not change. The unit tests in
+# src/api.rs read these files by path with no_ignore.
+go/
