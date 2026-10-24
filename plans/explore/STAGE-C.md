@@ -81,7 +81,7 @@ Models cover:
 - the array methods `map`, `filter`, `sort`, `find`, `flat`, `flatMap`
 - `Promise`/`await` and `Response.json`
 
-They live as TOML under `config/models/ts/` (`builtins.toml`, `solid-js.toml`). The model syntax gains a slot that binds a receiver's or argument's elements to a callback's parameter, such as `receiver[*] -> arg0.param0`. Why: Jasper chose core plus stores, `Index` and `Switch` (2026-10-24). `on()` and contexts come later.
+They live as TOML under `config/models/ts/` (`builtins.toml`, `solid-js.toml`). The model syntax gains a slot that binds a receiver's or argument's elements to a callback's parameter, such as `receiver[*] -> 0.param0` (amended 2026-10-24 by the C1 plan review: the existing syntax has bare indices, not `arg0`). Model keys are `<import source>.<name>` for imported functions (`solid-js.For`, `solid-js/store.createStore`) and `<Global>.prototype.<method>` for receiver methods whose receiver type is unknown (`Array.prototype.map`, `Promise.prototype.then`, `Response.prototype.json`). Why: Jasper chose core plus stores, `Index` and `Switch` (2026-10-24). `on()` and contexts come later.
 
 ### C04. A callback bound by an iteration model is a loop
 
@@ -127,13 +127,29 @@ None yet.
 
 ## Package: ts-mech
 
-Files: the `[nodes]`, `[fields]` and `[tokens]` sections of `config/languages/typescript.toml`, `tsx.toml` and `javascript.toml`; `config/mechanics.rs` (new optional `Nodes` keys: object, pair, array, jsx_element, jsx_self_closing, jsx_expression, jsx_attribute, patterns, await, spread, literal kinds); new `config/models/ts/builtins.toml` and `config/models/ts/solid-js.toml`; the model parser for the C03 slot syntax (`src/config/models.rs`, `parse_file` `:117`); new `src/flow/ts_sig.rs` (a TS parameter list, with destructured parameters as paths), declared in `src/flow/mod.rs` with one line; and tests beside the code.
+Files:
+- the `[nodes]`, `[fields]` and `[tokens]` sections of `config/languages/typescript.toml`, `tsx.toml` and `javascript.toml`. Those files hold only `[tests]` today; `go.toml` `:5`, `:39`, `:63` is the shape to copy. Every value is a real grammar kind. The plain `typescript` grammar has no `jsx_*` kinds, so `typescript.toml` leaves the JSX keys out.
+- `src/config/mechanics.rs`: new optional `Nodes` keys, with these exact key names, each `Vec<String>`, `#[serde(default, skip_serializing_if = "Vec::is_empty")]` so `ctsq config dump go` prints exactly what it prints today:
+  - `object` (`object`), `pair` (`pair`), `array` (`array`)
+  - `jsx_element` (`jsx_element`), `jsx_self_closing` (`jsx_self_closing_element`), `jsx_expression` (`jsx_expression`), `jsx_attribute` (`jsx_attribute`), `jsx_text` (`jsx_text`)
+  - `pattern` (`object_pattern`, `array_pattern`, `assignment_pattern`, `rest_pattern`, `pair_pattern`, `object_assignment_pattern`, `shorthand_property_identifier_pattern`)
+  - `await` (`await_expression`), `spread` (`spread_element`)
+  - `literal` (`string`, `template_string`, `number`; Go's literal kinds are left to C2, not added here)
+  `Nodes` is `mechanics.rs:47`, `Fields` `:117`, `Tokens` `:171`. No key is required today (every struct is `#[serde(default)]`), and none becomes required.
+- `src/config/models.rs`: the C03 slot syntax. `Slot`'s variants (`:10`) stay unchanged, because engine.rs and upward.rs match on them exhaustively and C1 does not own those files. The element and parameter binding go in new fields on `Pass` (`:44`): `from_elements: bool` (the `[*]` suffix on the source) and `to_param: Option<usize>` (the `.paramN` suffix on the target). `Pass::parse` (`:50`) accepts the suffixes; every existing model string parses to the same `Pass` with the new fields at their defaults. `parse_file` is `:117`.
+- `src/config/mod.rs`: `BUILTIN_MODELS` (`:116`) gains the two new files, and the model lookup (`load_with`, `:280-313`) maps the languages `typescript`, `tsx` and `javascript` to the model directory `ts`, for built-in and for disk models (`.ctsq/models/ts/`, XDG). Additive only: Go's lookup is unchanged.
+- new `config/models/ts/builtins.toml` and `config/models/ts/solid-js.toml`, keyed as C03 says.
+- new `src/flow/ts_sig.rs`: a TS or JS parameter list, with destructured parameters as paths. Mirror `GoParam`/`GoSignature`/`go_signatures` (`src/resolve/go.rs:1357`, `:1373`, `:1383`). JS `formal_parameters` holds bare patterns; TS and TSX wrap them in `required_parameter`/`optional_parameter` with `pattern`, `type` and `value` fields. Declared in `src/flow/mod.rs` with one line, `pub mod ts_sig;` like its neighbours (`:14-17`). Nothing calls it until C3, so follow the repo's `#[allow(dead_code)] // wired by C3` pattern (`src/resolve/go.rs:1354`) where the build would warn.
+- tests beside the code.
 
 Acceptance:
-- the TS, TSX and JS mechanics load, with every required key and the new optional ones present
-- `go.toml` is unchanged, and loading it gives the same `Nodes` as before
-- the models parse, and a test asserts the slots for `For`, `Index`, `createMemo`, `createResource`, `createStore` and `Array.map`
-- `ts_sig` returns the parameters for `function f(a, {b, c}: P, ...rest)`, arrow functions, and `(props) =>`
+- a test loads each of the three language files through the config loader and asserts these lists are non-empty: call, assign, function, param, object, pair, array, pattern, await, spread, literal, and for TSX and JS also jsx_element, jsx_self_closing, jsx_expression, jsx_attribute
+- a test asserts every kind named in the three TOMLs exists in its grammar (`Language::id_for_node_kind`, named, non-zero)
+- `config/languages/go.toml` is byte-identical to base, and `ctsq config dump go` prints the same as the reference binary
+- every existing model in `config/models/` parses to the same passes as before (new `Pass` fields at their defaults)
+- the TS models parse, and a test asserts the slots for `solid-js.For`, `solid-js.Index`, `solid-js.createMemo`, `solid-js.createResource`, `solid-js/store.createStore` and `Array.prototype.map`
+- `ctsq config dump tsx` lists `<built-in>/models/ts/solid-js.toml` with a non-zero model count, and `config dump javascript` lists `builtins.toml`
+- `ts_sig` returns the parameters for `function f(a, {b, c}: P, ...rest)` in TS, the same list in plain JS (`function f(a, {b, c}, ...rest)`), arrow functions, `(props) =>`, and a default value `(a = 1)`
 - `same-output.sh` at 0 differences
 
 ## Package: value-start
@@ -178,3 +194,18 @@ Files: `src/flow/upward.rs`, the mechanics keys it needs, fixtures and tests.
 Acceptance:
 - backward from `a.eventStartsAt` at `AssetsIndex.tsx:60`, the walk reaches `api.ts:2183` and stops at `fetch` (`api.ts:427`) as external, with the hops of the Baseline backward chain
 - Go backward output is unchanged
+
+## Plan review (2026-10-24, C1)
+
+One architecture-lens reviewer (Opus) read this file scoped to C1 against the live code. All ten findings accepted; Package: ts-mech and C03's example were amended in the same commit.
+
+- F1 models in `config/models/ts/` never load: the lookup filters on the language name (`typescript`, `tsx`, `javascript`) and built-in models are `include_str!`'d. Fixed by adding `src/config/mod.rs` to C1 with a `ts` directory alias.
+- F2 `arg0` does not exist and a new `Slot` variant breaks matches in engine.rs and upward.rs. Fixed: `0.param0`, new `Pass` fields, `Slot` unchanged.
+- F3 no TS model key convention. Fixed in C03: `<import source>.<name>` and `<Global>.prototype.<method>`.
+- F4 "every required key" cannot fail: no key is required. Replaced with named non-empty lists.
+- F5 `Nodes` has no `PartialEq` and new fields would change `config dump go`. Fixed with `skip_serializing_if` and a dump comparison.
+- F6 an uncalled `ts_sig` warns. Fixed with the repo's `allow(dead_code)` pattern.
+- F7 `patterns` and `literal kinds` were not key names. Named.
+- F8 shorthand kind names differ from the grammar, and nothing checks mechanics kinds. Real kinds listed, grammar test added.
+- F9 JS and TS build parameter lists differently. JS case added to acceptance.
+- F10 `same-output.sh` does not load TS mechanics, so 0 differences is reachable. No change.
