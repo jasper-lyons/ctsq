@@ -1,0 +1,4 @@
+# These files stand in for code outside a repo (a GOROOT, a module cache).
+# The decls::go tests read them directly; searches over fixtures/ skip them,
+# so the call graph pinned on fixtures/ does not change.
+*

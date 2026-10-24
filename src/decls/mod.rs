@@ -1,5 +1,6 @@
 //! Declarations of code outside the repo: the Go standard library and modules
 //! (`go`), and TypeScript `.d.ts` files (`dts`). Read on demand, held for one run.
+pub mod go;
 
 /// A type named by a declaration, qualified by the package it comes from.
 ///
