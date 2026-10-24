@@ -1,0 +1,41 @@
+# Solid models, for TypeScript, TSX and JavaScript.
+# Keys are <import source>.<name>.
+# pass entries read "from -> to" where each side is an argument index, *, receiver or return.
+# [*] after the source moves each element of it, not the whole value.
+# .paramN after an argument target moves the value into parameter N of the
+# callback passed there.
+# A JSX element is a call with its attributes as named arguments and its
+# children as the argument `children`. args lists those names in index
+# order, so `0` below is the first name in args.
+
+["solid-js.For"]
+args = ["each", "children"]
+pass = ["0[*] -> 1.param0"]
+
+["solid-js.Index"]
+args = ["each", "children"]
+pass = ["0[*] -> 1.param0"]
+
+["solid-js.Show"]
+args = ["when", "children", "fallback"]
+pass = ["0 -> 1.param0"]
+
+["solid-js.Switch"]
+args = ["children", "fallback"]
+pass = ["* -> return"]
+
+["solid-js.Match"]
+args = ["when", "children"]
+pass = ["0 -> 1.param0"]
+
+["solid-js.createSignal"]
+pass = ["0 -> return"]
+
+["solid-js.createMemo"]
+pass = ["0 -> return"]
+
+["solid-js.createResource"]
+pass = ["0 -> 1.param0", "0 -> return", "1 -> return"]
+
+["solid-js/store.createStore"]
+pass = ["0 -> return"]

@@ -107,18 +107,42 @@ impl Roots {
 }
 
 struct BuiltinModel {
+    /// Model directory, as `model_dir` names it.
     lang: &'static str,
     label: &'static str,
     version: Option<(u32, u32)>,
     text: &'static str,
 }
 
-const BUILTIN_MODELS: &[BuiltinModel] = &[BuiltinModel {
-    lang: "go",
-    label: "stdlib@1.23.toml",
-    version: Some((1, 23)),
-    text: include_str!("../../config/models/go/stdlib@1.23.toml"),
-}];
+const BUILTIN_MODELS: &[BuiltinModel] = &[
+    BuiltinModel {
+        lang: "go",
+        label: "stdlib@1.23.toml",
+        version: Some((1, 23)),
+        text: include_str!("../../config/models/go/stdlib@1.23.toml"),
+    },
+    BuiltinModel {
+        lang: "ts",
+        label: "builtins.toml",
+        version: None,
+        text: include_str!("../../config/models/ts/builtins.toml"),
+    },
+    BuiltinModel {
+        lang: "ts",
+        label: "solid-js.toml",
+        version: None,
+        text: include_str!("../../config/models/ts/solid-js.toml"),
+    },
+];
+
+/// The `models/` directory a language reads: TypeScript, TSX and JavaScript
+/// share `ts`, every other language has its own name.
+pub fn model_dir(lang: &str) -> &str {
+    match lang {
+        "typescript" | "tsx" | "javascript" => "ts",
+        other => other,
+    }
+}
 
 const BUILTIN_LANGUAGES: &[(&str, &str)] = &[
     ("go", include_str!("../../config/languages/go.toml")),
@@ -290,8 +314,9 @@ pub fn load_with(roots: &Roots, repo_root: &Path, lang: &str) -> Result<LangConf
         sources.push((label.to_string(), n));
         Ok(())
     };
+    let mdir = model_dir(lang);
     for root in roots.ordered() {
-        let dir = root.join("models").join(lang);
+        let dir = root.join("models").join(mdir);
         for path in select_versioned(list_toml(&dir), go_version) {
             let text = read(&path)?;
             absorb(&path.display().to_string(), &text)?;
@@ -299,7 +324,7 @@ pub fn load_with(roots: &Roots, repo_root: &Path, lang: &str) -> Result<LangConf
     }
     let builtin: Vec<(String, Option<(u32, u32)>, &str)> = BUILTIN_MODELS
         .iter()
-        .filter(|b| b.lang == lang)
+        .filter(|b| b.lang == mdir)
         .map(|b| (b.label.to_string(), b.version, b.text))
         .collect();
     let items: Vec<(String, Option<GoVersion>)> = builtin
@@ -308,7 +333,7 @@ pub fn load_with(roots: &Roots, repo_root: &Path, lang: &str) -> Result<LangConf
         .collect();
     for name in select_versions(&items, go_version) {
         let (_, _, text) = builtin.iter().find(|(l, _, _)| *l == name).unwrap();
-        absorb(&format!("<built-in>/models/{}/{}", lang, name), text)?;
+        absorb(&format!("<built-in>/models/{}/{}", mdir, name), text)?;
     }
 
     Ok(LangConfig { lang: lang.to_string(), mechanics, models, go_version, module_path, sources })
@@ -649,6 +674,171 @@ mod tests {
         let s = dump_report(&load_with(&roots(&d), &d, "typescript").unwrap());
         assert!(s.contains("[tests]\n"), "{}", s);
         assert!(s.contains("\"*.spec.*\""), "{}", s);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn ts_languages_share_the_ts_models() {
+        let d = tmp();
+        for lang in ["typescript", "tsx", "javascript"] {
+            let c = load_with(&roots(&d), &d, lang).unwrap();
+            assert!(c.model("Array.prototype.map").is_some(), "{}", lang);
+            assert!(c.model("solid-js.For").is_some(), "{}", lang);
+            assert!(c.sources.iter().any(|(l, n)| l == "<built-in>/models/ts/solid-js.toml" && *n > 0), "{:?}", c.sources);
+            assert!(c.sources.iter().any(|(l, n)| l == "<built-in>/models/ts/builtins.toml" && *n > 0), "{:?}", c.sources);
+        }
+        let go = load_with(&roots(&d), &d, "go").unwrap();
+        assert!(go.model("solid-js.For").is_none());
+        assert!(go.sources.iter().all(|(l, _)| !l.contains("/ts/")));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_repo_ts_model_dir_serves_every_ts_language() {
+        let d = tmp();
+        write(&d.join(".ctsq/models/ts/app.toml"), "[\"solid-js.For\"]\nclear = true\n\n[\"my-lib.run\"]\npass = [\"0 -> return\"]\n");
+        for lang in ["typescript", "tsx", "javascript"] {
+            let c = load_with(&roots(&d), &d, lang).unwrap();
+            assert!(c.model("solid-js.For").unwrap().clear, "{}", lang);
+            assert!(c.model("my-lib.run").is_some(), "{}", lang);
+        }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    fn passes(c: &LangConfig, key: &str) -> Vec<Pass> {
+        c.model(key).unwrap_or_else(|| panic!("no model {}", key)).pass.clone()
+    }
+
+    #[test]
+    fn ts_model_slots() {
+        let d = tmp();
+        let c = load_with(&roots(&d), &d, "tsx").unwrap();
+        let el = |from, to, param| Pass { from, to, from_elements: true, to_param: Some(param) };
+        let plain = Pass::plain;
+        let for_ = c.model("solid-js.For").unwrap();
+        assert_eq!(for_.args, vec!["each", "children"]);
+        assert_eq!(for_.pass, vec![el(Slot::Arg(0), Slot::Arg(1), 0)]);
+        let index = c.model("solid-js.Index").unwrap();
+        assert_eq!(index.args, vec!["each", "children"]);
+        assert_eq!(index.pass, vec![el(Slot::Arg(0), Slot::Arg(1), 0)]);
+        assert_eq!(passes(&c, "solid-js.createMemo"), vec![plain(Slot::Arg(0), Slot::Return)]);
+        assert_eq!(
+            passes(&c, "solid-js.createResource"),
+            vec![
+                Pass { from: Slot::Arg(0), to: Slot::Arg(1), from_elements: false, to_param: Some(0) },
+                plain(Slot::Arg(0), Slot::Return),
+                plain(Slot::Arg(1), Slot::Return),
+            ]
+        );
+        assert_eq!(passes(&c, "solid-js/store.createStore"), vec![plain(Slot::Arg(0), Slot::Return)]);
+        assert_eq!(
+            passes(&c, "Array.prototype.map"),
+            vec![el(Slot::Receiver, Slot::Arg(0), 0), plain(Slot::Receiver, Slot::Return)]
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn go_models_keep_plain_passes() {
+        let d = tmp();
+        let c = load_with(&roots(&d), &d, "go").unwrap();
+        for (k, m) in c.models.iter() {
+            for p in &m.pass {
+                assert!(!p.from_elements && p.to_param.is_none(), "{}", k);
+            }
+            assert!(m.args.is_empty(), "{}", k);
+        }
+        assert_eq!(
+            passes(&c, "strings.Replace"),
+            vec![Pass::plain(Slot::Arg(0), Slot::Return), Pass::plain(Slot::Arg(2), Slot::Return)]
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Role lists a TS-family language file must fill.
+    fn ts_lists(m: &Mechanics, jsx: bool) -> Vec<(&'static str, &Vec<String>)> {
+        let n = &m.nodes;
+        let mut v = vec![
+            ("call", &n.call),
+            ("assign", &n.assign),
+            ("function", &n.function),
+            ("param", &n.param),
+            ("object", &n.object),
+            ("pair", &n.pair),
+            ("array", &n.array),
+            ("pattern", &n.pattern),
+            ("await", &n.await_),
+            ("spread", &n.spread),
+            ("literal", &n.literal),
+        ];
+        if jsx {
+            v.extend([
+                ("jsx_element", &n.jsx_element),
+                ("jsx_self_closing", &n.jsx_self_closing),
+                ("jsx_expression", &n.jsx_expression),
+                ("jsx_attribute", &n.jsx_attribute),
+                ("jsx_text", &n.jsx_text),
+            ]);
+        }
+        v
+    }
+
+    #[test]
+    fn ts_languages_fill_the_flow_roles() {
+        let d = tmp();
+        for (lang, jsx) in [("typescript", false), ("tsx", true), ("javascript", true)] {
+            let c = load_with(&roots(&d), &d, lang).unwrap();
+            for (key, list) in ts_lists(&c.mechanics, jsx) {
+                assert!(!list.is_empty(), "{} [nodes] {} is empty", lang, key);
+            }
+        }
+        let ts = load_with(&roots(&d), &d, "typescript").unwrap();
+        assert!(ts.mechanics.nodes.jsx_element.is_empty(), "the typescript grammar has no JSX");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Every node kind in `[nodes]` and every field name in `[fields]` exists in the grammar.
+    #[test]
+    fn ts_language_kinds_exist_in_their_grammar() {
+        let d = tmp();
+        let grammars: [(&str, tree_sitter::Language); 3] = [
+            ("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+            ("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
+            ("javascript", tree_sitter_javascript::LANGUAGE.into()),
+        ];
+        for (lang, grammar) in grammars {
+            let c = load_with(&roots(&d), &d, lang).unwrap();
+            let nodes = toml::Value::try_from(&c.mechanics.nodes).unwrap();
+            let mut seen = 0;
+            for (key, list) in nodes.as_table().unwrap() {
+                for kind in list.as_array().unwrap() {
+                    let kind = kind.as_str().unwrap();
+                    assert_ne!(grammar.id_for_node_kind(kind, true), 0, "{} [nodes] {}: {} is not a named kind", lang, key, kind);
+                    seen += 1;
+                }
+            }
+            assert!(seen > 40, "{} only {} kinds", lang, seen);
+            let fields = toml::Value::try_from(&c.mechanics.fields).unwrap();
+            for (key, list) in fields.as_table().unwrap() {
+                for f in list.as_array().unwrap() {
+                    let f = f.as_str().unwrap();
+                    assert!(grammar.field_id_for_name(f).is_some(), "{} [fields] {}: {} is not a field", lang, key, f);
+                }
+            }
+        }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn go_dump_leaves_the_ts_keys_out() {
+        let d = tmp();
+        let s = dump_report(&load_with(&roots(&d), &d, "go").unwrap());
+        for key in ["object", "pair", "array", "pattern", "await", "spread", "literal", "jsx_element"] {
+            assert!(!s.lines().any(|l| l.starts_with(&format!("{} = ", key))), "{}: {}", key, s);
+        }
+        let s = dump_report(&load_with(&roots(&d), &d, "tsx").unwrap());
+        assert!(s.contains("<built-in>/models/ts/solid-js.toml ("), "{}", s);
+        assert!(s.contains("jsx_attribute = "), "{}", s);
         std::fs::remove_dir_all(&d).ok();
     }
 

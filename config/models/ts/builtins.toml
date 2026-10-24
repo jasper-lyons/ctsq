@@ -1,0 +1,34 @@
+# JavaScript built-in models, for TypeScript, TSX and JavaScript.
+# Keys are <Global>.prototype.<method> for a method whose receiver type is
+# unknown, and <Global>.<name> for a static function.
+# pass entries read "from -> to" where each side is an argument index, *, receiver or return.
+# [*] after the source moves each element of it, not the whole value.
+# .paramN after an argument target moves the value into parameter N of the
+# callback passed there.
+
+["Array.prototype.map"]
+pass = ["receiver[*] -> 0.param0", "receiver -> return"]
+
+["Array.prototype.filter"]
+pass = ["receiver[*] -> 0.param0", "receiver -> return"]
+
+["Array.prototype.sort"]
+pass = ["receiver[*] -> 0.param0", "receiver[*] -> 0.param1", "receiver -> return"]
+
+["Array.prototype.find"]
+pass = ["receiver[*] -> 0.param0", "receiver -> return"]
+
+["Array.prototype.flat"]
+pass = ["receiver -> return"]
+
+["Array.prototype.flatMap"]
+pass = ["receiver[*] -> 0.param0", "receiver -> return"]
+
+["Promise.prototype.then"]
+pass = ["receiver -> 0.param0", "receiver -> return"]
+
+["Promise.resolve"]
+pass = ["0 -> return"]
+
+["Response.prototype.json"]
+pass = ["receiver -> return"]

@@ -110,6 +110,44 @@ pub struct Nodes {
     pub pipeline: Vec<String>,
     /// Actions that print the value of their pipeline.
     pub print: Vec<String>,
+    // The keys below are TypeScript and JavaScript roles. Each is left out of
+    // `config dump` when empty, so a language without them dumps as before.
+    /// Object literal `{ a: x }`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub object: Vec<String>,
+    /// `key: value` entry of an object literal.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pair: Vec<String>,
+    /// Array literal `[a, b]`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub array: Vec<String>,
+    /// JSX element with children, `<A>...</A>`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub jsx_element: Vec<String>,
+    /// JSX element without children, `<A />`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub jsx_self_closing: Vec<String>,
+    /// `{...}` expression container inside JSX.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub jsx_expression: Vec<String>,
+    /// `name={value}` attribute of a JSX element.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub jsx_attribute: Vec<String>,
+    /// Literal text between JSX tags.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub jsx_text: Vec<String>,
+    /// Destructuring patterns and their parts, `{a, b: c}`, `[x, ...y]`, `a = 1`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pattern: Vec<String>,
+    /// `await x`.
+    #[serde(rename = "await", skip_serializing_if = "Vec::is_empty")]
+    pub await_: Vec<String>,
+    /// `...x` in a call, array or object.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub spread: Vec<String>,
+    /// Literal values: strings, template strings, numbers.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub literal: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

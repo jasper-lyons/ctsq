@@ -40,10 +40,26 @@ impl fmt::Display for Slot {
 
 /// A `from -> to` entry. `from` is an argument, `*` or `receiver`.
 /// `to` is an argument, `receiver` or `return`.
+///
+/// Two suffixes bind a collection's elements to a callback's parameter, as
+/// `receiver[*] -> 0.param0` for `xs.map(f)`: `[*]` on the source moves each
+/// element rather than the whole value, and `.paramN` on an argument target
+/// moves it into parameter N of the function passed there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pass {
     pub from: Slot,
     pub to: Slot,
+    /// `[*]` on the source: the elements of `from`, not `from` itself.
+    pub from_elements: bool,
+    /// `.paramN` on the target: parameter N of the callback passed at `to`.
+    pub to_param: Option<usize>,
+}
+
+impl Pass {
+    /// A pass with no suffixes.
+    pub fn plain(from: Slot, to: Slot) -> Pass {
+        Pass { from, to, from_elements: false, to_param: None }
+    }
 }
 
 impl Pass {
@@ -55,15 +71,33 @@ impl Pass {
             )
         };
         let (a, b) = s.split_once("->").ok_or_else(bad)?;
-        let from = Slot::parse(a.trim()).ok_or_else(bad)?;
-        let to = Slot::parse(b.trim()).ok_or_else(bad)?;
+        let (a, from_elements) = match a.trim().strip_suffix("[*]") {
+            Some(rest) => (rest.trim_end(), true),
+            None => (a.trim(), false),
+        };
+        let b = b.trim();
+        let (b, to_param) = match b.split_once(".param") {
+            Some((slot, n)) if !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()) => {
+                (slot.trim_end(), Some(n.parse::<usize>().map_err(|_| bad())?))
+            }
+            Some(_) => return Err(bad()),
+            None => (b, None),
+        };
+        let from = Slot::parse(a).ok_or_else(bad)?;
+        let to = Slot::parse(b).ok_or_else(bad)?;
         if from == Slot::Return {
             return Err(format!("bad pass entry \"{}\": return cannot be a source", s));
         }
         if to == Slot::AllArgs {
             return Err(format!("bad pass entry \"{}\": * can only be a source", s));
         }
-        Ok(Pass { from, to })
+        if from_elements && from == Slot::AllArgs {
+            return Err(format!("bad pass entry \"{}\": [*] needs one argument or the receiver", s));
+        }
+        if to_param.is_some() && !matches!(to, Slot::Arg(_)) {
+            return Err(format!("bad pass entry \"{}\": .paramN needs an argument index before it", s));
+        }
+        Ok(Pass { from, to, from_elements, to_param })
     }
 }
 
@@ -91,6 +125,11 @@ pub struct Model {
     pub source: Option<Slot>,
     pub template: Option<TemplateUse>,
     pub template_load: Option<TemplateLoad>,
+    /// Names of the named arguments, in index order: a JSX call
+    /// `<For each={xs}>{f}</For>` with `args = ["each", "children"]` has
+    /// `each` as argument 0 and its children as argument 1, so `pass` and
+    /// `source` address them by those indices. Empty for positional calls.
+    pub args: Vec<String>,
     /// Where the model came from, for `config dump`.
     pub origin: String,
 }
@@ -107,6 +146,8 @@ struct RawModel {
     source: Option<String>,
     template: Option<TemplateUse>,
     template_load: Option<TemplateLoad>,
+    #[serde(default)]
+    args: Vec<String>,
 }
 
 fn line_of(text: &str, offset: usize) -> usize {
@@ -144,6 +185,7 @@ pub fn parse_file(file: &str, text: &str) -> Result<Vec<(String, Model)>, Config
                 source,
                 template: r.template,
                 template_load: r.template_load,
+                args: r.args,
                 origin: file.to_string(),
             },
         ));
@@ -157,11 +199,46 @@ mod tests {
 
     #[test]
     fn every_pass_form_parses() {
-        assert_eq!(Pass::parse("0 -> return").unwrap(), Pass { from: Slot::Arg(0), to: Slot::Return });
-        assert_eq!(Pass::parse("* -> return").unwrap(), Pass { from: Slot::AllArgs, to: Slot::Return });
-        assert_eq!(Pass::parse("0 -> 1").unwrap(), Pass { from: Slot::Arg(0), to: Slot::Arg(1) });
-        assert_eq!(Pass::parse("receiver -> return").unwrap(), Pass { from: Slot::Receiver, to: Slot::Return });
-        assert_eq!(Pass::parse("1->receiver").unwrap(), Pass { from: Slot::Arg(1), to: Slot::Receiver });
+        assert_eq!(Pass::parse("0 -> return").unwrap(), Pass::plain(Slot::Arg(0), Slot::Return));
+        assert_eq!(Pass::parse("* -> return").unwrap(), Pass::plain(Slot::AllArgs, Slot::Return));
+        assert_eq!(Pass::parse("0 -> 1").unwrap(), Pass::plain(Slot::Arg(0), Slot::Arg(1)));
+        assert_eq!(Pass::parse("receiver -> return").unwrap(), Pass::plain(Slot::Receiver, Slot::Return));
+        assert_eq!(Pass::parse("1->receiver").unwrap(), Pass::plain(Slot::Arg(1), Slot::Receiver));
+    }
+
+    #[test]
+    fn element_and_param_suffixes_parse() {
+        let p = Pass::parse("receiver[*] -> 0.param0").unwrap();
+        assert_eq!(p, Pass { from: Slot::Receiver, to: Slot::Arg(0), from_elements: true, to_param: Some(0) });
+        let p = Pass::parse("0[*] -> 1.param2").unwrap();
+        assert_eq!(p, Pass { from: Slot::Arg(0), to: Slot::Arg(1), from_elements: true, to_param: Some(2) });
+        let p = Pass::parse("receiver -> 0.param1").unwrap();
+        assert_eq!(p, Pass { from: Slot::Receiver, to: Slot::Arg(0), from_elements: false, to_param: Some(1) });
+        let p = Pass::parse("1 [*] -> return").unwrap();
+        assert_eq!(p, Pass { from: Slot::Arg(1), to: Slot::Return, from_elements: true, to_param: None });
+    }
+
+    #[test]
+    fn plain_forms_keep_the_new_fields_at_their_defaults() {
+        let p = Pass::parse("0 -> 1").unwrap();
+        assert!(!p.from_elements);
+        assert_eq!(p.to_param, None);
+        assert_eq!(p, Pass::plain(Slot::Arg(0), Slot::Arg(1)));
+    }
+
+    #[test]
+    fn bad_suffix_forms_are_rejected() {
+        for bad in ["*[*] -> return", "0 -> return.param0", "0 -> receiver.param0", "0 -> 1.param", "0 -> 1.param+1", "0 -> 1.paramx", "0[*] -> *", "0[] -> 1", "return[*] -> 0"] {
+            assert!(Pass::parse(bad).is_err(), "{}", bad);
+        }
+    }
+
+    #[test]
+    fn named_args_parse() {
+        let t = "[\"solid-js.For\"]\nargs = [\"each\", \"children\"]\npass = [\"0[*] -> 1.param0\"]\n";
+        let m = parse_file("f.toml", t).unwrap();
+        assert_eq!(m[0].1.args, vec!["each", "children"]);
+        assert!(parse_file("f.toml", "[\"a.B\"]\npass = [\"0 -> return\"]\n").unwrap()[0].1.args.is_empty());
     }
 
     #[test]

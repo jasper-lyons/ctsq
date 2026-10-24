@@ -13,6 +13,7 @@ mod report;
 mod tests;
 pub mod upward;
 pub mod template;
+pub mod ts_sig;
 pub mod values;
 pub mod widen;
 
